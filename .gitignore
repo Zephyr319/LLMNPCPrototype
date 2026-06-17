@@ -1,0 +1,62 @@
+# Unreal generated folders
+Binaries/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+
+# Python virtual environments
+venv/
+.venv/
+LocalWhisperServer/venv/
+LocalEmotionServer/venv/
+__pycache__/
+*.pyc
+
+# Local AI servers / models
+Style-Bert-VITS2/
+VoiceVox/
+
+# Python environments and cache
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Model files
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.bin
+*.ckpt
+*.gguf
+*.wav
+*.mp3
+
+# Visual Studio generated files
+*.sln
+*.VC.db
+*.opensdf
+*.sdf
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+
+# Unreal build artifacts
+Build/
+*.tmp
+*.log
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Local external runtime folders
+VoiceVox/
+
+# OS files
+.DS_Store
+Thumbs.db
