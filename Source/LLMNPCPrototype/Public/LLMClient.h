@@ -71,6 +71,9 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TTS")
     UVoicevoxTTSClient* VoicevoxTTSClient;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "OpenAI")
+    FString OpenAIModelName;
+
     UPROPERTY(BlueprintAssignable, Category = "LLM")
     FOnLLMResponseReceived OnLLMResponseReceived;
 
@@ -85,19 +88,23 @@ public:
 
 private:
     TArray<TSharedPtr<FJsonValue>> ConversationHistory;
+    int32 ActiveLLMRequestId;
 
-    void OnDeepSeekResponseReceived(
+    void OnOpenAINormalResponseReceived(
         FHttpRequestPtr Request,
         FHttpResponsePtr Response,
-        bool bWasSuccessful
+        bool bWasSuccessful,
+        int32 RequestId
     );
 
     void OnStrategyResponseReceived(
         FHttpRequestPtr Request,
         FHttpResponsePtr Response,
-        bool bWasSuccessful
+        bool bWasSuccessful,
+        int32 RequestId
     );
 
+    void InterruptCurrentVoicevoxSpeech();
     void HandleFinalReplyText(const FString& ReplyText);
     FString SanitizeReplyTextForSpeechAndDisplay(const FString& RawText) const;
     UVoicevoxTTSClient* ResolveVoicevoxTTSClient();

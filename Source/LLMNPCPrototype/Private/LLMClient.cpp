@@ -11,13 +11,24 @@
 #include "VoicevoxTTSClient.h"
 #include "Components/ActorComponent.h"
 #include "GameFramework/Actor.h"
+#include "HAL/PlatformMisc.h"
 
 namespace
 {
-    const FString DeepSeekUrl = TEXT("https://api.deepseek.com/chat/completions");
+    const FString OpenAIChatCompletionsUrl = TEXT("https://api.openai.com/v1/chat/completions");
 
-    // Replace this with your new DeepSeek API key.
-    const FString DeepSeekApiKey = TEXT("sk-a384ef4d28264b228e986df942704c6f");
+    FString GetOpenAIApiKey()
+    {
+        FString ApiKey = FPlatformMisc::GetEnvironmentVariable(TEXT("OPENAI_API_KEY"));
+        ApiKey = ApiKey.TrimStartAndEnd();
+
+        if (ApiKey.IsEmpty())
+        {
+            UE_LOG(LogTemp, Error, TEXT("[OpenAI] OPENAI_API_KEY environment variable is not set"));
+        }
+
+        return ApiKey;
+    }
 
     FString CleanJsonContent(FString Content)
     {
@@ -45,7 +56,7 @@ namespace
         return Content;
     }
 
-    bool ExtractDeepSeekMessageContent(
+    bool ExtractOpenAIMessageContent(
         const FString& ResponseString,
         FString& OutContent,
         FString& OutError
@@ -56,34 +67,34 @@ namespace
 
         if (!FJsonSerializer::Deserialize(Reader, RootObject) || !RootObject.IsValid())
         {
-            OutError = TEXT("Failed to parse DeepSeek response JSON.");
+            OutError = TEXT("Failed to parse OpenAI response JSON.");
             return false;
         }
 
         const TArray<TSharedPtr<FJsonValue>>* Choices = nullptr;
         if (!RootObject->TryGetArrayField(TEXT("choices"), Choices) || Choices->Num() == 0)
         {
-            OutError = TEXT("No choices found in DeepSeek response.");
+            OutError = TEXT("No choices found in OpenAI response.");
             return false;
         }
 
         TSharedPtr<FJsonObject> ChoiceObject = (*Choices)[0]->AsObject();
         if (!ChoiceObject.IsValid())
         {
-            OutError = TEXT("Invalid choice object in DeepSeek response.");
+            OutError = TEXT("Invalid choice object in OpenAI response.");
             return false;
         }
 
         TSharedPtr<FJsonObject> MessageObject = ChoiceObject->GetObjectField(TEXT("message"));
         if (!MessageObject.IsValid())
         {
-            OutError = TEXT("No message object found in DeepSeek response.");
+            OutError = TEXT("No message object found in OpenAI response.");
             return false;
         }
 
         if (!MessageObject->TryGetStringField(TEXT("content"), OutContent))
         {
-            OutError = TEXT("No content field found in DeepSeek response.");
+            OutError = TEXT("No content field found in OpenAI response.");
             return false;
         }
 
@@ -164,6 +175,8 @@ ULLMClient::ULLMClient()
 {
     bUseVoicevoxTTS = true;
     VoicevoxTTSClient = nullptr;
+    OpenAIModelName = TEXT("gpt-4o-mini");
+    ActiveLLMRequestId = 0;
 }
 
 void ULLMClient::SetVoicevoxTTSClient(UVoicevoxTTSClient* InVoicevoxTTSClient)
@@ -173,8 +186,17 @@ void ULLMClient::SetVoicevoxTTSClient(UVoicevoxTTSClient* InVoicevoxTTSClient)
 
 void ULLMClient::SendDeepSeekMessage(const FString& UserMessage)
 {
+    InterruptCurrentVoicevoxSpeech();
+
+    const int32 LocalRequestId = ++ActiveLLMRequestId;
+    const FString OpenAIApiKey = GetOpenAIApiKey();
+    if (OpenAIApiKey.IsEmpty())
+    {
+        return;
+    }
+
     TSharedPtr<FJsonObject> RootObject = MakeShared<FJsonObject>();
-    RootObject->SetStringField(TEXT("model"), TEXT("deepseek-v4-flash"));
+    RootObject->SetStringField(TEXT("model"), OpenAIModelName);
     RootObject->SetBoolField(TEXT("stream"), false);
     RootObject->SetNumberField(TEXT("max_tokens"), 500);
 
@@ -231,27 +253,37 @@ void ULLMClient::SendDeepSeekMessage(const FString& UserMessage)
     FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
 
     TSharedRef<IHttpRequest> Request = FHttpModule::Get().CreateRequest();
-    Request->SetURL(DeepSeekUrl);
+    Request->SetURL(OpenAIChatCompletionsUrl);
     Request->SetVerb(TEXT("POST"));
     Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-    Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + DeepSeekApiKey);
+    Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + OpenAIApiKey);
     Request->SetContentAsString(RequestBody);
     Request->SetTimeout(120.0f);
 
     Request->OnProcessRequestComplete().BindUObject(
         this,
-        &ULLMClient::OnDeepSeekResponseReceived
+        &ULLMClient::OnOpenAINormalResponseReceived,
+        LocalRequestId
     );
 
     Request->ProcessRequest();
 
-    UE_LOG(LogTemp, Warning, TEXT("DeepSeek normal request sent: %s"), *UserMessage);
+    UE_LOG(LogTemp, Warning, TEXT("OpenAI normal request sent: %s"), *UserMessage);
 }
 
 void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 {
+    InterruptCurrentVoicevoxSpeech();
+
+    const int32 LocalRequestId = ++ActiveLLMRequestId;
+    const FString OpenAIApiKey = GetOpenAIApiKey();
+    if (OpenAIApiKey.IsEmpty())
+    {
+        return;
+    }
+
     TSharedPtr<FJsonObject> RootObject = MakeShared<FJsonObject>();
-    RootObject->SetStringField(TEXT("model"), TEXT("deepseek-v4-flash"));
+    RootObject->SetStringField(TEXT("model"), OpenAIModelName);
     RootObject->SetBoolField(TEXT("stream"), false);
     RootObject->SetNumberField(TEXT("temperature"), 0.2);
     RootObject->SetNumberField(TEXT("max_tokens"), 700);
@@ -342,32 +374,40 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
     FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
 
     TSharedRef<IHttpRequest> Request = FHttpModule::Get().CreateRequest();
-    Request->SetURL(DeepSeekUrl);
+    Request->SetURL(OpenAIChatCompletionsUrl);
     Request->SetVerb(TEXT("POST"));
     Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
-    Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + DeepSeekApiKey);
+    Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + OpenAIApiKey);
     Request->SetContentAsString(RequestBody);
     Request->SetTimeout(120.0f);
 
     Request->OnProcessRequestComplete().BindUObject(
         this,
-        &ULLMClient::OnStrategyResponseReceived
+        &ULLMClient::OnStrategyResponseReceived,
+        LocalRequestId
     );
 
     Request->ProcessRequest();
 
-    UE_LOG(LogTemp, Warning, TEXT("DeepSeek strategy request sent: %s"), *UserMessage);
+    UE_LOG(LogTemp, Warning, TEXT("OpenAI strategy request sent: %s"), *UserMessage);
 }
 
-void ULLMClient::OnDeepSeekResponseReceived(
+void ULLMClient::OnOpenAINormalResponseReceived(
     FHttpRequestPtr Request,
     FHttpResponsePtr Response,
-    bool bWasSuccessful
+    bool bWasSuccessful,
+    int32 RequestId
 )
 {
+    if (RequestId != ActiveLLMRequestId)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[LLM] ignored stale OpenAI response"));
+        return;
+    }
+
     if (!bWasSuccessful || !Response.IsValid())
     {
-        const FString ErrorMessage = TEXT("DeepSeek request failed.");
+        const FString ErrorMessage = TEXT("OpenAI request failed.");
         UE_LOG(LogTemp, Error, TEXT("%s"), *ErrorMessage);
         OnLLMErrorReceived.Broadcast(ErrorMessage);
         return;
@@ -376,13 +416,13 @@ void ULLMClient::OnDeepSeekResponseReceived(
     const int32 ResponseCode = Response->GetResponseCode();
     const FString ResponseString = Response->GetContentAsString();
 
-    UE_LOG(LogTemp, Warning, TEXT("DeepSeek normal response code: %d"), ResponseCode);
-    UE_LOG(LogTemp, Warning, TEXT("DeepSeek normal raw response: %s"), *ResponseString);
+    UE_LOG(LogTemp, Warning, TEXT("OpenAI normal response code: %d"), ResponseCode);
+    UE_LOG(LogTemp, Warning, TEXT("OpenAI normal raw response: %s"), *ResponseString);
 
     if (ResponseCode != 200)
     {
         const FString ErrorMessage = FString::Printf(
-            TEXT("DeepSeek server error. Code=%d, Body=%s"),
+            TEXT("OpenAI server error. Code=%d, Body=%s"),
             ResponseCode,
             *ResponseString
         );
@@ -395,7 +435,7 @@ void ULLMClient::OnDeepSeekResponseReceived(
     FString Content;
     FString ErrorMessage;
 
-    if (!ExtractDeepSeekMessageContent(ResponseString, Content, ErrorMessage))
+    if (!ExtractOpenAIMessageContent(ResponseString, Content, ErrorMessage))
     {
         UE_LOG(LogTemp, Error, TEXT("%s"), *ErrorMessage);
         OnLLMErrorReceived.Broadcast(ErrorMessage);
@@ -412,7 +452,7 @@ void ULLMClient::OnDeepSeekResponseReceived(
         ConversationHistory.RemoveAt(0);
     }
 
-    UE_LOG(LogTemp, Warning, TEXT("DeepSeek normal reply: %s"), *Content);
+    UE_LOG(LogTemp, Warning, TEXT("OpenAI normal reply: %s"), *Content);
 
     HandleFinalReplyText(Content);
 }
@@ -420,12 +460,19 @@ void ULLMClient::OnDeepSeekResponseReceived(
 void ULLMClient::OnStrategyResponseReceived(
     FHttpRequestPtr Request,
     FHttpResponsePtr Response,
-    bool bWasSuccessful
+    bool bWasSuccessful,
+    int32 RequestId
 )
 {
+    if (RequestId != ActiveLLMRequestId)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[LLM] ignored stale OpenAI response"));
+        return;
+    }
+
     if (!bWasSuccessful || !Response.IsValid())
     {
-        const FString ErrorMessage = TEXT("DeepSeek strategy request failed.");
+        const FString ErrorMessage = TEXT("OpenAI strategy request failed.");
         UE_LOG(LogTemp, Error, TEXT("%s"), *ErrorMessage);
         OnLLMErrorReceived.Broadcast(ErrorMessage);
         return;
@@ -434,13 +481,13 @@ void ULLMClient::OnStrategyResponseReceived(
     const int32 ResponseCode = Response->GetResponseCode();
     const FString ResponseString = Response->GetContentAsString();
 
-    UE_LOG(LogTemp, Warning, TEXT("DeepSeek strategy response code: %d"), ResponseCode);
-    UE_LOG(LogTemp, Warning, TEXT("DeepSeek strategy raw response: %s"), *ResponseString);
+    UE_LOG(LogTemp, Warning, TEXT("OpenAI strategy response code: %d"), ResponseCode);
+    UE_LOG(LogTemp, Warning, TEXT("OpenAI strategy raw response: %s"), *ResponseString);
 
     if (ResponseCode != 200)
     {
         const FString ErrorMessage = FString::Printf(
-            TEXT("DeepSeek strategy server error. Code=%d, Body=%s"),
+            TEXT("OpenAI strategy server error. Code=%d, Body=%s"),
             ResponseCode,
             *ResponseString
         );
@@ -453,7 +500,7 @@ void ULLMClient::OnStrategyResponseReceived(
     FString Content;
     FString ErrorMessage;
 
-    if (!ExtractDeepSeekMessageContent(ResponseString, Content, ErrorMessage))
+    if (!ExtractOpenAIMessageContent(ResponseString, Content, ErrorMessage))
     {
         UE_LOG(LogTemp, Error, TEXT("%s"), *ErrorMessage);
         OnLLMErrorReceived.Broadcast(ErrorMessage);
@@ -563,6 +610,23 @@ FString ULLMClient::SanitizeReplyTextForSpeechAndDisplay(const FString& RawText)
     RemoveDelimitedSections(CleanText, TEXT('<'), TEXT('>'));
 
     return CleanText.TrimStartAndEnd();
+}
+
+void ULLMClient::InterruptCurrentVoicevoxSpeech()
+{
+    if (!bUseVoicevoxTTS)
+    {
+        return;
+    }
+
+    UVoicevoxTTSClient* ResolvedVoicevoxTTSClient = ResolveVoicevoxTTSClient();
+    if (!ResolvedVoicevoxTTSClient)
+    {
+        return;
+    }
+
+    ResolvedVoicevoxTTSClient->StopVoicevoxSpeech();
+    UE_LOG(LogTemp, Warning, TEXT("[LLM] interrupted current VOICEVOX speech before new request"));
 }
 
 void ULLMClient::HandleFinalReplyText(const FString& ReplyText)
