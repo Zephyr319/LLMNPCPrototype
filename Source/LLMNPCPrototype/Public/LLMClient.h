@@ -48,6 +48,18 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_NineParams(
     RawJson
 );
 
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FourParams(
+    FOnNPCActionRequested,
+    const FString&,
+    ActionType,
+    const FString&,
+    Timing,
+    const FString&,
+    Item,
+    int32,
+    Quantity
+);
+
 UCLASS(Blueprintable)
 class LLMNPCPROTOTYPE_API ULLMClient : public UObject
 {
@@ -85,6 +97,9 @@ public:
 
     UPROPERTY(BlueprintAssignable, Category = "LLM")
     FOnStrategyResultReceived OnStrategyResultReceived;
+
+    UPROPERTY(BlueprintAssignable, Category = "LLM")
+    FOnNPCActionRequested OnNPCActionRequested;
 
 private:
     TArray<TSharedPtr<FJsonValue>> ConversationHistory;

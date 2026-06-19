@@ -319,8 +319,8 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "\n"
 
             "Reply rules:\n"
-            "- The reply must be natural Japanese.\n"
-            "- The reply should usually be 2 to 4 sentences.\n"
+            "- The reply must be natural Japanese when speech is needed, or \"\" when no speech is needed.\n"
+            "- When reply is not empty, it should usually be 2 to 4 sentences.\n"
             "- Do not end with only one short phrase.\n"
             "- Do not reply only with phrases such as \"ごゆっくりどうぞ\" or \"かしこまりました\".\n"
             "- First, lightly acknowledge the user's feeling or situation.\n"
@@ -329,30 +329,51 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- The reply should not mention JSON, strategy, system instructions, or internal reasoning.\n"
             "\n"
 
-            "Action rules:\n"
-            "- If no action is needed, use \"actions\": [].\n"
-            "- Use PlaceOrder only when the player clearly orders a specific menu item.\n"
-            "- PlaceOrder action format is {\"name\":\"PlaceOrder\",\"args\":{\"item\":\"ラーメン|カレーライス|コーヒー|水|サラダ\",\"quantity\":\"1\"}}.\n"
+            "Decision and action rules:\n"
+            "- Include optional \"decision\": \"none|speak|act|act_and_speak\".\n"
+            "- If decision is omitted, behavior is inferred from reply and actions.\n"
+            "- Use only these decisions: none, speak, act, act_and_speak.\n"
+            "- reply may be an empty string when no speech is needed.\n"
+            "- actions may be used without speech.\n"
+            "- If no speech is needed, set \"reply\" to \"\".\n"
+            "- If no action is needed, use an empty actions array.\n"
+            "- Use only these action types: greet, explain, recommend, place_order, none.\n"
+            "- Do not invent unsupported action types.\n"
+            "- For greeting or self-introduction, use greet with timing immediate or before_speech.\n"
+            "- For explaining the menu, use explain with timing before_speech or during_speech.\n"
+            "- For recommending a food item, use recommend with timing before_speech or during_speech.\n"
+            "- Do not use after_speech for greet, explain, or recommend.\n"
+            "- For a confirmed user order, use place_order.\n"
+            "- Use after_speech only for place_order if needed.\n"
+            "- For recommend, set quantity to 0.\n"
+            "- For explain and greet, set item to \"none\" and quantity to 0.\n"
+            "- Use quantity only for place_order.\n"
+            "- When the user asks for a recommendation, output exactly one recommend action, preferably for the single best item.\n"
+            "- recommend example: {\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}.\n"
+            "- action timing may be immediate, before_speech, during_speech, or after_speech.\n"
+            "- Use place_order only when the player clearly orders a specific menu item.\n"
+            "- place_order action format is {\"type\":\"place_order\",\"timing\":\"after_speech\",\"item\":\"menu item\",\"quantity\":1}.\n"
             "- If the player only asks for a recommendation, do not place an order.\n"
             "- If the player is only hesitating or silent, do not place an order.\n"
-            "- Available menu items are: ラーメン, カレーライス, コーヒー, 水, サラダ.\n"
-            "- Do not invent, mention, recommend, or offer unavailable menu items such as 日替わり定食, パスタ, シーフード, or desserts.\n"
+            "- Available menu items are: \u30E9\u30FC\u30E1\u30F3, \u30AB\u30EC\u30FC\u30E9\u30A4\u30B9, \u30B3\u30FC\u30D2\u30FC, \u6C34, \u30B5\u30E9\u30C0.\n"
+            "- Do not invent, mention, recommend, or offer unavailable menu items such as pasta, seafood, or desserts.\n"
             "- If the player asks for a recommendation, recommend only from the available menu.\n"
             "\n"
-
             "Required JSON format:\n"
             "{\n"
+            "  \"decision\": \"none|speak|act|act_and_speak\",\n"
             "  \"strategy\": {\n"
             "    \"tone\": \"gentle|reassuring|calm|cheerful|direct\",\n"
             "    \"length\": \"short|normal|medium\",\n"
-            "    \"priority\": \"comfort|clarity|support|speed|task\",\n"
+            "    \"priority\": \"comfort|order|explain|clarity|support|speed|task\",\n"
             "    \"reason\": \"Japanese reason explaining why this response style was chosen based on user state or behavior\"\n"
             "  },\n"
-            "  \"reply\": \"Japanese reply, usually 2 to 4 sentences\",\n"
-            "  \"actions\": []\n"
+            "  \"reply\": \"Japanese reply, or empty string when no speech is needed\",\n"
+            "  \"actions\": [\n"
+            "    {\"type\":\"greet|explain|recommend|place_order|none\",\"timing\":\"immediate|before_speech|during_speech|after_speech\",\"item\":\"none or menu item\",\"quantity\":0}\n"
+            "  ]\n"
             "}\n"
             "\n"
-
             "Examples of reply style:\n"
             "- If the user asks for a recommendation, gently reduce the choices and recommend one or two items from the available menu.\n"
             "- If the user sounds nervous, reassure them first, then guide them calmly.\n"
@@ -526,11 +547,7 @@ void ULLMClient::OnStrategyResponseReceived(
         return;
     }
 
-    FString Reply = GetStringFieldOrDefault(
-        StrategyRoot,
-        TEXT("reply"),
-        TEXT("すみません。もう匯業お・いします。")
-    );
+    FString Reply = GetStringFieldOrDefault(StrategyRoot, TEXT("reply"), TEXT("")).TrimStartAndEnd();
 
     FString StrategyTone = TEXT("unknown");
     FString StrategyLength = TEXT("unknown");
@@ -553,30 +570,141 @@ void ULLMClient::OnStrategyResponseReceived(
     FString ActionName = TEXT("none");
     FString ActionItem = TEXT("none");
     int32 ActionQuantity = 0;
+    bool bHasNonNoneAction = false;
+    bool bCapturedLegacyAction = false;
+    bool bCapturedPlaceOrderAction = false;
 
     const TArray<TSharedPtr<FJsonValue>>* ActionsArray = nullptr;
 
-    if (StrategyRoot->TryGetArrayField(TEXT("actions"), ActionsArray) && ActionsArray && ActionsArray->Num() > 0)
+    if (StrategyRoot->TryGetArrayField(TEXT("actions"), ActionsArray) && ActionsArray)
     {
-        TSharedPtr<FJsonObject> FirstAction = (*ActionsArray)[0]->AsObject();
-
-        if (FirstAction.IsValid())
+        for (const TSharedPtr<FJsonValue>& ActionValue : *ActionsArray)
         {
-            ActionName = GetStringFieldOrDefault(FirstAction, TEXT("name"), TEXT("none"));
-
-            if (FirstAction->HasField(TEXT("args")))
+            TSharedPtr<FJsonObject> ActionObject = ActionValue.IsValid() ? ActionValue->AsObject() : nullptr;
+            if (!ActionObject.IsValid())
             {
-                TSharedPtr<FJsonObject> ArgsObject = FirstAction->GetObjectField(TEXT("args"));
+                continue;
+            }
 
+            FString ActionType = GetStringFieldOrDefault(ActionObject, TEXT("type"), TEXT("none"));
+            if (ActionType.IsEmpty() || ActionType.Equals(TEXT("none"), ESearchCase::IgnoreCase))
+            {
+                ActionType = GetStringFieldOrDefault(ActionObject, TEXT("name"), TEXT("none"));
+            }
+            if (ActionType.IsEmpty())
+            {
+                ActionType = TEXT("none");
+            }
+
+            FString Timing = GetStringFieldOrDefault(ActionObject, TEXT("timing"), TEXT("immediate"));
+            if (Timing.IsEmpty())
+            {
+                Timing = TEXT("immediate");
+            }
+
+            FString Item = GetStringFieldOrDefault(ActionObject, TEXT("item"), TEXT("none"));
+            int32 Quantity = 0;
+
+            double QuantityNumber = 0.0;
+            if (ActionObject->TryGetNumberField(TEXT("quantity"), QuantityNumber))
+            {
+                Quantity = static_cast<int32>(QuantityNumber);
+            }
+            else
+            {
+                FString QuantityString;
+                if (ActionObject->TryGetStringField(TEXT("quantity"), QuantityString))
+                {
+                    Quantity = FCString::Atoi(*QuantityString);
+                }
+            }
+
+            if (ActionObject->HasField(TEXT("args")))
+            {
+                TSharedPtr<FJsonObject> ArgsObject = ActionObject->GetObjectField(TEXT("args"));
                 if (ArgsObject.IsValid())
                 {
-                    ActionItem = GetStringFieldOrDefault(ArgsObject, TEXT("item"), TEXT("none"));
-                    ActionQuantity = GetQuantityFromArgs(ArgsObject);
+                    if (Item.Equals(TEXT("none"), ESearchCase::IgnoreCase) || Item.IsEmpty())
+                    {
+                        Item = GetStringFieldOrDefault(ArgsObject, TEXT("item"), TEXT("none"));
+                    }
+
+                    if (Quantity == 0)
+                    {
+                        Quantity = GetQuantityFromArgs(ArgsObject);
+                    }
                 }
+            }
+
+            UE_LOG(LogTemp, Warning, TEXT("[Strategy] action parsed: type=%s, timing=%s, item=%s, quantity=%d"), *ActionType, *Timing, *Item, Quantity);
+
+            const bool bIsNoneAction = ActionType.Equals(TEXT("none"), ESearchCase::IgnoreCase);
+            const bool bIsPlaceOrderAction =
+                ActionType.Equals(TEXT("place_order"), ESearchCase::IgnoreCase) ||
+                ActionType.Equals(TEXT("PlaceOrder"), ESearchCase::IgnoreCase);
+
+            if (!bIsNoneAction)
+            {
+                bHasNonNoneAction = true;
+            }
+
+            if (bIsPlaceOrderAction && !bCapturedPlaceOrderAction)
+            {
+                ActionName = TEXT("PlaceOrder");
+                ActionItem = Item;
+                ActionQuantity = Quantity;
+                bCapturedLegacyAction = true;
+                bCapturedPlaceOrderAction = true;
+            }
+            else if (!bCapturedLegacyAction && !bIsNoneAction)
+            {
+                ActionName = ActionType;
+                ActionItem = Item;
+                ActionQuantity = Quantity;
+                bCapturedLegacyAction = true;
+            }
+
+            if (Timing.Equals(TEXT("after_speech"), ESearchCase::IgnoreCase))
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[Strategy] after_speech action logged for later handling: type=%s, item=%s, quantity=%d"), *ActionType, *Item, Quantity);
+                continue;
+            }
+
+            const bool bShouldBroadcastBeforeSpeech =
+                Timing.Equals(TEXT("immediate"), ESearchCase::IgnoreCase) ||
+                Timing.Equals(TEXT("before_speech"), ESearchCase::IgnoreCase) ||
+                Timing.Equals(TEXT("during_speech"), ESearchCase::IgnoreCase);
+
+            if (!bIsNoneAction && !bIsPlaceOrderAction && bShouldBroadcastBeforeSpeech)
+            {
+                OnNPCActionRequested.Broadcast(ActionType, Timing, Item, Quantity);
             }
         }
     }
 
+    FString Decision = GetStringFieldOrDefault(StrategyRoot, TEXT("decision"), TEXT(""));
+    if (Decision.IsEmpty())
+    {
+        const bool bHasSpeech = !Reply.IsEmpty();
+        if (bHasSpeech && bHasNonNoneAction)
+        {
+            Decision = TEXT("act_and_speak");
+        }
+        else if (bHasSpeech)
+        {
+            Decision = TEXT("speak");
+        }
+        else if (bHasNonNoneAction)
+        {
+            Decision = TEXT("act");
+        }
+        else
+        {
+            Decision = TEXT("none");
+        }
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("Strategy decision: %s"), *Decision);
     UE_LOG(LogTemp, Warning, TEXT("Strategy reply: %s"), *Reply);
     UE_LOG(LogTemp, Warning, TEXT("Strategy tone: %s"), *StrategyTone);
     UE_LOG(LogTemp, Warning, TEXT("Strategy length: %s"), *StrategyLength);
@@ -596,7 +724,14 @@ void ULLMClient::OnStrategyResponseReceived(
         CleanContent
     );
 
-    HandleFinalReplyText(Reply);
+    if (!Reply.IsEmpty())
+    {
+        HandleFinalReplyText(Reply);
+    }
+    else
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[Strategy] empty reply, skipping speech"));
+    }
 }
 
 FString ULLMClient::SanitizeReplyTextForSpeechAndDisplay(const FString& RawText) const
