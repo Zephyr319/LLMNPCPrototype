@@ -49,6 +49,7 @@ bool UPlayerSeatComponent::TrySitAtFurniture(AFurnitureMarkerActor* Seat)
 	CurrentSeatID = Seat->FurnitureID;
 	CurrentTableID = Seat->RelatedTableID;
 	Seat->bIsOccupied = true;
+	OnPlayerSeated.Broadcast(CurrentSeatID, CurrentTableID);
 	return true;
 }
 
@@ -59,6 +60,9 @@ bool UPlayerSeatComponent::LeaveSeat()
 		return false;
 	}
 
+	const FString LeavingSeatID = CurrentSeatID;
+	const FString LeavingTableID = CurrentTableID;
+
 	if (CurrentSeat)
 	{
 		CurrentSeat->bIsOccupied = false;
@@ -68,6 +72,7 @@ bool UPlayerSeatComponent::LeaveSeat()
 	CurrentSeat = nullptr;
 	CurrentSeatID = TEXT("");
 	CurrentTableID = TEXT("");
+	OnPlayerLeftSeat.Broadcast(LeavingSeatID, LeavingTableID);
 	return true;
 }
 

@@ -104,6 +104,7 @@ public:
 private:
     TArray<TSharedPtr<FJsonValue>> ConversationHistory;
     int32 ActiveLLMRequestId;
+    FString LastStrategyUserMessage;
 
     void OnOpenAINormalResponseReceived(
         FHttpRequestPtr Request,

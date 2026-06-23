@@ -8,6 +8,7 @@
 #include "FurnitureMarkerActor.generated.h"
 
 class UBoxComponent;
+class UArrowComponent;
 class USceneComponent;
 
 UCLASS()
@@ -18,23 +19,68 @@ class AFurnitureMarkerActor : public AActor, public IInteractableInterface
 public:
 	AFurnitureMarkerActor();
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Furniture")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Furniture Marker")
 	USceneComponent* SceneRoot;
 
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Furniture")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Furniture Marker")
 	UBoxComponent* InteractionBox;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture")
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Furniture Marker")
+	UBoxComponent* SeatTriggerBox;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Furniture Marker")
+	UBoxComponent* ObstacleBox;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Furniture Marker")
+	UArrowComponent* Arrow;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Furniture Marker")
+	USceneComponent* SitPoint;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Furniture Marker")
+	USceneComponent* ExitPoint;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Furniture Marker")
+	USceneComponent* NPCStandPoint;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture Marker")
 	FString FurnitureID;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture Marker")
+	FString FurnitureType;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture Marker")
+	FText DisplayName;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture Marker")
 	FString RelatedTableID;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture Marker")
+	TArray<FString> FurnitureTags;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture Marker")
+	bool bIsOccupied;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture Marker")
 	bool bCanSit;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture")
-	bool bIsOccupied;
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture Marker")
+	int32 Priority;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Furniture Marker")
+	FTransform GetSitTransform() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Furniture Marker")
+	FTransform GetExitTransform() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Furniture Marker")
+	FTransform GetNPCStandTransform() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Furniture Marker")
+	bool IsActorInInteractionRange(AActor* Actor) const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Furniture Marker")
+	bool IsActorInSeatRange(AActor* Actor) const;
 
 	virtual bool CanInteract_Implementation(AActor* Interactor) const override;
 	virtual FText GetInteractionText_Implementation(AActor* Interactor) const override;

@@ -8,6 +8,8 @@
 
 class AFurnitureMarkerActor;
 
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FPlayerSeatChangedSignature, FString, SeatID, FString, TableID);
+
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class UPlayerSeatComponent : public UActorComponent
 {
@@ -27,6 +29,12 @@ public:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Seat")
 	FString CurrentTableID;
+
+	UPROPERTY(BlueprintAssignable, Category = "Seat")
+	FPlayerSeatChangedSignature OnPlayerSeated;
+
+	UPROPERTY(BlueprintAssignable, Category = "Seat")
+	FPlayerSeatChangedSignature OnPlayerLeftSeat;
 
 	UFUNCTION(BlueprintCallable, Category = "Seat")
 	bool TrySitAtFurniture(AFurnitureMarkerActor* Seat);
