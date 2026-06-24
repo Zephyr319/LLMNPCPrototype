@@ -131,9 +131,29 @@ UNPCMoveToTableComponent::UNPCMoveToTableComponent()
 	bFollowMoveInProgress = false;
 	bPrintFollowDebug = false;
 	bIsGuidingPlayer = false;
+	GuidePlayerPhase = EGuidePlayerPhase::None;
 	GuidePlayerMaxDistance = 450.0f;
 	GuidePlayerResumeDistance = 280.0f;
 	GuideCheckInterval = 0.5f;
+	bGuideApproachPlayerFirst = true;
+	GuideStartPlayerDistanceThreshold = 320.0f;
+	GuideStartApproachPlayerDistance = 160.0f;
+	GuidePausedLineVariants = {
+		TEXT("お客様、大丈夫ですか？こちらへどうぞ。"),
+		TEXT("すみません、少し離れてしまいました。こちらです。"),
+		TEXT("お客様、こちらについてきてください。"),
+		TEXT("こちらでお待ちしていますね。")
+	};
+	GuideResumedLineVariants = {
+		TEXT("ありがとうございます。それではご案内します。"),
+		TEXT("では、続きをご案内しますね。"),
+		TEXT("こちらです。ゆっくりお進みください。")
+	};
+	GuideArrivedLineVariants = {
+		TEXT("こちらのお席へどうぞ。"),
+		TEXT("こちらがご案内のお席です。"),
+		TEXT("どうぞ、こちらにお掛けください。")
+	};
 	LastFollowPlayerLocation = FVector::ZeroVector;
 	LastFollowGoalLocation = FVector::ZeroVector;
 	FollowUpdateTimer = 0.0f;
@@ -145,6 +165,11 @@ UNPCMoveToTableComponent::UNPCMoveToTableComponent()
 	GuideTargetType = TEXT("");
 	GuideTargetID = TEXT("");
 	bPreserveMovementModeForGuideMove = false;
+	bGuideStartedEventBroadcasted = false;
+	bGuideArrivedEventBroadcasted = false;
+	LastGuidePausedLine = TEXT("");
+	LastGuideResumedLine = TEXT("");
+	LastGuideArrivedLine = TEXT("");
 	MoveSpeedDebugTimer = 0.0f;
 }
 
@@ -607,20 +632,45 @@ bool UNPCMoveToTableComponent::StartGuideToTable(const FString& TableID)
 	GuideTargetID = TrimmedTableID;
 	GuidePlayerActor = FindPlayerActor();
 	GuideCheckTimer = GuideCheckInterval;
+	GuidePlayerPhase = EGuidePlayerPhase::None;
+	bGuideStartedEventBroadcasted = false;
+	bGuideArrivedEventBroadcasted = false;
 
-	const bool bPreviousPreserveGuideMove = bPreserveMovementModeForGuideMove;
-	bPreserveMovementModeForGuideMove = true;
-	const bool bMoveStarted = MoveToTableByID(TrimmedTableID);
-	bPreserveMovementModeForGuideMove = bPreviousPreserveGuideMove;
+	const FString Message = FString::Printf(TEXT("Start guide to table: %s"), *TrimmedTableID);
+	UE_LOG(LogTemp, Warning, TEXT("%s"), *Message);
+	PrintDebugMessage(Message, FColor::Green);
 
-	if (bMoveStarted)
+	AActor* Owner = GetOwner();
+	AActor* PlayerActor = GuidePlayerActor.Get();
+	if (bGuideApproachPlayerFirst && Owner && PlayerActor)
 	{
-		const FString Message = FString::Printf(TEXT("Start guide to table: %s"), *TrimmedTableID);
-		UE_LOG(LogTemp, Warning, TEXT("%s"), *Message);
-		PrintDebugMessage(Message, FColor::Green);
+		const float DistanceToPlayer = FVector::Dist2D(Owner->GetActorLocation(), PlayerActor->GetActorLocation());
+		const float EffectiveStartThreshold = GuideStartPlayerDistanceThreshold > KINDA_SMALL_NUMBER
+			? GuideStartPlayerDistanceThreshold
+			: 320.0f;
+		if (DistanceToPlayer > EffectiveStartThreshold)
+		{
+			GuidePlayerPhase = EGuidePlayerPhase::ApproachingPlayer;
+			const float EffectiveApproachDistance = GuideStartApproachPlayerDistance > KINDA_SMALL_NUMBER
+				? GuideStartApproachPlayerDistance
+				: 160.0f;
+			const bool bStartedApproach = MoveNearActor(PlayerActor, EffectiveApproachDistance);
+			if (bStartedApproach)
+			{
+				CurrentMoveReason = TEXT("guide_approach_player");
+				CurrentMoveTargetID = TEXT("player");
+				UE_LOG(LogTemp, Warning, TEXT("Guide start: approaching player first"));
+				PrintDebugMessage(TEXT("Guide start: approaching player first"), FColor::Green);
+			}
+			else
+			{
+				StopGuidingPlayer();
+			}
+			return bStartedApproach;
+		}
 	}
 
-	return bMoveStarted;
+	return StartGuideMovementToSavedTarget();
 }
 
 bool UNPCMoveToTableComponent::StartGuideToSceneTag(const FString& TargetTag)
@@ -640,33 +690,68 @@ bool UNPCMoveToTableComponent::StartGuideToSceneTag(const FString& TargetTag)
 	GuideTargetID = TrimmedTargetTag;
 	GuidePlayerActor = FindPlayerActor();
 	GuideCheckTimer = GuideCheckInterval;
+	GuidePlayerPhase = EGuidePlayerPhase::None;
+	bGuideStartedEventBroadcasted = false;
+	bGuideArrivedEventBroadcasted = false;
 
-	const bool bPreviousPreserveGuideMove = bPreserveMovementModeForGuideMove;
-	bPreserveMovementModeForGuideMove = true;
-	const bool bMoveStarted = MoveToSceneTargetByTag(TrimmedTargetTag);
-	bPreserveMovementModeForGuideMove = bPreviousPreserveGuideMove;
+	const FString Message = FString::Printf(TEXT("Start guide to scene tag: %s"), *TrimmedTargetTag);
+	UE_LOG(LogTemp, Warning, TEXT("%s"), *Message);
+	PrintDebugMessage(Message, FColor::Green);
 
-	if (bMoveStarted)
+	AActor* Owner = GetOwner();
+	AActor* PlayerActor = GuidePlayerActor.Get();
+	if (bGuideApproachPlayerFirst && Owner && PlayerActor)
 	{
-		const FString Message = FString::Printf(TEXT("Start guide to scene tag: %s"), *TrimmedTargetTag);
-		UE_LOG(LogTemp, Warning, TEXT("%s"), *Message);
-		PrintDebugMessage(Message, FColor::Green);
+		const float DistanceToPlayer = FVector::Dist2D(Owner->GetActorLocation(), PlayerActor->GetActorLocation());
+		const float EffectiveStartThreshold = GuideStartPlayerDistanceThreshold > KINDA_SMALL_NUMBER
+			? GuideStartPlayerDistanceThreshold
+			: 320.0f;
+		if (DistanceToPlayer > EffectiveStartThreshold)
+		{
+			GuidePlayerPhase = EGuidePlayerPhase::ApproachingPlayer;
+			const float EffectiveApproachDistance = GuideStartApproachPlayerDistance > KINDA_SMALL_NUMBER
+				? GuideStartApproachPlayerDistance
+				: 160.0f;
+			const bool bStartedApproach = MoveNearActor(PlayerActor, EffectiveApproachDistance);
+			if (bStartedApproach)
+			{
+				CurrentMoveReason = TEXT("guide_approach_player");
+				CurrentMoveTargetID = TEXT("player");
+				UE_LOG(LogTemp, Warning, TEXT("Guide start: approaching player first"));
+				PrintDebugMessage(TEXT("Guide start: approaching player first"), FColor::Green);
+			}
+			else
+			{
+				StopGuidingPlayer();
+			}
+			return bStartedApproach;
+		}
 	}
 
-	return bMoveStarted;
+	return StartGuideMovementToSavedTarget();
 }
 
 void UNPCMoveToTableComponent::StopGuidingPlayer()
 {
-	const bool bWasGuiding = bIsGuidingPlayer || bGuidePausedForPlayer || MovementMode == ENPCMovementMode::GuidePlayer;
+	const bool bWasGuiding = bIsGuidingPlayer;
+	const FString StoppedTargetID = GuideTargetID;
+
+	if (bWasGuiding)
+	{
+		OnGuideStopped.Broadcast(TEXT("guide_stopped"), StoppedTargetID, GuideStoppedLine);
+		UE_LOG(LogTemp, Warning, TEXT("Broadcast OnGuideStopped: %s"), *StoppedTargetID);
+	}
 
 	bIsGuidingPlayer = false;
 	bGuidePausedForPlayer = false;
+	GuidePlayerPhase = EGuidePlayerPhase::None;
 	GuidePlayerActor.Reset();
 	GuideCheckTimer = 0.0f;
 	GuideTargetType = TEXT("");
 	GuideTargetID = TEXT("");
 	bPreserveMovementModeForGuideMove = false;
+	bGuideStartedEventBroadcasted = false;
+	bGuideArrivedEventBroadcasted = false;
 
 	if (bIsMovingToTable || bWasGuiding)
 	{
@@ -1978,9 +2063,56 @@ void UNPCMoveToTableComponent::UpdateFollowPlayer(AActor* Owner, float DeltaTime
 	PrintFollowDebugIfNeeded(bStartedMove);
 }
 
+FString UNPCMoveToTableComponent::PickGuideLine(const TArray<FString>& Variants, const FString& FallbackLine, FString& LastLine)
+{
+	FString SelectedLine;
+	if (Variants.Num() <= 0)
+	{
+		SelectedLine = FallbackLine;
+	}
+	else if (Variants.Num() == 1)
+	{
+		SelectedLine = Variants[0];
+	}
+	else
+	{
+		TArray<int32> CandidateIndexes;
+		for (int32 Index = 0; Index < Variants.Num(); ++Index)
+		{
+			if (!Variants[Index].Equals(LastLine, ESearchCase::CaseSensitive))
+			{
+				CandidateIndexes.Add(Index);
+			}
+		}
+
+		if (CandidateIndexes.Num() > 0)
+		{
+			SelectedLine = Variants[CandidateIndexes[FMath::RandRange(0, CandidateIndexes.Num() - 1)]];
+		}
+		else
+		{
+			SelectedLine = Variants[FMath::RandRange(0, Variants.Num() - 1)];
+		}
+	}
+
+	LastLine = SelectedLine;
+	return SelectedLine;
+}
+
 void UNPCMoveToTableComponent::UpdateGuidePlayer(AActor* Owner, float DeltaTime)
 {
 	if (!bIsGuidingPlayer || MovementMode != ENPCMovementMode::GuidePlayer || !Owner)
+	{
+		return;
+	}
+
+	if (GuidePlayerPhase == EGuidePlayerPhase::ApproachingPlayer)
+	{
+		return;
+	}
+
+	if (GuidePlayerPhase != EGuidePlayerPhase::GuidingToTarget
+		&& GuidePlayerPhase != EGuidePlayerPhase::PausedForPlayer)
 	{
 		return;
 	}
@@ -2007,7 +2139,7 @@ void UNPCMoveToTableComponent::UpdateGuidePlayer(AActor* Owner, float DeltaTime)
 		if (bGuidePausedForPlayer)
 		{
 			bGuidePausedForPlayer = false;
-			ResumeGuideMove();
+			StartGuideMovementToSavedTarget();
 		}
 		return;
 	}
@@ -2020,22 +2152,34 @@ void UNPCMoveToTableComponent::UpdateGuidePlayer(AActor* Owner, float DeltaTime)
 		? FMath::Min(GuidePlayerResumeDistance, EffectiveMaxDistance)
 		: 280.0f;
 
-	if (DistanceToPlayer > EffectiveMaxDistance && !bGuidePausedForPlayer)
+	if (GuidePlayerPhase == EGuidePlayerPhase::GuidingToTarget
+		&& DistanceToPlayer > EffectiveMaxDistance
+		&& !bGuidePausedForPlayer)
 	{
 		ClearMovementState();
 		bGuidePausedForPlayer = true;
+		GuidePlayerPhase = EGuidePlayerPhase::PausedForPlayer;
 		CurrentMoveSpeed = 0.0f;
 		CurrentMoveVelocity = FVector::ZeroVector;
 		SetOwnerComponentVelocity(Owner, CurrentMoveVelocity);
+		const FString SuggestedLine = PickGuideLine(GuidePausedLineVariants, GuidePausedLine, LastGuidePausedLine);
+		OnGuidePausedForPlayer.Broadcast(TEXT("guide_paused"), GuideTargetID, SuggestedLine);
 		UE_LOG(LogTemp, Warning, TEXT("Guide paused: waiting for player"));
+		UE_LOG(LogTemp, Warning, TEXT("Broadcast OnGuidePausedForPlayer: %s"), *GuideTargetID);
 		PrintDebugMessage(TEXT("Guide paused: waiting for player"), FColor::Yellow);
 		return;
 	}
 
-	if (bGuidePausedForPlayer && DistanceToPlayer <= EffectiveResumeDistance)
+	if (GuidePlayerPhase == EGuidePlayerPhase::PausedForPlayer
+		&& bGuidePausedForPlayer
+		&& DistanceToPlayer <= EffectiveResumeDistance)
 	{
 		bGuidePausedForPlayer = false;
-		if (ResumeGuideMove())
+		GuidePlayerPhase = EGuidePlayerPhase::GuidingToTarget;
+		const FString SuggestedLine = PickGuideLine(GuideResumedLineVariants, GuideResumedLine, LastGuideResumedLine);
+		OnGuideResumed.Broadcast(TEXT("guide_resumed"), GuideTargetID, SuggestedLine);
+		UE_LOG(LogTemp, Warning, TEXT("Broadcast OnGuideResumed: %s"), *GuideTargetID);
+		if (StartGuideMovementToSavedTarget())
 		{
 			UE_LOG(LogTemp, Warning, TEXT("Guide resumed: player caught up"));
 			PrintDebugMessage(TEXT("Guide resumed: player caught up"), FColor::Green);
@@ -2043,7 +2187,7 @@ void UNPCMoveToTableComponent::UpdateGuidePlayer(AActor* Owner, float DeltaTime)
 	}
 }
 
-bool UNPCMoveToTableComponent::ResumeGuideMove()
+bool UNPCMoveToTableComponent::StartGuideMovementToSavedTarget()
 {
 	if (!bIsGuidingPlayer || MovementMode != ENPCMovementMode::GuidePlayer)
 	{
@@ -2059,6 +2203,8 @@ bool UNPCMoveToTableComponent::ResumeGuideMove()
 
 	const bool bPreviousPreserveGuideMove = bPreserveMovementModeForGuideMove;
 	bPreserveMovementModeForGuideMove = true;
+	GuidePlayerPhase = EGuidePlayerPhase::GuidingToTarget;
+	bGuidePausedForPlayer = false;
 
 	bool bMoveStarted = false;
 	if (GuideTargetType.Equals(TEXT("table"), ESearchCase::IgnoreCase))
@@ -2071,10 +2217,24 @@ bool UNPCMoveToTableComponent::ResumeGuideMove()
 	}
 	else
 	{
-		FailMoveToTable(TEXT("Guide target type missing"));
+		UE_LOG(LogTemp, Warning, TEXT("Guide target type missing: %s"), *GuideTargetType);
+		bPreserveMovementModeForGuideMove = bPreviousPreserveGuideMove;
+		StopGuidingPlayer();
+		return false;
 	}
 
 	bPreserveMovementModeForGuideMove = bPreviousPreserveGuideMove;
+	if (bMoveStarted)
+	{
+		if (!bGuideStartedEventBroadcasted)
+		{
+			bGuideStartedEventBroadcasted = true;
+			OnGuideStarted.Broadcast(TEXT("guide_started"), ResumeTargetID, GuideStartedLine);
+			UE_LOG(LogTemp, Warning, TEXT("Broadcast OnGuideStarted: %s"), *ResumeTargetID);
+		}
+		UE_LOG(LogTemp, Warning, TEXT("Guide started moving to saved target: %s"), *ResumeTargetID);
+		PrintDebugMessage(FString::Printf(TEXT("Guide started moving to saved target: %s"), *ResumeTargetID), FColor::Green);
+	}
 	return bMoveStarted;
 }
 
@@ -2093,13 +2253,33 @@ void UNPCMoveToTableComponent::FinishMoveToTable(AActor* Owner)
 			|| CompletedMoveReason == FName(TEXT("player"))
 			|| CompletedMoveReason == FName(TEXT("follow_player")));
 	const bool bCompletedGuideMove = bIsGuidingPlayer && MovementMode == ENPCMovementMode::GuidePlayer;
+	const EGuidePlayerPhase CompletedGuidePhase = GuidePlayerPhase;
 	ClearMovementState();
 	if (bCompletedFollowMove)
 	{
 		bFollowMoveInProgress = false;
 	}
+	else if (bCompletedGuideMove && CompletedGuidePhase == EGuidePlayerPhase::ApproachingPlayer)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Guide start: reached player, now guiding to target"));
+		PrintDebugMessage(TEXT("Guide start: reached player, now guiding to target"), FColor::Green);
+		StartGuideMovementToSavedTarget();
+		return;
+	}
 	else if (bCompletedGuideMove)
 	{
+		if (CompletedGuidePhase == EGuidePlayerPhase::GuidingToTarget)
+		{
+			if (!bGuideArrivedEventBroadcasted)
+			{
+				bGuideArrivedEventBroadcasted = true;
+				const FString SuggestedLine = PickGuideLine(GuideArrivedLineVariants, GuideArrivedLine, LastGuideArrivedLine);
+				OnGuideArrived.Broadcast(TEXT("guide_arrived"), GuideTargetID, SuggestedLine);
+				UE_LOG(LogTemp, Warning, TEXT("Broadcast OnGuideArrived: %s"), *GuideTargetID);
+			}
+			UE_LOG(LogTemp, Warning, TEXT("Guide arrived at target"));
+			PrintDebugMessage(TEXT("Guide arrived at target"), FColor::Cyan);
+		}
 		StopGuidingPlayer();
 	}
 	else if (MovementMode == ENPCMovementMode::CommandedMove

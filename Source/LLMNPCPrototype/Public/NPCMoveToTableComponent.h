@@ -11,6 +11,7 @@ class AFurnitureMarkerActor;
 class ACafeTargetPointActor;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FNPCMoveCompletedSignature, FName, MoveReason, FString, TargetID, bool, bSuccess);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FGuidePlayerEvent, FName, EventName, FString, TargetID, FString, SuggestedLine);
 
 UENUM(BlueprintType)
 enum class ENPCMovementMode : uint8
@@ -20,6 +21,15 @@ enum class ENPCMovementMode : uint8
 	CommandedMove UMETA(DisplayName = "Commanded Move"),
 	GuidePlayer UMETA(DisplayName = "Guide Player"),
 	SeekPlayer UMETA(DisplayName = "Seek Player")
+};
+
+UENUM(BlueprintType)
+enum class EGuidePlayerPhase : uint8
+{
+	None UMETA(DisplayName = "None"),
+	ApproachingPlayer UMETA(DisplayName = "Approaching Player"),
+	GuidingToTarget UMETA(DisplayName = "Guiding To Target"),
+	PausedForPlayer UMETA(DisplayName = "Paused For Player")
 };
 
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
@@ -176,6 +186,9 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "NPC|Guide")
 	bool bIsGuidingPlayer = false;
 
+	UPROPERTY(BlueprintReadOnly, Category = "NPC|Guide")
+	EGuidePlayerPhase GuidePlayerPhase = EGuidePlayerPhase::None;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide")
 	float GuidePlayerMaxDistance = 450.0f;
 
@@ -184,6 +197,54 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide")
 	float GuideCheckInterval = 0.5f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide")
+	bool bGuideApproachPlayerFirst = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide")
+	float GuideStartPlayerDistanceThreshold = 320.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide")
+	float GuideStartApproachPlayerDistance = 160.0f;
+
+	UPROPERTY(BlueprintAssignable, Category = "NPC|Guide")
+	FGuidePlayerEvent OnGuideStarted;
+
+	UPROPERTY(BlueprintAssignable, Category = "NPC|Guide")
+	FGuidePlayerEvent OnGuidePausedForPlayer;
+
+	UPROPERTY(BlueprintAssignable, Category = "NPC|Guide")
+	FGuidePlayerEvent OnGuideResumed;
+
+	UPROPERTY(BlueprintAssignable, Category = "NPC|Guide")
+	FGuidePlayerEvent OnGuideArrived;
+
+	UPROPERTY(BlueprintAssignable, Category = "NPC|Guide")
+	FGuidePlayerEvent OnGuideStopped;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide|Speech")
+	FString GuideStartedLine = TEXT("それではご案内します。");
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide|Speech")
+	FString GuidePausedLine = TEXT("お客様、大丈夫ですか？こちらへどうぞ。");
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide|Speech")
+	TArray<FString> GuidePausedLineVariants;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide|Speech")
+	FString GuideResumedLine = TEXT("ありがとうございます。それではご案内します。");
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide|Speech")
+	TArray<FString> GuideResumedLineVariants;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide|Speech")
+	FString GuideArrivedLine = TEXT("こちらのお席へどうぞ。");
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide|Speech")
+	TArray<FString> GuideArrivedLineVariants;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide|Speech")
+	FString GuideStoppedLine = TEXT("案内を停止します。");
 
 	UPROPERTY(BlueprintAssignable, Category = "Table Movement")
 	FNPCMoveCompletedSignature OnNPCMoveCompleted;
@@ -294,6 +355,16 @@ private:
 
 	bool bPreserveMovementModeForGuideMove = false;
 
+	bool bGuideStartedEventBroadcasted = false;
+
+	bool bGuideArrivedEventBroadcasted = false;
+
+	FString LastGuidePausedLine;
+
+	FString LastGuideResumedLine;
+
+	FString LastGuideArrivedLine;
+
 	bool StartMovingToTable(const ATableMarkerActor* TableMarker, bool bRequireNavigationPath = false);
 
 	bool StartMovingToFurniture(AFurnitureMarkerActor* FurnitureMarker);
@@ -326,9 +397,11 @@ private:
 
 	void UpdateFollowPlayer(AActor* Owner, float DeltaTime);
 
+	FString PickGuideLine(const TArray<FString>& Variants, const FString& FallbackLine, FString& LastLine);
+
 	void UpdateGuidePlayer(AActor* Owner, float DeltaTime);
 
-	bool ResumeGuideMove();
+	bool StartGuideMovementToSavedTarget();
 
 	void FinishMoveToTable(AActor* Owner);
 
