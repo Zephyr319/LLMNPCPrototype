@@ -43,6 +43,31 @@ bool IsCounterMoveHint(const FString& TargetHint)
 		|| TrimmedHint.Contains(TEXT("吧台"), ESearchCase::IgnoreCase);
 }
 
+bool IsFuzzyGuideTableTarget(const FString& RequestedTable)
+{
+	const FString TrimmedTable = RequestedTable.TrimStartAndEnd();
+	if (TrimmedTable.IsEmpty())
+	{
+		return true;
+	}
+
+	return TrimmedTable.Equals(TEXT("nearest"), ESearchCase::IgnoreCase)
+		|| TrimmedTable.Equals(TEXT("seat"), ESearchCase::IgnoreCase)
+		|| TrimmedTable.Equals(TEXT("table"), ESearchCase::IgnoreCase)
+		|| TrimmedTable.Equals(TEXT("any"), ESearchCase::IgnoreCase)
+		|| TrimmedTable.Equals(TEXT("available"), ESearchCase::IgnoreCase)
+		|| TrimmedTable.Equals(TEXT("recommended"), ESearchCase::IgnoreCase)
+		|| TrimmedTable.Contains(TEXT("\u5EA7\u4F4D"))
+		|| TrimmedTable.Contains(TEXT("\u5E2D"))
+		|| TrimmedTable.Contains(TEXT("\u304A\u5E2D"))
+		|| TrimmedTable.Contains(TEXT("\u30C6\u30FC\u30D6\u30EB"));
+}
+
+bool ShouldPreferNearestGuideTable(const FString& RequestedTable)
+{
+	return RequestedTable.TrimStartAndEnd().Equals(TEXT("nearest"), ESearchCase::IgnoreCase);
+}
+
 FString GetApproachDebugTargetName(const AActor* TargetActor)
 {
 	if (const AFurnitureMarkerActor* FurnitureMarker = Cast<AFurnitureMarkerActor>(TargetActor))
@@ -615,14 +640,102 @@ bool UNPCMoveToTableComponent::IsFollowingPlayer() const
 	return bIsFollowingPlayer;
 }
 
+FString UNPCMoveToTableComponent::ResolveGuideTableTarget(const FString& RequestedTable) const
+{
+	const FString TrimmedTable = RequestedTable.TrimStartAndEnd();
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return IsFuzzyGuideTableTarget(TrimmedTable) ? TEXT("") : TrimmedTable;
+	}
+
+	for (TActorIterator<ATableMarkerActor> It(World); It; ++It)
+	{
+		const ATableMarkerActor* TableMarker = *It;
+		if (!TableMarker)
+		{
+			continue;
+		}
+
+		const FString CandidateTableID = TableMarker->GetTableID();
+		if (CandidateTableID == TrimmedTable || CandidateTableID.TrimStartAndEnd() == TrimmedTable)
+		{
+			return CandidateTableID;
+		}
+	}
+
+	if (!IsFuzzyGuideTableTarget(TrimmedTable))
+	{
+		return TrimmedTable;
+	}
+
+	const AActor* DistanceReferenceActor = FindPlayerActor();
+	if (!DistanceReferenceActor)
+	{
+		DistanceReferenceActor = GetOwner();
+	}
+
+	const bool bPreferNearest = ShouldPreferNearestGuideTable(TrimmedTable);
+	ATableMarkerActor* BestTable = nullptr;
+	float BestDistanceSq = TNumericLimits<float>::Max();
+
+	for (TActorIterator<ATableMarkerActor> It(World); It; ++It)
+	{
+		ATableMarkerActor* TableMarker = *It;
+		if (!TableMarker || TableMarker->IsTableOccupied())
+		{
+			continue;
+		}
+
+		const float CandidateDistanceSq = DistanceReferenceActor
+			? FVector::DistSquared(TableMarker->GetActorLocation(), DistanceReferenceActor->GetActorLocation())
+			: 0.0f;
+
+		bool bIsBetter = false;
+		if (!BestTable)
+		{
+			bIsBetter = true;
+		}
+		else if (bPreferNearest)
+		{
+			bIsBetter = CandidateDistanceSq < BestDistanceSq - KINDA_SMALL_NUMBER
+				|| (FMath::IsNearlyEqual(CandidateDistanceSq, BestDistanceSq, 1.0f)
+					&& TableMarker->GetPriority() > BestTable->GetPriority());
+		}
+		else
+		{
+			bIsBetter = IsBetterSceneCandidate(
+				TableMarker->GetPriority(),
+				CandidateDistanceSq,
+				BestTable != nullptr,
+				BestTable->GetPriority(),
+				BestDistanceSq);
+		}
+
+		if (bIsBetter)
+		{
+			BestTable = TableMarker;
+			BestDistanceSq = CandidateDistanceSq;
+		}
+	}
+
+	return BestTable ? BestTable->GetTableID() : TEXT("");
+}
+
 bool UNPCMoveToTableComponent::StartGuideToTable(const FString& TableID)
 {
-	const FString TrimmedTableID = TableID.TrimStartAndEnd();
+	const FString RequestedTableID = TableID.TrimStartAndEnd();
+	UE_LOG(LogTemp, Warning, TEXT("[Guide] Requested table target: %s"), *RequestedTableID);
+
+	const FString TrimmedTableID = ResolveGuideTableTarget(RequestedTableID);
 	if (TrimmedTableID.IsEmpty())
 	{
-		PrintDebugMessage(TEXT("Guide table target is empty"), FColor::Red);
+		const FString Message = FString::Printf(TEXT("[Guide] Failed to resolve table target: %s"), *RequestedTableID);
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *Message);
+		PrintDebugMessage(Message, FColor::Red);
 		return false;
 	}
+	UE_LOG(LogTemp, Warning, TEXT("[Guide] Resolved table target: %s"), *TrimmedTableID);
 
 	CancelFollowingForExplicitCommand();
 	SetMovementMode(ENPCMovementMode::GuidePlayer);

@@ -399,6 +399,8 @@ private:
 
 	FString PickGuideLine(const TArray<FString>& Variants, const FString& FallbackLine, FString& LastLine);
 
+	FString ResolveGuideTableTarget(const FString& RequestedTable) const;
+
 	void UpdateGuidePlayer(AActor* Owner, float DeltaTime);
 
 	bool StartGuideMovementToSavedTarget();

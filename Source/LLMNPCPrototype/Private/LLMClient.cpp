@@ -580,6 +580,18 @@ void ULLMClient::SetVoicevoxTTSClient(UVoicevoxTTSClient* InVoicevoxTTSClient)
     VoicevoxTTSClient = InVoicevoxTTSClient;
 }
 
+void ULLMClient::SpeakDirectText(const FString& Text)
+{
+    const FString TrimmedText = Text.TrimStartAndEnd();
+    if (TrimmedText.IsEmpty())
+    {
+        return;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("[Speech] SpeakDirectText: %s"), *TrimmedText);
+    HandleFinalReplyText(TrimmedText);
+}
+
 void ULLMClient::SendDeepSeekMessage(const FString& UserMessage)
 {
     InterruptCurrentVoicevoxSpeech();
@@ -752,6 +764,8 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- For a simple explicit table movement, output action_sequence item=\"[{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_03\\\"}]\" using the normalized Table_XX target.\n"
             "- Guide-player commands mean the NPC leads the player to a destination and waits if the player falls behind. They are different from ordinary commanded moves and different from follow_player.\n"
             "- If the user says \u5E26\u6211\u53BB3\u53F7\u684C, \u6848\u5185\u6211\u52303\u53F7\u684C, \u5E26\u8DEF\u53BB3\u53F7\u684C, show me to table 3, or guide me to table 3, output {\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"Table_03\",\"quantity\":0}.\n"
+            "- In the entrance/reception flow, if the user confirms dining or asks to be seated, such as \u662F, \u53EF\u4EE5, \u6211\u8981\u7528\u9910, \u7528\u9910, \u5E26\u6211\u53BB\u5EA7\u4F4D, \u5E26\u6211\u53BB\u5E2D\u4F4D, yes, sure, seat me, \u306F\u3044, \u304A\u9858\u3044\u3057\u307E\u3059, or \u304A\u5E2D\u3078\u304A\u9858\u3044\u3057\u307E\u3059, output {\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"nearest\",\"quantity\":0}.\n"
+            "- If the user asks Haruka to guide, lead, show, or take them to a seat or table without an explicit Table_XX ID, output guide_player_to_table with item \"nearest\" instead of guide_to_table.\n"
             "- If the user says \u5E26\u6211\u53BB\u5427\u53F0, \u6848\u5185\u6211\u5230\u5427\u53F0, or show me to the counter, output {\"type\":\"guide_player_to_scene_tag\",\"timing\":\"immediate\",\"item\":\"counter\",\"quantity\":0}.\n"
             "- If the user says \u4E0D\u7528\u5E26\u8DEF\u4E86, \u505C\u6B62\u6848\u5185, or stop guiding, output {\"type\":\"stop_guide_player\",\"timing\":\"immediate\",\"item\":\"\",\"quantity\":0}.\n"
             "- If the user asks to find the player and then greet or speak, such as \u53BB\u627E\u73A9\u5BB6\u7136\u540E\u6253\u62DB\u547C, \u6765\u627E\u6211\u7136\u540E\u8BF4\u8BDD, or find the player and greet them, output action_sequence item=\"[{\\\"type\\\":\\\"move_near_player\\\",\\\"target\\\":\\\"player\\\"},{\\\"type\\\":\\\"face_player\\\",\\\"target\\\":\\\"player\\\"}]\".\n"
@@ -770,13 +784,13 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- If the user says \u53BB1\u53F7\u684C\u518D\u56DE\u5230\u5427\u53F0 or first go to Table_01 and then return to the counter, preserve that order and output action_sequence item=\"[{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_01\\\"},{\\\"type\\\":\\\"move_to_scene_tag\\\",\\\"target\\\":\\\"counter\\\"}]\".\n"
             "- If the user says \u5148\u53BB\u5427\u53F0\u518D\u56DE\u52301\u53F7\u684C or first go to counter and then return to Table_01, preserve that order and output action_sequence item=\"[{\\\"type\\\":\\\"move_to_scene_tag\\\",\\\"target\\\":\\\"counter\\\"},{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_01\\\"}]\".\n"
             "- If the user explicitly names a table together with counter, prefer action_sequence and never collapse it into counter_then_return.\n"
-            "- Use guide_to_table only for table-selection hints where no explicit table ID is given, such as nearest, empty, window, corner, or counter_side; guide_to_table is not GuidePlayer mode.\n"
+            "- guide_to_table is legacy and unsupported for player seating. For seating, table-selection, nearest table, available table, or any request where Haruka should lead the player, use guide_player_to_table.\n"
             "- If the user asks Haruka to guide, lead, show, or take them to an explicit Table_XX table, output guide_player_to_table instead of guide_to_table or ordinary action_sequence.\n"
-            "- Table-selection examples for guide_to_table include: \u6700\u8FD1\u7684\u684C\u5B50, nearest table, \u7A7A\u3044\u3066\u3044\u308B\u5E2D, \u9760\u7A97\u7684\u684C\u5B50, window table, \u89D2\u843D\u7684\u684C\u5B50, corner table, \u5427\u53F0\u65C1\u8FB9\u7684\u684C\u5B50, counter side table.\n"
-            "- For guide_to_table, set quantity to 0.\n"
-            "- For guide_to_table, set item using exactly these table hint rules: nearest table or \u6700\u8FD1\u7684\u684C\u5B50 -> \"nearest\"; empty table, available table, \u7A7A\u3044\u3066\u3044\u308B\u5E2D, or \u7A7A\u684C -> \"empty\"; window or \u9760\u7A97 -> \"window\"; corner or \u89D2\u843D -> \"corner\"; counter side or \u5427\u53F0\u65C1\u8FB9 -> \"counter_side\".\n"
-            "- guide_to_table action format is {\"type\":\"guide_to_table\",\"timing\":\"immediate\",\"item\":\"table hint\",\"quantity\":0}.\n"
-            "- When using guide_to_table, the reply may be one short natural Japanese sentence such as \"\u306F\u3044\u3001\u3054\u6848\u5185\u3057\u307E\u3059\u306D\u3002\" or \"\u3053\u3061\u3089\u306E\u304A\u5E2D\u3078\u3054\u6848\u5185\u3057\u307E\u3059\u3002\".\n"
+            "- Table-selection examples for guide_player_to_table include: \u6700\u8FD1\u306E\u684C\u5B50, nearest table, \u7A7A\u3044\u3066\u3044\u308B\u5E2D, available seat, \u304A\u5E2D, or seat me.\n"
+            "- For guide_player_to_table, set quantity to 0.\n"
+            "- For guide_player_to_table, set item using exactly these table hint rules: nearest table, available table, available seat, seat me, \u304A\u5E2D, \u6700\u8FD1\u306E\u684C\u5B50, \u7A7A\u3044\u3066\u3044\u308B\u5E2D, or \u7A7A\u684C -> \"nearest\".\n"
+            "- guide_player_to_table action format is {\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"table hint or Table_XX\",\"quantity\":0}.\n"
+            "- When using guide_player_to_table, the reply may be one short natural Japanese sentence such as \"\u306F\u3044\u3001\u3054\u6848\u5185\u3057\u307E\u3059\u306D\u3002\" or \"\u3053\u3061\u3089\u306E\u304A\u5E2D\u3078\u3054\u6848\u5185\u3057\u307E\u3059\u3002\".\n"
             "- Do not use after_speech for greet, explain, or recommend.\n"
             "- For a confirmed user order, use place_order.\n"
             "- Use after_speech only for place_order if needed.\n"

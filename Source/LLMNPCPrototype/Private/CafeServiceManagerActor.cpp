@@ -100,15 +100,14 @@ void ACafeServiceManagerActor::SubmitReceptionResponse(int32 PartySize, bool bWa
 		return;
 	}
 
-	if (PartySize <= 0)
+	if (CurrentPartySize <= 0)
 	{
-		RequestMaidSpeech(FText::FromString(TEXT("恐れ入ります。何名様でご利用でしょうか？")));
-		return;
+		CurrentPartySize = 1;
 	}
 
 	SetState(ECafeServiceState::SelectingSeat);
 
-	const ATableMarkerActor* BestTable = FindBestAvailableTable(PartySize);
+	const ATableMarkerActor* BestTable = FindBestAvailableTable(CurrentPartySize);
 	if (!BestTable)
 	{
 		PrintDebugMessage(TEXT("No available table"), FColor::Red);
@@ -121,7 +120,7 @@ void ACafeServiceManagerActor::SubmitReceptionResponse(int32 PartySize, bool bWa
 	RequestMaidSpeech(FText::FromString(TEXT("かしこまりました。お席へご案内します。")));
 	SetState(ECafeServiceState::GuidingToSeat);
 
-	if (!MaidMoveComponent || !MaidMoveComponent->MoveToTableByID(TargetTableID))
+	if (!MaidMoveComponent || !MaidMoveComponent->StartGuideToTable(TargetTableID))
 	{
 		PrintDebugMessage(TEXT("Failed to start table guide movement"), FColor::Red);
 		SetState(ECafeServiceState::WaitingForReceptionResponse);
@@ -195,7 +194,7 @@ void ACafeServiceManagerActor::HandleMaidMoveCompleted(FName MoveReason, FString
 		if (bSuccess)
 		{
 			SetState(ECafeServiceState::ReceptionGreeting);
-			RequestMaidSpeech(FText::FromString(TEXT("いらっしゃいませ。何名様ですか？店内でお食事のご利用でよろしいでしょうか？")));
+			RequestMaidSpeech(FText::FromString(TEXT("\u3044\u3089\u3063\u3057\u3083\u3044\u307E\u305B\u3002\u304A\u98DF\u4E8B\u3067\u306E\u3054\u5229\u7528\u3067\u3057\u3087\u3046\u304B\uFF1F")));
 			SetState(ECafeServiceState::WaitingForReceptionResponse);
 		}
 		else
