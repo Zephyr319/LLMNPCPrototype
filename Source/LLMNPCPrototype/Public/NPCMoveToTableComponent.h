@@ -12,6 +12,16 @@ class ACafeTargetPointActor;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FNPCMoveCompletedSignature, FName, MoveReason, FString, TargetID, bool, bSuccess);
 
+UENUM(BlueprintType)
+enum class ENPCMovementMode : uint8
+{
+	Idle UMETA(DisplayName = "Idle"),
+	FollowPlayer UMETA(DisplayName = "Follow Player"),
+	CommandedMove UMETA(DisplayName = "Commanded Move"),
+	GuidePlayer UMETA(DisplayName = "Guide Player"),
+	SeekPlayer UMETA(DisplayName = "Seek Player")
+};
+
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class UNPCMoveToTableComponent : public UActorComponent
 {
@@ -24,6 +34,39 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement")
 	float MoveSpeed;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement|Dynamic Speed")
+	bool bUseDynamicMoveSpeed = true;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement|Dynamic Speed")
+	float WalkSpeed = 90.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement|Dynamic Speed")
+	float RunSpeed = 220.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement|Dynamic Speed")
+	float RunStartDistance = 500.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement|Dynamic Speed")
+	float WalkResumeDistance = 250.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement|Dynamic Speed")
+	float SlowDownDistance = 140.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement|Dynamic Speed")
+	float MinApproachSpeed = 55.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement|Dynamic Speed")
+	float SpeedInterpRate = 5.0f;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Table Movement|Dynamic Speed")
+	bool bIsRunning = false;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Table Movement|Dynamic Speed")
+	float RemainingMoveDistance = 0.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement|Dynamic Speed")
+	bool bPrintMoveSpeedDebug = false;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement")
 	float AcceptanceRadius;
@@ -61,6 +104,12 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement")
 	bool bStopOnCollisionHit;
 
+	UPROPERTY(BlueprintReadOnly, Category = "NPC|Movement")
+	ENPCMovementMode MovementMode = ENPCMovementMode::Idle;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Movement")
+	bool bExplicitCommandCancelsFollow = true;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Approach Location")
 	bool bUseAutomaticApproachLocation;
 
@@ -94,6 +143,48 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Approach Location")
 	bool bPrintApproachCandidateRejectReasons;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Player")
+	float PlayerApproachDistance = 140.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Player")
+	float FollowStartDistance = 280.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Player")
+	float FollowStopDistance = 170.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Player")
+	float FollowDesiredDistance = 160.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Player")
+	float FollowUpdateInterval = 0.5f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Player")
+	float FollowMinRepathInterval = 1.2f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Player")
+	float FollowRepathPlayerMoveThreshold = 180.0f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "NPC|Player")
+	bool bIsFollowingPlayer = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "NPC|Player")
+	bool bFollowMoveInProgress = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Player")
+	bool bPrintFollowDebug = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "NPC|Guide")
+	bool bIsGuidingPlayer = false;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide")
+	float GuidePlayerMaxDistance = 450.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide")
+	float GuidePlayerResumeDistance = 280.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide")
+	float GuideCheckInterval = 0.5f;
+
 	UPROPERTY(BlueprintAssignable, Category = "Table Movement")
 	FNPCMoveCompletedSignature OnNPCMoveCompleted;
 
@@ -105,6 +196,33 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "Table Movement")
 	bool MoveNearActor(AActor* TargetActor, float StopDistance = 120.0f);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC|Player")
+	AActor* FindPlayerActor() const;
+
+	UFUNCTION(BlueprintCallable, Category = "NPC|Player")
+	bool MoveNearPlayer(float StopDistance = 140.0f);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC|Player")
+	void StartFollowingPlayer(float DesiredDistance = 160.0f);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC|Player")
+	void StopFollowingPlayer();
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC|Player")
+	bool IsFollowingPlayer() const;
+
+	UFUNCTION(BlueprintCallable, Category = "NPC|Guide")
+	bool StartGuideToTable(const FString& TableID);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC|Guide")
+	bool StartGuideToSceneTag(const FString& TargetTag);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC|Guide")
+	void StopGuidingPlayer();
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC|Guide")
+	bool IsGuidingPlayer() const;
 
 	UFUNCTION(BlueprintCallable, Category = "Scene Target Movement")
 	bool MoveToFurnitureByID(const FString& FurnitureID);
@@ -130,6 +248,15 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Table Movement")
 	void StopMovingToTable();
 
+	UFUNCTION(BlueprintCallable, Category = "NPC|Movement")
+	void SetMovementMode(ENPCMovementMode NewMode);
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC|Movement")
+	ENPCMovementMode GetMovementMode() const;
+
+	UFUNCTION(BlueprintCallable, Category = "NPC|Player")
+	void CancelFollowingForExplicitCommand();
+
 private:
 	FVector TargetLocation;
 
@@ -140,6 +267,32 @@ private:
 	FName CurrentMoveReason;
 
 	FString CurrentMoveTargetID;
+
+	TWeakObjectPtr<AActor> FollowPlayerActor;
+
+	FVector LastFollowPlayerLocation = FVector::ZeroVector;
+
+	FVector LastFollowGoalLocation = FVector::ZeroVector;
+
+	float FollowUpdateTimer = 0.0f;
+
+	float FollowRepathTimer = 0.0f;
+
+	float FollowDebugTimer = 0.0f;
+
+	bool bPrintedFollowModeSkipWarning = false;
+
+	TWeakObjectPtr<AActor> GuidePlayerActor;
+
+	float GuideCheckTimer = 0.0f;
+
+	bool bGuidePausedForPlayer = false;
+
+	FString GuideTargetType;
+
+	FString GuideTargetID;
+
+	bool bPreserveMovementModeForGuideMove = false;
 
 	bool StartMovingToTable(const ATableMarkerActor* TableMarker, bool bRequireNavigationPath = false);
 
@@ -166,6 +319,16 @@ private:
 	float ScoreApproachCandidate(const FVector& CandidateLocation, const FVector& OwnerLocation, const FVector& ApproachTargetLocation, const FVector& TargetForward, float DesiredDistance, bool bHasLineOfSight, float PathLength) const;
 
 	bool IsApproachLocationFree(const FVector& Location, const AActor* TargetActor = nullptr) const;
+
+	float CalculateRemainingPathDistance() const;
+
+	float GetDesiredMoveSpeed(float RemainingDistance);
+
+	void UpdateFollowPlayer(AActor* Owner, float DeltaTime);
+
+	void UpdateGuidePlayer(AActor* Owner, float DeltaTime);
+
+	bool ResumeGuideMove();
 
 	void FinishMoveToTable(AActor* Owner);
 
@@ -194,4 +357,6 @@ private:
 	bool DoesTagMatchStringArray(const FString& TargetTag, const TArray<FString>& Tags) const;
 
 	void PrintDebugMessage(const FString& Message, const FColor& Color) const;
+
+	float MoveSpeedDebugTimer = 0.0f;
 };

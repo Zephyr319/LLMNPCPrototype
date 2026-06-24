@@ -8,6 +8,7 @@
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "GameFramework/Character.h"
 #include "Kismet/GameplayStatics.h"
 #include "NPCFaceTargetComponent.h"
 #include "NPCMoveToTableComponent.h"
@@ -158,6 +159,19 @@ void UNPCActionQueueComponent::StartActionQueue()
 	CacheOwnerComponents();
 	BindMoveCompletedEvent();
 
+	const bool bQueueContainsMove = ActionQueue.ContainsByPredicate([](const FNPCQueuedAction& Action)
+	{
+		return Action.ActionType == ENPCQueuedActionType::MoveToTableID
+			|| Action.ActionType == ENPCQueuedActionType::MoveToSceneTag
+			|| Action.ActionType == ENPCQueuedActionType::MoveToFurnitureTag
+			|| Action.ActionType == ENPCQueuedActionType::MoveToFurnitureID
+			|| Action.ActionType == ENPCQueuedActionType::MoveNearPlayer;
+	});
+	if (bQueueContainsMove)
+	{
+		CancelFollowingForExplicitCommand();
+	}
+
 	bIsRunningQueue = true;
 	bWaitingForMove = false;
 	PrintDebugMessage(TEXT("NPC action queue started"), FColor::Green);
@@ -173,6 +187,7 @@ void UNPCActionQueueComponent::RunCounterAndReturnToTable(const FString& ReturnT
 		return;
 	}
 
+	CancelFollowingForExplicitCommand();
 	ClearActionQueue();
 	EnqueueMoveToSceneTag(TEXT("counter"));
 	EnqueueWait(1.0f);
@@ -183,11 +198,98 @@ void UNPCActionQueueComponent::RunCounterAndReturnToTable(const FString& ReturnT
 void UNPCActionQueueComponent::RunCounterAndReturnToPlayer()
 {
 	PrintDebugMessage(TEXT("Run counter and return to player"), FColor::Green);
+	CancelFollowingForExplicitCommand();
 	ClearActionQueue();
 	EnqueueMoveToSceneTag(TEXT("counter"));
 	EnqueueWait(1.0f);
-	EnqueueMoveNearPlayer(120.0f);
+	EnqueueMoveNearPlayer(140.0f);
 	StartActionQueue();
+}
+
+void UNPCActionQueueComponent::RunMoveNearPlayer(float StopDistance)
+{
+	PrintDebugMessage(TEXT("Run move near player"), FColor::Green);
+	CancelFollowingForExplicitCommand();
+	ClearActionQueue();
+	EnqueueMoveNearPlayer(StopDistance);
+	StartActionQueue();
+}
+
+void UNPCActionQueueComponent::RunStartFollowPlayer(float DesiredDistance)
+{
+	PrintDebugMessage(TEXT("Start following player"), FColor::Green);
+	ClearActionQueue();
+
+	CacheOwnerComponents();
+	if (!MoveComponent)
+	{
+		PrintDebugMessage(TEXT("NPCMoveToTableComponent not found"), FColor::Red);
+		return;
+	}
+
+	MoveComponent->StartFollowingPlayer(DesiredDistance);
+}
+
+void UNPCActionQueueComponent::RunStopFollowPlayer()
+{
+	PrintDebugMessage(TEXT("Stop following player"), FColor::Yellow);
+	ClearActionQueue();
+
+	CacheOwnerComponents();
+	if (!MoveComponent)
+	{
+		PrintDebugMessage(TEXT("NPCMoveToTableComponent not found"), FColor::Red);
+		return;
+	}
+
+	MoveComponent->StopFollowingPlayer();
+}
+
+void UNPCActionQueueComponent::RunGuidePlayerToTable(const FString& TableID)
+{
+	const FString TrimmedTableID = TableID.TrimStartAndEnd();
+	PrintDebugMessage(FString::Printf(TEXT("Run guide player to table: %s"), *TrimmedTableID), FColor::Green);
+	ClearActionQueue();
+
+	CacheOwnerComponents();
+	if (!MoveComponent)
+	{
+		PrintDebugMessage(TEXT("NPCMoveToTableComponent not found"), FColor::Red);
+		return;
+	}
+
+	MoveComponent->StartGuideToTable(TrimmedTableID);
+}
+
+void UNPCActionQueueComponent::RunGuidePlayerToSceneTag(const FString& TargetTag)
+{
+	const FString TrimmedTargetTag = TargetTag.TrimStartAndEnd();
+	PrintDebugMessage(FString::Printf(TEXT("Run guide player to scene tag: %s"), *TrimmedTargetTag), FColor::Green);
+	ClearActionQueue();
+
+	CacheOwnerComponents();
+	if (!MoveComponent)
+	{
+		PrintDebugMessage(TEXT("NPCMoveToTableComponent not found"), FColor::Red);
+		return;
+	}
+
+	MoveComponent->StartGuideToSceneTag(TrimmedTargetTag);
+}
+
+void UNPCActionQueueComponent::RunStopGuidePlayer()
+{
+	PrintDebugMessage(TEXT("Stop guiding player"), FColor::Yellow);
+	ClearActionQueue();
+
+	CacheOwnerComponents();
+	if (!MoveComponent)
+	{
+		PrintDebugMessage(TEXT("NPCMoveToTableComponent not found"), FColor::Red);
+		return;
+	}
+
+	MoveComponent->StopGuidingPlayer();
 }
 
 void UNPCActionQueueComponent::RunTableRouteFromString(const FString& RouteString)
@@ -195,6 +297,7 @@ void UNPCActionQueueComponent::RunTableRouteFromString(const FString& RouteStrin
 	const FString TrimmedRouteString = RouteString.TrimStartAndEnd();
 	PrintDebugMessage(FString::Printf(TEXT("Run table route: %s"), *TrimmedRouteString), FColor::Green);
 
+	CancelFollowingForExplicitCommand();
 	ClearActionQueue();
 
 	TArray<FString> RouteTableIDs;
@@ -231,6 +334,43 @@ void UNPCActionQueueComponent::RunActionSequenceFromJson(const FString& Sequence
 	{
 		PrintDebugMessage(TEXT("Action sequence JSON parse failed"), FColor::Red);
 		return;
+	}
+
+	bool bFoundFirstValidStep = false;
+	bool bFirstValidStepIsDirectControl = false;
+	for (const TSharedPtr<FJsonValue>& StepValue : SequenceSteps)
+	{
+		const TSharedPtr<FJsonObject> StepObject = StepValue.IsValid() ? StepValue->AsObject() : nullptr;
+		if (!StepObject.IsValid())
+		{
+			continue;
+		}
+
+		FString StepType;
+		if (!StepObject->TryGetStringField(TEXT("type"), StepType))
+		{
+			continue;
+		}
+
+		StepType = StepType.TrimStartAndEnd();
+		if (StepType.IsEmpty())
+		{
+			continue;
+		}
+
+		bFoundFirstValidStep = true;
+		bFirstValidStepIsDirectControl =
+			StepType.Equals(TEXT("follow_player"), ESearchCase::IgnoreCase)
+			|| StepType.Equals(TEXT("stop_follow_player"), ESearchCase::IgnoreCase)
+			|| StepType.Equals(TEXT("guide_player_to_table"), ESearchCase::IgnoreCase)
+			|| StepType.Equals(TEXT("guide_player_to_scene_tag"), ESearchCase::IgnoreCase)
+			|| StepType.Equals(TEXT("stop_guide_player"), ESearchCase::IgnoreCase);
+		break;
+	}
+
+	if (bFoundFirstValidStep && !bFirstValidStepIsDirectControl)
+	{
+		CancelFollowingForExplicitCommand();
 	}
 
 	ClearActionQueue();
@@ -276,8 +416,37 @@ void UNPCActionQueueComponent::RunActionSequenceFromJson(const FString& Sequence
 		}
 		else if (StepType.Equals(TEXT("move_near_player"), ESearchCase::IgnoreCase))
 		{
-			PrintDebugMessage(TEXT("Enqueue sequence step: move_near_player"), FColor::Green);
-			EnqueueMoveNearPlayer(120.0f);
+			double StopDistance = 140.0;
+			StepObject->TryGetNumberField(TEXT("distance"), StopDistance);
+			PrintDebugMessage(TEXT("Enqueue sequence step: move_near_player / player"), FColor::Green);
+			EnqueueMoveNearPlayer(static_cast<float>(StopDistance));
+		}
+		else if (StepType.Equals(TEXT("follow_player"), ESearchCase::IgnoreCase))
+		{
+			double DesiredDistance = 160.0;
+			StepObject->TryGetNumberField(TEXT("distance"), DesiredDistance);
+			RunStartFollowPlayer(static_cast<float>(DesiredDistance));
+			return;
+		}
+		else if (StepType.Equals(TEXT("stop_follow_player"), ESearchCase::IgnoreCase))
+		{
+			RunStopFollowPlayer();
+			return;
+		}
+		else if (StepType.Equals(TEXT("guide_player_to_table"), ESearchCase::IgnoreCase))
+		{
+			RunGuidePlayerToTable(Target);
+			return;
+		}
+		else if (StepType.Equals(TEXT("guide_player_to_scene_tag"), ESearchCase::IgnoreCase))
+		{
+			RunGuidePlayerToSceneTag(Target);
+			return;
+		}
+		else if (StepType.Equals(TEXT("stop_guide_player"), ESearchCase::IgnoreCase))
+		{
+			RunStopGuidePlayer();
+			return;
 		}
 		else if (StepType.Equals(TEXT("wait"), ESearchCase::IgnoreCase))
 		{
@@ -308,6 +477,8 @@ void UNPCActionQueueComponent::RunActionSequenceFromJson(const FString& Sequence
 
 void UNPCActionQueueComponent::RunCounterAndReturnToCurrentTable()
 {
+	CancelFollowingForExplicitCommand();
+
 	const FString ResolvedTableID = ResolveCurrentServiceTableID();
 	if (ResolvedTableID.IsEmpty())
 	{
@@ -342,6 +513,15 @@ void UNPCActionQueueComponent::CacheOwnerComponents()
 
 	MoveComponent = Owner->FindComponentByClass<UNPCMoveToTableComponent>();
 	FaceTargetComponent = Owner->FindComponentByClass<UNPCFaceTargetComponent>();
+}
+
+void UNPCActionQueueComponent::CancelFollowingForExplicitCommand()
+{
+	CacheOwnerComponents();
+	if (MoveComponent)
+	{
+		MoveComponent->CancelFollowingForExplicitCommand();
+	}
 }
 
 void UNPCActionQueueComponent::BindMoveCompletedEvent()
@@ -440,6 +620,7 @@ void UNPCActionQueueComponent::ExecuteMoveAction()
 
 	bool bMoveStarted = false;
 	bWaitingForMove = true;
+	MoveComponent->CancelFollowingForExplicitCommand();
 
 	switch (CurrentAction.ActionType)
 	{
@@ -460,19 +641,9 @@ void UNPCActionQueueComponent::ExecuteMoveAction()
 		break;
 
 	case ENPCQueuedActionType::MoveNearPlayer:
-	{
-		AActor* PlayerActor = FindPlayerActor();
-		if (!PlayerActor)
-		{
-			bWaitingForMove = false;
-			CompleteCurrentAction(false, TEXT("Player actor not found for action queue"));
-			return;
-		}
-
 		PrintDebugMessage(TEXT("Move near player"), FColor::Green);
-		bMoveStarted = MoveComponent->MoveNearActor(PlayerActor, CurrentAction.StopDistance);
+		bMoveStarted = MoveComponent->MoveNearPlayer(CurrentAction.StopDistance);
 		break;
-	}
 
 	default:
 		bWaitingForMove = false;
@@ -600,7 +771,12 @@ FString UNPCActionQueueComponent::ResolveCurrentServiceTableID() const
 
 AActor* UNPCActionQueueComponent::FindPlayerActor() const
 {
-	return UGameplayStatics::GetPlayerPawn(GetWorld(), 0);
+	if (AActor* PlayerPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0))
+	{
+		return PlayerPawn;
+	}
+
+	return UGameplayStatics::GetPlayerCharacter(GetWorld(), 0);
 }
 
 void UNPCActionQueueComponent::FaceOwnerTowardActor(AActor* TargetActor) const

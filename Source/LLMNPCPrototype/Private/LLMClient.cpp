@@ -246,6 +246,18 @@ namespace
             {
                 AddSequenceStep(Steps, TEXT("move_to_table"), Item);
             }
+            else if (ActionType.Equals(TEXT("guide_player_to_table"), ESearchCase::IgnoreCase))
+            {
+                AddSequenceStep(Steps, TEXT("guide_player_to_table"), Item);
+            }
+            else if (ActionType.Equals(TEXT("guide_player_to_scene_tag"), ESearchCase::IgnoreCase))
+            {
+                AddSequenceStep(Steps, TEXT("guide_player_to_scene_tag"), Item);
+            }
+            else if (ActionType.Equals(TEXT("stop_guide_player"), ESearchCase::IgnoreCase))
+            {
+                AddSequenceStep(Steps, TEXT("stop_guide_player"));
+            }
             else if (ActionType.Equals(TEXT("counter_then_return"), ESearchCase::IgnoreCase))
             {
                 AddSequenceStep(Steps, TEXT("move_to_scene_tag"), TEXT("counter"));
@@ -269,6 +281,14 @@ namespace
             else if (ActionType.Equals(TEXT("move_near_player"), ESearchCase::IgnoreCase))
             {
                 AddSequenceStep(Steps, TEXT("move_near_player"), TEXT("player"));
+            }
+            else if (ActionType.Equals(TEXT("follow_player"), ESearchCase::IgnoreCase))
+            {
+                AddSequenceStep(Steps, TEXT("follow_player"), TEXT("player"));
+            }
+            else if (ActionType.Equals(TEXT("stop_follow_player"), ESearchCase::IgnoreCase))
+            {
+                AddSequenceStep(Steps, TEXT("stop_follow_player"), TEXT("player"));
             }
             else if (ActionType.Equals(TEXT("wait"), ESearchCase::IgnoreCase))
             {
@@ -714,17 +734,28 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- actions may be used without speech.\n"
             "- If no speech is needed, set \"reply\" to \"\".\n"
             "- If no action is needed, use an empty actions array.\n"
-            "- Use only these action types: greet, explain, recommend, place_order, guide_to_table, counter_then_return, table_route, action_sequence, none.\n"
+            "- Use only these action types: greet, explain, recommend, place_order, guide_to_table, guide_player_to_table, guide_player_to_scene_tag, stop_guide_player, counter_then_return, table_route, action_sequence, move_near_player, follow_player, stop_follow_player, none.\n"
             "- Do not invent unsupported action types.\n"
             "- For greeting or self-introduction, use greet with timing immediate or before_speech.\n"
             "- For explaining the menu, use explain with timing before_speech or during_speech.\n"
             "- For recommending a food item, use recommend with timing before_speech or during_speech.\n"
             "- For any multi-step plan or route, especially with sequence words such as \u5148, \u7136\u540E, \u518D, \u6700\u540E, \u9806\u756A\u306B, \u3057\u3066\u304B\u3089, or and then, do not output multiple independent actions.\n"
             "- For multi-step plans, output exactly one action: {\"type\":\"action_sequence\",\"timing\":\"immediate\",\"item\":\"JSON string of steps\",\"quantity\":0}.\n"
-            "- The action_sequence item must be a JSON array string. Allowed step types are move_to_table, move_to_scene_tag, move_to_furniture_tag, move_to_furniture_id, move_near_player, wait, and face_player.\n"
+            "- The action_sequence item must be a JSON array string. Allowed step types are move_to_table, move_to_scene_tag, move_to_furniture_tag, move_to_furniture_id, move_near_player, follow_player, stop_follow_player, guide_player_to_table, guide_player_to_scene_tag, stop_guide_player, wait, and face_player.\n"
             "- action_sequence example for a table route: item=\"[{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_04\\\"},{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_03\\\"},{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_02\\\"},{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_01\\\"}]\".\n"
             "- action_sequence example for counter then return to player: item=\"[{\\\"type\\\":\\\"move_to_scene_tag\\\",\\\"target\\\":\\\"counter\\\"},{\\\"type\\\":\\\"wait\\\",\\\"seconds\\\":1.0},{\\\"type\\\":\\\"move_near_player\\\",\\\"target\\\":\\\"player\\\"}]\".\n"
             "- action_sequence example for cleaning, watering, counter, then greeting: item=\"[{\\\"type\\\":\\\"move_to_scene_tag\\\",\\\"target\\\":\\\"cleaning\\\"},{\\\"type\\\":\\\"wait\\\",\\\"seconds\\\":2.0},{\\\"type\\\":\\\"move_to_scene_tag\\\",\\\"target\\\":\\\"watering\\\"},{\\\"type\\\":\\\"wait\\\",\\\"seconds\\\":1.5},{\\\"type\\\":\\\"move_to_scene_tag\\\",\\\"target\\\":\\\"counter\\\"},{\\\"type\\\":\\\"move_near_player\\\",\\\"target\\\":\\\"player\\\"},{\\\"type\\\":\\\"face_player\\\"}]\".\n"
+            "- If the user says \u8FC7\u6765, \u6765\u6211\u8FD9\u91CC, \u6765\u5230\u6211\u8EAB\u8FB9, \u6765\u627E\u6211, come here, come to me, or \u3053\u3063\u3061\u306B\u6765\u3066, output {\"type\":\"move_near_player\",\"timing\":\"immediate\",\"item\":\"player\",\"quantity\":0} or an action_sequence with one move_near_player step.\n"
+            "- If the user says \u8DDF\u7740\u6211, \u966A\u6211\u8D70, \u8DDF\u6211\u6765, follow me, come with me, or \u3064\u3044\u3066\u304D\u3066, output {\"type\":\"follow_player\",\"timing\":\"immediate\",\"item\":\"player\",\"quantity\":0}.\n"
+            "- If the user says \u4E0D\u7528\u8DDF\u4E86, \u522B\u8DDF\u7740\u6211\u4E86, \u505C\u4E0B, \u5728\u90A3\u91CC\u7B49\u7740, stop following me, or wait there, output {\"type\":\"stop_follow_player\",\"timing\":\"immediate\",\"item\":\"player\",\"quantity\":0}.\n"
+            "- Explicit movement commands such as \u53BB3\u53F7\u684C, \u524D\u5F803\u53F7\u684C, go to Table_03, \u53BB\u5427\u53F0, or \u524D\u5F80\u5427\u53F0 are ordinary commanded moves. They must not output follow_player, must not keep following the player, and must not output counter_then_return unless the user explicitly asks to come back.\n"
+            "- For a simple explicit table movement, output action_sequence item=\"[{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_03\\\"}]\" using the normalized Table_XX target.\n"
+            "- Guide-player commands mean the NPC leads the player to a destination and waits if the player falls behind. They are different from ordinary commanded moves and different from follow_player.\n"
+            "- If the user says \u5E26\u6211\u53BB3\u53F7\u684C, \u6848\u5185\u6211\u52303\u53F7\u684C, \u5E26\u8DEF\u53BB3\u53F7\u684C, show me to table 3, or guide me to table 3, output {\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"Table_03\",\"quantity\":0}.\n"
+            "- If the user says \u5E26\u6211\u53BB\u5427\u53F0, \u6848\u5185\u6211\u5230\u5427\u53F0, or show me to the counter, output {\"type\":\"guide_player_to_scene_tag\",\"timing\":\"immediate\",\"item\":\"counter\",\"quantity\":0}.\n"
+            "- If the user says \u4E0D\u7528\u5E26\u8DEF\u4E86, \u505C\u6B62\u6848\u5185, or stop guiding, output {\"type\":\"stop_guide_player\",\"timing\":\"immediate\",\"item\":\"\",\"quantity\":0}.\n"
+            "- If the user asks to find the player and then greet or speak, such as \u53BB\u627E\u73A9\u5BB6\u7136\u540E\u6253\u62DB\u547C, \u6765\u627E\u6211\u7136\u540E\u8BF4\u8BDD, or find the player and greet them, output action_sequence item=\"[{\\\"type\\\":\\\"move_near_player\\\",\\\"target\\\":\\\"player\\\"},{\\\"type\\\":\\\"face_player\\\",\\\"target\\\":\\\"player\\\"}]\".\n"
+            "- Never treat the player as a table, furniture, or scene target. The player is a dynamic target and must use target/item \"player\".\n"
             "- Normalize scene targets exactly: \u5427\u53F0, \u30AB\u30A6\u30F3\u30BF\u30FC, counter, or bar -> scene tag counter; \u6253\u626B, \u6E05\u626B, \u6383\u9664, or cleaning -> scene tag cleaning; \u6D47\u82B1, \u6C34\u3084\u308A, or watering -> scene tag watering; \u5BA2\u4EBA, \u73A9\u5BB6, player, user, or \u304A\u5BA2\u69D8 -> player.\n"
             "- Do not freely invent target IDs. Use only normalized table IDs, known scene tags, known furniture IDs/tags, or player.\n"
             "- For multi-step table route commands, do not output multiple guide_to_table actions.\n"
@@ -739,11 +770,11 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- If the user says \u53BB1\u53F7\u684C\u518D\u56DE\u5230\u5427\u53F0 or first go to Table_01 and then return to the counter, preserve that order and output action_sequence item=\"[{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_01\\\"},{\\\"type\\\":\\\"move_to_scene_tag\\\",\\\"target\\\":\\\"counter\\\"}]\".\n"
             "- If the user says \u5148\u53BB\u5427\u53F0\u518D\u56DE\u52301\u53F7\u684C or first go to counter and then return to Table_01, preserve that order and output action_sequence item=\"[{\\\"type\\\":\\\"move_to_scene_tag\\\",\\\"target\\\":\\\"counter\\\"},{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_01\\\"}]\".\n"
             "- If the user explicitly names a table together with counter, prefer action_sequence and never collapse it into counter_then_return.\n"
-            "- For guiding the user to a table or seat, use guide_to_table with timing immediate.\n"
-            "- Use guide_to_table when the user asks Haruka to guide, lead, take them, go to a table, go to a seat, or choose a suitable table.\n"
-            "- Table guidance examples include: \u53BB1\u53F7\u684C, \u5E26\u6211\u53BB1\u53F7\u684C, 1\u756A\u30C6\u30FC\u30D6\u30EB\u3078\u6848\u5185\u3057\u3066, \u6700\u8FD1\u7684\u684C\u5B50, nearest table, \u7A7A\u3044\u3066\u3044\u308B\u5E2D, \u9760\u7A97\u7684\u684C\u5B50, window table, \u89D2\u843D\u7684\u684C\u5B50, corner table, \u5427\u53F0\u65C1\u8FB9\u7684\u684C\u5B50, counter side table.\n"
+            "- Use guide_to_table only for table-selection hints where no explicit table ID is given, such as nearest, empty, window, corner, or counter_side; guide_to_table is not GuidePlayer mode.\n"
+            "- If the user asks Haruka to guide, lead, show, or take them to an explicit Table_XX table, output guide_player_to_table instead of guide_to_table or ordinary action_sequence.\n"
+            "- Table-selection examples for guide_to_table include: \u6700\u8FD1\u7684\u684C\u5B50, nearest table, \u7A7A\u3044\u3066\u3044\u308B\u5E2D, \u9760\u7A97\u7684\u684C\u5B50, window table, \u89D2\u843D\u7684\u684C\u5B50, corner table, \u5427\u53F0\u65C1\u8FB9\u7684\u684C\u5B50, counter side table.\n"
             "- For guide_to_table, set quantity to 0.\n"
-            "- For guide_to_table, set item using exactly these table hint rules: explicit 1\u53F7\u684C, Table 1, or 1\u756A\u30C6\u30FC\u30D6\u30EB -> \"Table_01\"; nearest table or \u6700\u8FD1\u7684\u684C\u5B50 -> \"nearest\"; empty table, available table, \u7A7A\u3044\u3066\u3044\u308B\u5E2D, or \u7A7A\u684C -> \"empty\"; window or \u9760\u7A97 -> \"window\"; corner or \u89D2\u843D -> \"corner\"; counter side or \u5427\u53F0\u65C1\u8FB9 -> \"counter_side\".\n"
+            "- For guide_to_table, set item using exactly these table hint rules: nearest table or \u6700\u8FD1\u7684\u684C\u5B50 -> \"nearest\"; empty table, available table, \u7A7A\u3044\u3066\u3044\u308B\u5E2D, or \u7A7A\u684C -> \"empty\"; window or \u9760\u7A97 -> \"window\"; corner or \u89D2\u843D -> \"corner\"; counter side or \u5427\u53F0\u65C1\u8FB9 -> \"counter_side\".\n"
             "- guide_to_table action format is {\"type\":\"guide_to_table\",\"timing\":\"immediate\",\"item\":\"table hint\",\"quantity\":0}.\n"
             "- When using guide_to_table, the reply may be one short natural Japanese sentence such as \"\u306F\u3044\u3001\u3054\u6848\u5185\u3057\u307E\u3059\u306D\u3002\" or \"\u3053\u3061\u3089\u306E\u304A\u5E2D\u3078\u3054\u6848\u5185\u3057\u307E\u3059\u3002\".\n"
             "- Do not use after_speech for greet, explain, or recommend.\n"
@@ -774,7 +805,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "  },\n"
             "  \"reply\": \"Japanese reply, or empty string when no speech is needed\",\n"
             "  \"actions\": [\n"
-            "    {\"type\":\"greet|explain|recommend|place_order|guide_to_table|counter_then_return|table_route|action_sequence|none\",\"timing\":\"immediate|before_speech|during_speech|after_speech\",\"item\":\"none, menu item, table hint, comma-separated table route, or JSON string steps for action_sequence\",\"return_table_id\":\"Table_01 or current_table when type is counter_then_return\",\"quantity\":0}\n"
+            "    {\"type\":\"greet|explain|recommend|place_order|guide_to_table|guide_player_to_table|guide_player_to_scene_tag|stop_guide_player|counter_then_return|table_route|action_sequence|move_near_player|follow_player|stop_follow_player|none\",\"timing\":\"immediate|before_speech|during_speech|after_speech\",\"item\":\"none, player, menu item, table hint, table ID, scene tag, comma-separated table route, or JSON string steps for action_sequence\",\"return_table_id\":\"Table_01 or current_table when type is counter_then_return\",\"quantity\":0}\n"
             "  ]\n"
             "}\n"
             "\n"
@@ -1010,6 +1041,11 @@ void ULLMClient::OnStrategyResponseReceived(
             Timing = Timing.TrimStartAndEnd();
 
             FString Item = GetStringFieldOrDefault(ActionObject, TEXT("item"), TEXT("none")).TrimStartAndEnd();
+            const FString TargetField = GetStringFieldOrDefault(ActionObject, TEXT("target"), TEXT("")).TrimStartAndEnd();
+            if ((Item.Equals(TEXT("none"), ESearchCase::IgnoreCase) || Item.IsEmpty()) && !TargetField.IsEmpty())
+            {
+                Item = TargetField;
+            }
             FString ReturnTableID = GetStringFieldOrDefault(ActionObject, TEXT("return_table_id"), TEXT("")).TrimStartAndEnd();
             int32 Quantity = 0;
             float WaitSeconds = 0.0f;
@@ -1044,6 +1080,11 @@ void ULLMClient::OnStrategyResponseReceived(
                         Item = GetStringFieldOrDefault(ArgsObject, TEXT("item"), TEXT("none")).TrimStartAndEnd();
                     }
 
+                    if (Item.Equals(TEXT("none"), ESearchCase::IgnoreCase) || Item.IsEmpty())
+                    {
+                        Item = GetStringFieldOrDefault(ArgsObject, TEXT("target"), TEXT("")).TrimStartAndEnd();
+                    }
+
                     if (ReturnTableID.IsEmpty())
                     {
                         ReturnTableID = GetStringFieldOrDefault(ArgsObject, TEXT("return_table_id"), TEXT("")).TrimStartAndEnd();
@@ -1066,6 +1107,10 @@ void ULLMClient::OnStrategyResponseReceived(
                 ActionType.Equals(TEXT("place_order"), ESearchCase::IgnoreCase) ||
                 ActionType.Equals(TEXT("PlaceOrder"), ESearchCase::IgnoreCase);
             const bool bIsCounterThenReturnAction = ActionType.Equals(TEXT("counter_then_return"), ESearchCase::IgnoreCase);
+            const bool bIsPlayerAction =
+                ActionType.Equals(TEXT("move_near_player"), ESearchCase::IgnoreCase) ||
+                ActionType.Equals(TEXT("follow_player"), ESearchCase::IgnoreCase) ||
+                ActionType.Equals(TEXT("stop_follow_player"), ESearchCase::IgnoreCase);
 
             if (bIsCounterThenReturnAction)
             {
@@ -1080,6 +1125,10 @@ void ULLMClient::OnStrategyResponseReceived(
                 }
 
                 Item = ReturnTableID;
+            }
+            else if (bIsPlayerAction)
+            {
+                Item = TEXT("player");
             }
 
             UE_LOG(LogTemp, Warning, TEXT("[Strategy] action parsed: type=%s, timing=%s, item=%s, return_table_id=%s, quantity=%d"), *ActionType, *Timing, *Item, *ReturnTableID, Quantity);

@@ -8,6 +8,8 @@
 #include "Engine/Engine.h"
 #include "EngineUtils.h"
 #include "FurnitureMarkerActor.h"
+#include "GameFramework/Character.h"
+#include "Kismet/GameplayStatics.h"
 #include "TableMarkerActor.h"
 #include "UObject/UnrealType.h"
 
@@ -53,6 +55,25 @@ FString GetApproachDebugTargetName(const AActor* TargetActor)
 
 	return TargetActor ? TargetActor->GetName() : TEXT("None");
 }
+
+const TCHAR* MovementModeToString(ENPCMovementMode Mode)
+{
+	switch (Mode)
+	{
+	case ENPCMovementMode::Idle:
+		return TEXT("Idle");
+	case ENPCMovementMode::FollowPlayer:
+		return TEXT("FollowPlayer");
+	case ENPCMovementMode::CommandedMove:
+		return TEXT("CommandedMove");
+	case ENPCMovementMode::GuidePlayer:
+		return TEXT("GuidePlayer");
+	case ENPCMovementMode::SeekPlayer:
+		return TEXT("SeekPlayer");
+	default:
+		return TEXT("Unknown");
+	}
+}
 }
 
 UNPCMoveToTableComponent::UNPCMoveToTableComponent()
@@ -60,6 +81,17 @@ UNPCMoveToTableComponent::UNPCMoveToTableComponent()
 	PrimaryComponentTick.bCanEverTick = true;
 
 	MoveSpeed = 120.0f;
+	bUseDynamicMoveSpeed = true;
+	WalkSpeed = 90.0f;
+	RunSpeed = 220.0f;
+	RunStartDistance = 500.0f;
+	WalkResumeDistance = 250.0f;
+	SlowDownDistance = 140.0f;
+	MinApproachSpeed = 55.0f;
+	SpeedInterpRate = 5.0f;
+	bIsRunning = false;
+	RemainingMoveDistance = 0.0f;
+	bPrintMoveSpeedDebug = false;
 	AcceptanceRadius = 20.0f;
 	StopDistanceFromTable = 80.0f;
 	bIsMovingToTable = false;
@@ -71,6 +103,8 @@ UNPCMoveToTableComponent::UNPCMoveToTableComponent()
 	bUseNavigationPath = true;
 	CurrentPathIndex = 0;
 	bStopOnCollisionHit = true;
+	MovementMode = ENPCMovementMode::Idle;
+	bExplicitCommandCancelsFollow = true;
 	TargetLocation = FVector::ZeroVector;
 	TargetTableLocation = FVector::ZeroVector;
 	CurrentMoveReason = NAME_None;
@@ -86,21 +120,53 @@ UNPCMoveToTableComponent::UNPCMoveToTableComponent()
 	TopApproachCandidateCount = 3;
 	bDrawDebugApproachCandidates = false;
 	bPrintApproachCandidateRejectReasons = false;
+	PlayerApproachDistance = 140.0f;
+	FollowStartDistance = 280.0f;
+	FollowStopDistance = 170.0f;
+	FollowDesiredDistance = 160.0f;
+	FollowUpdateInterval = 0.5f;
+	FollowMinRepathInterval = 1.2f;
+	FollowRepathPlayerMoveThreshold = 180.0f;
+	bIsFollowingPlayer = false;
+	bFollowMoveInProgress = false;
+	bPrintFollowDebug = false;
+	bIsGuidingPlayer = false;
+	GuidePlayerMaxDistance = 450.0f;
+	GuidePlayerResumeDistance = 280.0f;
+	GuideCheckInterval = 0.5f;
+	LastFollowPlayerLocation = FVector::ZeroVector;
+	LastFollowGoalLocation = FVector::ZeroVector;
+	FollowUpdateTimer = 0.0f;
+	FollowRepathTimer = 0.0f;
+	FollowDebugTimer = 0.0f;
+	bPrintedFollowModeSkipWarning = false;
+	GuideCheckTimer = 0.0f;
+	bGuidePausedForPlayer = false;
+	GuideTargetType = TEXT("");
+	GuideTargetID = TEXT("");
+	bPreserveMovementModeForGuideMove = false;
+	MoveSpeedDebugTimer = 0.0f;
 }
 
 void UNPCMoveToTableComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-	if (!bIsMovingToTable)
-	{
-		return;
-	}
-
 	AActor* Owner = GetOwner();
 	if (!Owner)
 	{
-		FailMoveToTable(TEXT("NPC movement owner missing"));
+		if (bIsFollowingPlayer)
+		{
+			StopFollowingPlayer();
+		}
+		if (bIsGuidingPlayer)
+		{
+			StopGuidingPlayer();
+		}
+		if (bIsMovingToTable)
+		{
+			FailMoveToTable(TEXT("NPC movement owner missing"));
+		}
 		return;
 	}
 
@@ -109,6 +175,34 @@ void UNPCMoveToTableComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 		CurrentMoveVelocity = FVector::ZeroVector;
 		CurrentMoveSpeed = 0.0f;
 		SetOwnerComponentVelocity(Owner, CurrentMoveVelocity);
+		return;
+	}
+
+	if (bIsFollowingPlayer && MovementMode == ENPCMovementMode::FollowPlayer)
+	{
+		bPrintedFollowModeSkipWarning = false;
+		UpdateFollowPlayer(Owner, DeltaTime);
+	}
+	else if (bIsFollowingPlayer && MovementMode != ENPCMovementMode::FollowPlayer)
+	{
+		if (!bPrintedFollowModeSkipWarning)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Follow Tick skipped because MovementMode != FollowPlayer"));
+			bPrintedFollowModeSkipWarning = true;
+		}
+	}
+
+	if (bIsGuidingPlayer && MovementMode == ENPCMovementMode::GuidePlayer)
+	{
+		UpdateGuidePlayer(Owner, DeltaTime);
+		if (bGuidePausedForPlayer)
+		{
+			return;
+		}
+	}
+
+	if (!bIsMovingToTable)
+	{
 		return;
 	}
 
@@ -136,20 +230,52 @@ void UNPCMoveToTableComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 		return;
 	}
 
-	const FVector DesiredLocation = FMath::VInterpConstantTo(OldLocation, MoveTarget, DeltaTime, MoveSpeed);
+	const float DistanceToCurrentMovePoint = FVector::Dist(OldLocation, MoveTarget);
+	RemainingMoveDistance = CalculateRemainingPathDistance();
+	const float DesiredSpeed = GetDesiredMoveSpeed(RemainingMoveDistance);
+	const float EffectiveSpeedInterpRate = FMath::Max(SpeedInterpRate, 0.0f);
+	CurrentMoveSpeed = EffectiveSpeedInterpRate <= KINDA_SMALL_NUMBER
+		? DesiredSpeed
+		: FMath::FInterpTo(CurrentMoveSpeed, DesiredSpeed, DeltaTime, EffectiveSpeedInterpRate);
+
+	FVector DesiredLocation = MoveTarget;
+	if (DistanceToCurrentMovePoint > KINDA_SMALL_NUMBER)
+	{
+		const float MoveStep = CurrentMoveSpeed * DeltaTime;
+		const FVector MoveDirection = (MoveTarget - OldLocation).GetSafeNormal();
+		DesiredLocation = OldLocation + MoveDirection * FMath::Min(MoveStep, DistanceToCurrentMovePoint);
+	}
+
 	FHitResult SweepHit;
 	Owner->SetActorLocation(DesiredLocation, true, &SweepHit);
 
 	const FVector NewLocation = Owner->GetActorLocation();
 	const FVector DeltaLocation = NewLocation - OldLocation;
-	CurrentMoveVelocity = DeltaLocation / DeltaTime;
-	CurrentMoveSpeed = CurrentMoveVelocity.Size2D();
+	CurrentMoveVelocity = DeltaLocation.IsNearlyZero()
+		? FVector::ZeroVector
+		: DeltaLocation.GetSafeNormal() * CurrentMoveSpeed;
 	SetOwnerComponentVelocity(Owner, CurrentMoveVelocity);
 
 	if (SweepHit.bBlockingHit && bStopOnCollisionHit)
 	{
 		FailMoveToTable(TEXT("NPC movement blocked"));
 		return;
+	}
+
+	if (bPrintMoveSpeedDebug)
+	{
+		MoveSpeedDebugTimer += DeltaTime;
+		if (MoveSpeedDebugTimer >= 0.5f)
+		{
+			PrintDebugMessage(
+				FString::Printf(TEXT("Move speed | Remaining=%.1f Speed=%.1f Running=%s"), RemainingMoveDistance, CurrentMoveSpeed, bIsRunning ? TEXT("true") : TEXT("false")),
+				FColor::Yellow);
+			MoveSpeedDebugTimer = 0.0f;
+		}
+	}
+	else
+	{
+		MoveSpeedDebugTimer = 0.0f;
 	}
 
 	if (bFaceMovementDirection && CurrentMoveSpeed > KINDA_SMALL_NUMBER)
@@ -178,6 +304,8 @@ void UNPCMoveToTableComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 
 bool UNPCMoveToTableComponent::MoveToTableByID(const FString& TargetTableID)
 {
+	CancelFollowingForExplicitCommand();
+
 	CurrentMoveReason = TEXT("Table");
 	CurrentMoveTargetID = TargetTableID;
 
@@ -203,6 +331,8 @@ bool UNPCMoveToTableComponent::MoveToTableByID(const FString& TargetTableID)
 
 bool UNPCMoveToTableComponent::MoveToTableByHint(const FString& TargetHint, AActor* ReferenceActor)
 {
+	CancelFollowingForExplicitCommand();
+
 	CurrentMoveReason = TEXT("Table");
 	CurrentMoveTargetID = TargetHint;
 
@@ -333,11 +463,234 @@ bool UNPCMoveToTableComponent::MoveNearActor(AActor* TargetActor, float StopDist
 	bIsMovingToTable = true;
 	CurrentMoveVelocity = FVector::ZeroVector;
 	CurrentMoveSpeed = 0.0f;
+	bIsRunning = false;
+	RemainingMoveDistance = 0.0f;
+	MoveSpeedDebugTimer = 0.0f;
 	return true;
+}
+
+AActor* UNPCMoveToTableComponent::FindPlayerActor() const
+{
+	if (AActor* PlayerPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0))
+	{
+		return PlayerPawn;
+	}
+
+	return UGameplayStatics::GetPlayerCharacter(GetWorld(), 0);
+}
+
+bool UNPCMoveToTableComponent::MoveNearPlayer(float StopDistance)
+{
+	CancelFollowingForExplicitCommand();
+	SetMovementMode(ENPCMovementMode::SeekPlayer);
+
+	CurrentMoveReason = TEXT("near_player");
+	CurrentMoveTargetID = TEXT("player");
+
+	AActor* PlayerActor = FindPlayerActor();
+	if (!PlayerActor)
+	{
+		const FString Message = TEXT("Player actor not found");
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *Message);
+		FailMoveToTable(Message);
+		return false;
+	}
+
+	const float EffectiveStopDistance = StopDistance > KINDA_SMALL_NUMBER
+		? StopDistance
+		: PlayerApproachDistance;
+	const bool bStartedMove = MoveNearActor(PlayerActor, EffectiveStopDistance);
+	if (bStartedMove)
+	{
+		CurrentMoveReason = TEXT("near_player");
+		CurrentMoveTargetID = TEXT("player");
+		PrintDebugMessage(TEXT("Move near player"), FColor::Green);
+	}
+
+	return bStartedMove;
+}
+
+void UNPCMoveToTableComponent::StartFollowingPlayer(float DesiredDistance)
+{
+	if (bIsGuidingPlayer)
+	{
+		StopGuidingPlayer();
+	}
+
+	FollowDesiredDistance = DesiredDistance > KINDA_SMALL_NUMBER
+		? DesiredDistance
+		: FollowDesiredDistance;
+
+	if (bIsFollowingPlayer)
+	{
+		SetMovementMode(ENPCMovementMode::FollowPlayer);
+		PrintDebugMessage(TEXT("Already following player; updated desired distance"), FColor::Yellow);
+		return;
+	}
+
+	FollowPlayerActor = FindPlayerActor();
+	if (AActor* PlayerActor = FollowPlayerActor.Get())
+	{
+		LastFollowPlayerLocation = PlayerActor->GetActorLocation();
+	}
+	else
+	{
+		LastFollowPlayerLocation = FVector::ZeroVector;
+	}
+	LastFollowGoalLocation = FVector::ZeroVector;
+	FollowUpdateTimer = FollowUpdateInterval;
+	FollowRepathTimer = FollowMinRepathInterval;
+	FollowDebugTimer = 0.0f;
+	bFollowMoveInProgress = false;
+	bIsFollowingPlayer = true;
+	SetMovementMode(ENPCMovementMode::FollowPlayer);
+
+	UE_LOG(LogTemp, Warning, TEXT("Start following player"));
+	PrintDebugMessage(TEXT("Start following player"), FColor::Green);
+}
+
+void UNPCMoveToTableComponent::StopFollowingPlayer()
+{
+	const bool bWasFollowMode = MovementMode == ENPCMovementMode::FollowPlayer;
+	bIsFollowingPlayer = false;
+	bFollowMoveInProgress = false;
+	FollowPlayerActor.Reset();
+	FollowUpdateTimer = 0.0f;
+	FollowRepathTimer = 0.0f;
+	FollowDebugTimer = 0.0f;
+	LastFollowPlayerLocation = FVector::ZeroVector;
+	LastFollowGoalLocation = FVector::ZeroVector;
+
+	const bool bCurrentMoveTargetsPlayer = CurrentMoveTargetID.Equals(TEXT("player"), ESearchCase::IgnoreCase)
+		|| CurrentMoveReason == FName(TEXT("near_player"))
+		|| CurrentMoveReason == FName(TEXT("player"))
+		|| CurrentMoveReason == FName(TEXT("follow_player"));
+	if (bIsMovingToTable && bCurrentMoveTargetsPlayer)
+	{
+		ClearMovementState();
+	}
+	else if (bWasFollowMode)
+	{
+		CurrentMoveSpeed = 0.0f;
+		CurrentMoveVelocity = FVector::ZeroVector;
+		SetOwnerComponentVelocity(GetOwner(), CurrentMoveVelocity);
+	}
+
+	if (bWasFollowMode || bCurrentMoveTargetsPlayer || !bIsMovingToTable)
+	{
+		SetMovementMode(ENPCMovementMode::Idle);
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("Stop following player"));
+	PrintDebugMessage(TEXT("Stop following player"), FColor::Yellow);
+}
+
+bool UNPCMoveToTableComponent::IsFollowingPlayer() const
+{
+	return bIsFollowingPlayer;
+}
+
+bool UNPCMoveToTableComponent::StartGuideToTable(const FString& TableID)
+{
+	const FString TrimmedTableID = TableID.TrimStartAndEnd();
+	if (TrimmedTableID.IsEmpty())
+	{
+		PrintDebugMessage(TEXT("Guide table target is empty"), FColor::Red);
+		return false;
+	}
+
+	CancelFollowingForExplicitCommand();
+	SetMovementMode(ENPCMovementMode::GuidePlayer);
+	bIsGuidingPlayer = true;
+	bGuidePausedForPlayer = false;
+	GuideTargetType = TEXT("table");
+	GuideTargetID = TrimmedTableID;
+	GuidePlayerActor = FindPlayerActor();
+	GuideCheckTimer = GuideCheckInterval;
+
+	const bool bPreviousPreserveGuideMove = bPreserveMovementModeForGuideMove;
+	bPreserveMovementModeForGuideMove = true;
+	const bool bMoveStarted = MoveToTableByID(TrimmedTableID);
+	bPreserveMovementModeForGuideMove = bPreviousPreserveGuideMove;
+
+	if (bMoveStarted)
+	{
+		const FString Message = FString::Printf(TEXT("Start guide to table: %s"), *TrimmedTableID);
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *Message);
+		PrintDebugMessage(Message, FColor::Green);
+	}
+
+	return bMoveStarted;
+}
+
+bool UNPCMoveToTableComponent::StartGuideToSceneTag(const FString& TargetTag)
+{
+	const FString TrimmedTargetTag = TargetTag.TrimStartAndEnd();
+	if (TrimmedTargetTag.IsEmpty())
+	{
+		PrintDebugMessage(TEXT("Guide scene tag target is empty"), FColor::Red);
+		return false;
+	}
+
+	CancelFollowingForExplicitCommand();
+	SetMovementMode(ENPCMovementMode::GuidePlayer);
+	bIsGuidingPlayer = true;
+	bGuidePausedForPlayer = false;
+	GuideTargetType = TEXT("scene_tag");
+	GuideTargetID = TrimmedTargetTag;
+	GuidePlayerActor = FindPlayerActor();
+	GuideCheckTimer = GuideCheckInterval;
+
+	const bool bPreviousPreserveGuideMove = bPreserveMovementModeForGuideMove;
+	bPreserveMovementModeForGuideMove = true;
+	const bool bMoveStarted = MoveToSceneTargetByTag(TrimmedTargetTag);
+	bPreserveMovementModeForGuideMove = bPreviousPreserveGuideMove;
+
+	if (bMoveStarted)
+	{
+		const FString Message = FString::Printf(TEXT("Start guide to scene tag: %s"), *TrimmedTargetTag);
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *Message);
+		PrintDebugMessage(Message, FColor::Green);
+	}
+
+	return bMoveStarted;
+}
+
+void UNPCMoveToTableComponent::StopGuidingPlayer()
+{
+	const bool bWasGuiding = bIsGuidingPlayer || bGuidePausedForPlayer || MovementMode == ENPCMovementMode::GuidePlayer;
+
+	bIsGuidingPlayer = false;
+	bGuidePausedForPlayer = false;
+	GuidePlayerActor.Reset();
+	GuideCheckTimer = 0.0f;
+	GuideTargetType = TEXT("");
+	GuideTargetID = TEXT("");
+	bPreserveMovementModeForGuideMove = false;
+
+	if (bIsMovingToTable || bWasGuiding)
+	{
+		ClearMovementState();
+	}
+
+	if (MovementMode == ENPCMovementMode::GuidePlayer)
+	{
+		SetMovementMode(ENPCMovementMode::Idle);
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("Stop guiding player"));
+	PrintDebugMessage(TEXT("Stop guiding player"), FColor::Yellow);
+}
+
+bool UNPCMoveToTableComponent::IsGuidingPlayer() const
+{
+	return bIsGuidingPlayer;
 }
 
 bool UNPCMoveToTableComponent::MoveToFurnitureByID(const FString& FurnitureID)
 {
+	CancelFollowingForExplicitCommand();
+
 	CurrentMoveReason = TEXT("Furniture");
 	CurrentMoveTargetID = FurnitureID;
 
@@ -363,6 +716,8 @@ bool UNPCMoveToTableComponent::MoveToFurnitureByID(const FString& FurnitureID)
 
 bool UNPCMoveToTableComponent::MoveToFurnitureByTag(const FString& FurnitureTag)
 {
+	CancelFollowingForExplicitCommand();
+
 	CurrentMoveReason = TEXT("Furniture");
 	CurrentMoveTargetID = FurnitureTag;
 
@@ -412,6 +767,8 @@ bool UNPCMoveToTableComponent::MoveToFurnitureByTag(const FString& FurnitureTag)
 
 bool UNPCMoveToTableComponent::MoveToFurnitureByType(const FString& FurnitureType)
 {
+	CancelFollowingForExplicitCommand();
+
 	CurrentMoveReason = TEXT("Furniture");
 	CurrentMoveTargetID = FurnitureType;
 
@@ -462,6 +819,8 @@ bool UNPCMoveToTableComponent::MoveToFurnitureByType(const FString& FurnitureTyp
 
 bool UNPCMoveToTableComponent::MoveToTargetPointByID(const FString& TargetID)
 {
+	CancelFollowingForExplicitCommand();
+
 	CurrentMoveReason = TEXT("TargetPoint");
 	CurrentMoveTargetID = TargetID;
 
@@ -487,6 +846,8 @@ bool UNPCMoveToTableComponent::MoveToTargetPointByID(const FString& TargetID)
 
 bool UNPCMoveToTableComponent::MoveToTargetPointByTag(const FString& TargetTag)
 {
+	CancelFollowingForExplicitCommand();
+
 	CurrentMoveReason = TEXT("TargetPoint");
 	CurrentMoveTargetID = TargetTag;
 
@@ -528,6 +889,8 @@ bool UNPCMoveToTableComponent::MoveToTargetPointByTag(const FString& TargetTag)
 
 bool UNPCMoveToTableComponent::MoveToSceneTargetByID(const FString& TargetID)
 {
+	CancelFollowingForExplicitCommand();
+
 	CurrentMoveReason = TEXT("SceneTarget");
 	CurrentMoveTargetID = TargetID;
 
@@ -571,6 +934,8 @@ bool UNPCMoveToTableComponent::MoveToSceneTargetByID(const FString& TargetID)
 
 bool UNPCMoveToTableComponent::MoveToSceneTargetByTag(const FString& TargetTag)
 {
+	CancelFollowingForExplicitCommand();
+
 	CurrentMoveReason = TEXT("SceneTarget");
 	CurrentMoveTargetID = TargetTag;
 
@@ -695,6 +1060,64 @@ void UNPCMoveToTableComponent::StopMovingToTable()
 	ClearMovementState();
 }
 
+void UNPCMoveToTableComponent::SetMovementMode(ENPCMovementMode NewMode)
+{
+	if (MovementMode == NewMode)
+	{
+		return;
+	}
+
+	MovementMode = NewMode;
+	bPrintedFollowModeSkipWarning = false;
+	UE_LOG(LogTemp, Warning, TEXT("MovementMode changed: %s"), MovementModeToString(MovementMode));
+}
+
+ENPCMovementMode UNPCMoveToTableComponent::GetMovementMode() const
+{
+	return MovementMode;
+}
+
+void UNPCMoveToTableComponent::CancelFollowingForExplicitCommand()
+{
+	if (bIsGuidingPlayer && !bPreserveMovementModeForGuideMove)
+	{
+		StopGuidingPlayer();
+	}
+
+	if (!bExplicitCommandCancelsFollow)
+	{
+		if (!bPreserveMovementModeForGuideMove)
+		{
+			SetMovementMode(ENPCMovementMode::CommandedMove);
+		}
+		return;
+	}
+
+	if (!bIsFollowingPlayer)
+	{
+		if (!bPreserveMovementModeForGuideMove)
+		{
+			SetMovementMode(ENPCMovementMode::CommandedMove);
+		}
+		return;
+	}
+
+	bIsFollowingPlayer = false;
+	bFollowMoveInProgress = false;
+	FollowPlayerActor.Reset();
+	FollowUpdateTimer = 0.0f;
+	FollowRepathTimer = 0.0f;
+	FollowDebugTimer = 0.0f;
+	LastFollowPlayerLocation = FVector::ZeroVector;
+	LastFollowGoalLocation = FVector::ZeroVector;
+
+	if (!bPreserveMovementModeForGuideMove)
+	{
+		SetMovementMode(ENPCMovementMode::CommandedMove);
+	}
+	UE_LOG(LogTemp, Warning, TEXT("Follow cancelled by explicit command"));
+}
+
 bool UNPCMoveToTableComponent::StartMovingToTable(const ATableMarkerActor* TableMarker, bool bRequireNavigationPath)
 {
 	if (!TableMarker)
@@ -807,6 +1230,9 @@ bool UNPCMoveToTableComponent::StartMovingToLocation(const FVector& MoveLocation
 	bIsMovingToTable = true;
 	CurrentMoveVelocity = FVector::ZeroVector;
 	CurrentMoveSpeed = 0.0f;
+	bIsRunning = false;
+	RemainingMoveDistance = 0.0f;
+	MoveSpeedDebugTimer = 0.0f;
 	PrintDebugMessage(DebugMessage, FColor::Green);
 	return true;
 }
@@ -1349,6 +1775,309 @@ bool UNPCMoveToTableComponent::IsApproachLocationFree(const FVector& Location, c
 	return !World->OverlapBlockingTestByChannel(Location, FQuat::Identity, ECC_Pawn, CollisionShape, QueryParams);
 }
 
+float UNPCMoveToTableComponent::CalculateRemainingPathDistance() const
+{
+	const AActor* Owner = GetOwner();
+	if (!Owner)
+	{
+		return 0.0f;
+	}
+
+	const FVector OwnerLocation = Owner->GetActorLocation();
+	if (CurrentPathPoints.Num() > 0 && CurrentPathPoints.IsValidIndex(CurrentPathIndex))
+	{
+		float RemainingDistance = FVector::Dist(OwnerLocation, CurrentPathPoints[CurrentPathIndex]);
+		for (int32 PointIndex = CurrentPathIndex; PointIndex < CurrentPathPoints.Num() - 1; ++PointIndex)
+		{
+			RemainingDistance += FVector::Dist(CurrentPathPoints[PointIndex], CurrentPathPoints[PointIndex + 1]);
+		}
+
+		return RemainingDistance;
+	}
+
+	return FVector::Dist(OwnerLocation, TargetLocation);
+}
+
+float UNPCMoveToTableComponent::GetDesiredMoveSpeed(float RemainingDistance)
+{
+	const float EffectiveRemainingDistance = FMath::Max(RemainingDistance, 0.0f);
+	const float EffectiveWalkSpeed = WalkSpeed > KINDA_SMALL_NUMBER ? WalkSpeed : 90.0f;
+	const float EffectiveRunSpeed = RunSpeed > KINDA_SMALL_NUMBER ? RunSpeed : 220.0f;
+	const float EffectiveRunStartDistance = RunStartDistance > KINDA_SMALL_NUMBER ? RunStartDistance : 500.0f;
+	const float EffectiveWalkResumeDistance = WalkResumeDistance > KINDA_SMALL_NUMBER
+		? FMath::Min(WalkResumeDistance, EffectiveRunStartDistance)
+		: 250.0f;
+	const float EffectiveSlowDownDistance = SlowDownDistance > KINDA_SMALL_NUMBER ? SlowDownDistance : 140.0f;
+	const float EffectiveMinApproachSpeed = MinApproachSpeed > KINDA_SMALL_NUMBER ? MinApproachSpeed : 55.0f;
+
+	if (!bUseDynamicMoveSpeed)
+	{
+		bIsRunning = false;
+		return EffectiveWalkSpeed;
+	}
+
+	if (!bIsRunning && EffectiveRemainingDistance >= EffectiveRunStartDistance)
+	{
+		bIsRunning = true;
+	}
+	else if (bIsRunning && EffectiveRemainingDistance <= EffectiveWalkResumeDistance)
+	{
+		bIsRunning = false;
+	}
+
+	float DesiredSpeed = bIsRunning ? EffectiveRunSpeed : EffectiveWalkSpeed;
+	if (EffectiveRemainingDistance <= EffectiveSlowDownDistance)
+	{
+		bIsRunning = false;
+		const float Alpha = FMath::Clamp(EffectiveRemainingDistance / EffectiveSlowDownDistance, 0.0f, 1.0f);
+		const float LowSpeed = FMath::Max(EffectiveMinApproachSpeed, 0.0f);
+		const float HighSpeed = FMath::Max(EffectiveWalkSpeed, LowSpeed);
+		DesiredSpeed = FMath::Lerp(LowSpeed, HighSpeed, Alpha);
+	}
+
+	return FMath::Max(DesiredSpeed, 0.0f);
+}
+
+void UNPCMoveToTableComponent::UpdateFollowPlayer(AActor* Owner, float DeltaTime)
+{
+	if (!bIsFollowingPlayer || !Owner)
+	{
+		return;
+	}
+
+	FollowUpdateTimer += DeltaTime;
+	FollowRepathTimer += DeltaTime;
+	FollowDebugTimer += DeltaTime;
+
+	const float EffectiveUpdateInterval = FMath::Max(FollowUpdateInterval, 0.05f);
+	if (FollowUpdateTimer < EffectiveUpdateInterval)
+	{
+		return;
+	}
+	FollowUpdateTimer = 0.0f;
+
+	AActor* PlayerActor = FollowPlayerActor.Get();
+	if (!PlayerActor)
+	{
+		PlayerActor = FindPlayerActor();
+		FollowPlayerActor = PlayerActor;
+	}
+
+	if (!PlayerActor)
+	{
+		const FString Message = TEXT("Player actor not found for follow");
+		UE_LOG(LogTemp, Warning, TEXT("%s"), *Message);
+		PrintDebugMessage(Message, FColor::Red);
+		StopFollowingPlayer();
+		return;
+	}
+
+	const float EffectiveDesiredDistance = FollowDesiredDistance > KINDA_SMALL_NUMBER
+		? FollowDesiredDistance
+		: 160.0f;
+	const float EffectiveStopDistance = FollowStopDistance > KINDA_SMALL_NUMBER
+		? FMath::Max(FollowStopDistance, EffectiveDesiredDistance)
+		: 170.0f;
+	const float EffectiveStartDistance = FollowStartDistance > KINDA_SMALL_NUMBER
+		? FMath::Max(FollowStartDistance, EffectiveStopDistance)
+		: 280.0f;
+	const float EffectiveMinRepathInterval = FollowMinRepathInterval > KINDA_SMALL_NUMBER
+		? FollowMinRepathInterval
+		: 1.2f;
+	const float EffectivePlayerMoveThreshold = FollowRepathPlayerMoveThreshold > KINDA_SMALL_NUMBER
+		? FollowRepathPlayerMoveThreshold
+		: 180.0f;
+	const FVector PlayerLocation = PlayerActor->GetActorLocation();
+	const float DistanceToPlayer = FVector::Dist2D(Owner->GetActorLocation(), PlayerLocation);
+	const float PlayerMovedDistance = LastFollowPlayerLocation.IsNearlyZero()
+		? TNumericLimits<float>::Max()
+		: FVector::Dist2D(PlayerLocation, LastFollowPlayerLocation);
+	bool bWillRepath = false;
+	auto PrintFollowDebugIfNeeded = [&](bool bDidRepath)
+	{
+		if (bPrintFollowDebug && FollowDebugTimer >= 0.5f)
+		{
+			PrintDebugMessage(
+				FString::Printf(
+					TEXT("Follow debug | Distance=%.1f InProgress=%s PlayerMoved=%.1f RepathTimer=%.1f Repath=%s"),
+					DistanceToPlayer,
+					bFollowMoveInProgress ? TEXT("true") : TEXT("false"),
+					PlayerMovedDistance,
+					FollowRepathTimer,
+					bDidRepath ? TEXT("true") : TEXT("false")),
+				FColor::Yellow);
+			FollowDebugTimer = 0.0f;
+		}
+	};
+
+	if (DistanceToPlayer <= EffectiveStopDistance)
+	{
+		if (bFollowMoveInProgress)
+		{
+			ClearMovementState();
+			bFollowMoveInProgress = false;
+			PrintDebugMessage(TEXT("Follow: close enough, stop moving"), FColor::Yellow);
+		}
+		PrintFollowDebugIfNeeded(false);
+		return;
+	}
+
+	if (!bFollowMoveInProgress && DistanceToPlayer < EffectiveStartDistance)
+	{
+		PrintFollowDebugIfNeeded(false);
+		return;
+	}
+
+	if (bFollowMoveInProgress)
+	{
+		if (PlayerMovedDistance < EffectivePlayerMoveThreshold)
+		{
+			PrintFollowDebugIfNeeded(false);
+			return;
+		}
+
+		if (FollowRepathTimer < EffectiveMinRepathInterval)
+		{
+			PrintFollowDebugIfNeeded(false);
+			return;
+		}
+	}
+
+	if (!bFollowMoveInProgress && DistanceToPlayer > EffectiveStartDistance)
+	{
+		bWillRepath = true;
+	}
+	else if (bFollowMoveInProgress)
+	{
+		bWillRepath = true;
+	}
+
+	if (!bWillRepath)
+	{
+		PrintFollowDebugIfNeeded(false);
+		return;
+	}
+
+	FollowRepathTimer = 0.0f;
+	LastFollowPlayerLocation = PlayerLocation;
+	const bool bStartedMove = MoveNearActor(PlayerActor, EffectiveDesiredDistance);
+	if (bStartedMove)
+	{
+		CurrentMoveReason = TEXT("follow_player");
+		CurrentMoveTargetID = TEXT("player");
+		LastFollowGoalLocation = TargetLocation;
+		bFollowMoveInProgress = true;
+		PrintDebugMessage(TEXT("Follow: repath to player"), FColor::Green);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Follow: repath to player failed"));
+		bFollowMoveInProgress = false;
+	}
+
+	PrintFollowDebugIfNeeded(bStartedMove);
+}
+
+void UNPCMoveToTableComponent::UpdateGuidePlayer(AActor* Owner, float DeltaTime)
+{
+	if (!bIsGuidingPlayer || MovementMode != ENPCMovementMode::GuidePlayer || !Owner)
+	{
+		return;
+	}
+
+	GuideCheckTimer += DeltaTime;
+	const float EffectiveCheckInterval = GuideCheckInterval > KINDA_SMALL_NUMBER
+		? GuideCheckInterval
+		: 0.5f;
+	if (GuideCheckTimer < EffectiveCheckInterval)
+	{
+		return;
+	}
+	GuideCheckTimer = 0.0f;
+
+	AActor* PlayerActor = GuidePlayerActor.Get();
+	if (!PlayerActor)
+	{
+		PlayerActor = FindPlayerActor();
+		GuidePlayerActor = PlayerActor;
+	}
+
+	if (!PlayerActor)
+	{
+		if (bGuidePausedForPlayer)
+		{
+			bGuidePausedForPlayer = false;
+			ResumeGuideMove();
+		}
+		return;
+	}
+
+	const float DistanceToPlayer = FVector::Dist2D(Owner->GetActorLocation(), PlayerActor->GetActorLocation());
+	const float EffectiveMaxDistance = GuidePlayerMaxDistance > KINDA_SMALL_NUMBER
+		? GuidePlayerMaxDistance
+		: 450.0f;
+	const float EffectiveResumeDistance = GuidePlayerResumeDistance > KINDA_SMALL_NUMBER
+		? FMath::Min(GuidePlayerResumeDistance, EffectiveMaxDistance)
+		: 280.0f;
+
+	if (DistanceToPlayer > EffectiveMaxDistance && !bGuidePausedForPlayer)
+	{
+		ClearMovementState();
+		bGuidePausedForPlayer = true;
+		CurrentMoveSpeed = 0.0f;
+		CurrentMoveVelocity = FVector::ZeroVector;
+		SetOwnerComponentVelocity(Owner, CurrentMoveVelocity);
+		UE_LOG(LogTemp, Warning, TEXT("Guide paused: waiting for player"));
+		PrintDebugMessage(TEXT("Guide paused: waiting for player"), FColor::Yellow);
+		return;
+	}
+
+	if (bGuidePausedForPlayer && DistanceToPlayer <= EffectiveResumeDistance)
+	{
+		bGuidePausedForPlayer = false;
+		if (ResumeGuideMove())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("Guide resumed: player caught up"));
+			PrintDebugMessage(TEXT("Guide resumed: player caught up"), FColor::Green);
+		}
+	}
+}
+
+bool UNPCMoveToTableComponent::ResumeGuideMove()
+{
+	if (!bIsGuidingPlayer || MovementMode != ENPCMovementMode::GuidePlayer)
+	{
+		return false;
+	}
+
+	const FString ResumeTargetID = GuideTargetID.TrimStartAndEnd();
+	if (ResumeTargetID.IsEmpty())
+	{
+		FailMoveToTable(TEXT("Guide target missing"));
+		return false;
+	}
+
+	const bool bPreviousPreserveGuideMove = bPreserveMovementModeForGuideMove;
+	bPreserveMovementModeForGuideMove = true;
+
+	bool bMoveStarted = false;
+	if (GuideTargetType.Equals(TEXT("table"), ESearchCase::IgnoreCase))
+	{
+		bMoveStarted = MoveToTableByID(ResumeTargetID);
+	}
+	else if (GuideTargetType.Equals(TEXT("scene_tag"), ESearchCase::IgnoreCase))
+	{
+		bMoveStarted = MoveToSceneTargetByTag(ResumeTargetID);
+	}
+	else
+	{
+		FailMoveToTable(TEXT("Guide target type missing"));
+	}
+
+	bPreserveMovementModeForGuideMove = bPreviousPreserveGuideMove;
+	return bMoveStarted;
+}
+
 void UNPCMoveToTableComponent::FinishMoveToTable(AActor* Owner)
 {
 	if (Owner && bFaceTableOnArrival)
@@ -1358,7 +2087,26 @@ void UNPCMoveToTableComponent::FinishMoveToTable(AActor* Owner)
 
 	const FName CompletedMoveReason = CurrentMoveReason;
 	const FString CompletedMoveTargetID = CurrentMoveTargetID;
+	const bool bCompletedFollowMove = bIsFollowingPlayer
+		&& (CompletedMoveTargetID.Equals(TEXT("player"), ESearchCase::IgnoreCase)
+			|| CompletedMoveReason == FName(TEXT("near_player"))
+			|| CompletedMoveReason == FName(TEXT("player"))
+			|| CompletedMoveReason == FName(TEXT("follow_player")));
+	const bool bCompletedGuideMove = bIsGuidingPlayer && MovementMode == ENPCMovementMode::GuidePlayer;
 	ClearMovementState();
+	if (bCompletedFollowMove)
+	{
+		bFollowMoveInProgress = false;
+	}
+	else if (bCompletedGuideMove)
+	{
+		StopGuidingPlayer();
+	}
+	else if (MovementMode == ENPCMovementMode::CommandedMove
+		|| MovementMode == ENPCMovementMode::SeekPlayer)
+	{
+		SetMovementMode(ENPCMovementMode::Idle);
+	}
 	PrintDebugMessage(FString::Printf(TEXT("Arrived %s: %s"), *CompletedMoveReason.ToString(), *CompletedMoveTargetID), FColor::Cyan);
 	OnNPCMoveCompleted.Broadcast(CompletedMoveReason, CompletedMoveTargetID, true);
 }
@@ -1367,7 +2115,26 @@ void UNPCMoveToTableComponent::FailMoveToTable(const FString& Message)
 {
 	const FName FailedMoveReason = CurrentMoveReason;
 	const FString FailedMoveTargetID = CurrentMoveTargetID;
+	const bool bFailedFollowMove = bIsFollowingPlayer
+		&& (FailedMoveTargetID.Equals(TEXT("player"), ESearchCase::IgnoreCase)
+			|| FailedMoveReason == FName(TEXT("near_player"))
+			|| FailedMoveReason == FName(TEXT("player"))
+			|| FailedMoveReason == FName(TEXT("follow_player")));
+	const bool bFailedGuideMove = bIsGuidingPlayer && MovementMode == ENPCMovementMode::GuidePlayer;
 	ClearMovementState();
+	if (bFailedFollowMove)
+	{
+		bFollowMoveInProgress = false;
+	}
+	else if (bFailedGuideMove)
+	{
+		StopGuidingPlayer();
+	}
+	else if (MovementMode == ENPCMovementMode::CommandedMove
+		|| MovementMode == ENPCMovementMode::SeekPlayer)
+	{
+		SetMovementMode(ENPCMovementMode::Idle);
+	}
 	PrintDebugMessage(Message, FColor::Red);
 	OnNPCMoveCompleted.Broadcast(FailedMoveReason, FailedMoveTargetID, false);
 }
@@ -1377,6 +2144,9 @@ void UNPCMoveToTableComponent::ClearMovementState()
 	bIsMovingToTable = false;
 	CurrentMoveVelocity = FVector::ZeroVector;
 	CurrentMoveSpeed = 0.0f;
+	bIsRunning = false;
+	RemainingMoveDistance = 0.0f;
+	MoveSpeedDebugTimer = 0.0f;
 	CurrentPathPoints.Reset();
 	CurrentPathIndex = 0;
 	SetOwnerComponentVelocity(GetOwner(), CurrentMoveVelocity);

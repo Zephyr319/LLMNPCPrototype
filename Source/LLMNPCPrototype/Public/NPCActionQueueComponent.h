@@ -35,7 +35,7 @@ struct FNPCQueuedAction
 
 	float WaitSeconds = 0.0f;
 
-	float StopDistance = 120.0f;
+	float StopDistance = 140.0f;
 };
 
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
@@ -80,7 +80,7 @@ public:
 	void EnqueueMoveToFurnitureID(const FString& FurnitureID);
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
-	void EnqueueMoveNearPlayer(float StopDistance = 120.0f);
+	void EnqueueMoveNearPlayer(float StopDistance = 140.0f);
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void EnqueueWait(float Seconds);
@@ -96,6 +96,24 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void RunCounterAndReturnToPlayer();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void RunMoveNearPlayer(float StopDistance = 140.0f);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void RunStartFollowPlayer(float DesiredDistance = 160.0f);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void RunStopFollowPlayer();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void RunGuidePlayerToTable(const FString& TableID);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void RunGuidePlayerToSceneTag(const FString& TargetTag);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void RunStopGuidePlayer();
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void RunTableRouteFromString(const FString& RouteString);
@@ -132,6 +150,8 @@ private:
 	UNPCFaceTargetComponent* FaceTargetComponent;
 
 	void CacheOwnerComponents();
+
+	void CancelFollowingForExplicitCommand();
 
 	void BindMoveCompletedEvent();
 
