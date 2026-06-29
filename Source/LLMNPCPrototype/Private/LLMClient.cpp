@@ -1301,8 +1301,15 @@ void ULLMClient::InterruptCurrentVoicevoxSpeech()
 void ULLMClient::HandleFinalReplyText(const FString& ReplyText)
 {
     const FString CleanReplyText = SanitizeReplyTextForSpeechAndDisplay(ReplyText);
+    if (CleanReplyText.IsEmpty())
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[LLM] final reply text is empty after sanitizing; skipping subtitle and speech"));
+        return;
+    }
 
     OnLLMDisplayTextReceived.Broadcast(CleanReplyText);
+    UE_LOG(LogTemp, Warning, TEXT("[LLM] Broadcasting NPC subtitle: %s"), *CleanReplyText);
+    OnNPCSubtitleRequested.Broadcast(CleanReplyText);
 
     if (bUseVoicevoxTTS)
     {

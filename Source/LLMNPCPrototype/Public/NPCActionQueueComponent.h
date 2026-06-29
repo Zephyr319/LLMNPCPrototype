@@ -38,6 +38,10 @@ struct FNPCQueuedAction
 	float StopDistance = 140.0f;
 };
 
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FQueueSpeakRequestedSignature, FString, Text);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FQueueGestureRequestedSignature, FName, GestureName);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FPostSeatingMenuGuidanceFinishedSignature);
+
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class UNPCActionQueueComponent : public UActorComponent
 {
@@ -60,6 +64,57 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue")
 	FString LastVisitedTableID;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
+	float OrderPreparationSeconds;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
+	FString OrderConfirmLine;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
+	FString OrderServedLine;
+
+	UPROPERTY(BlueprintAssignable, Category = "NPC Action Queue|Order")
+	FQueueSpeakRequestedSignature OnQueueSpeakRequested;
+
+	UPROPERTY(BlueprintAssignable, Category = "NPC Action Queue|Order")
+	FQueueGestureRequestedSignature OnQueueGestureRequested;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
+	bool bReturnToCounterAfterServing;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
+	float PostServePauseSeconds;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
+	float BillPresentationPauseSeconds;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
+	float ClosingBowPauseSeconds;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
+	float ReturnToCounterAfterClosingDelaySeconds;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
+	int32 DefaultOrderPrice;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
+	FString BillLineFormat;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
+	FString ServiceClosingLine;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Post Seating")
+	float PostSeatingMenuGuidanceDelay;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Post Seating")
+	float PostSeatingMenuHelpEnableDelay;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Post Seating")
+	FString PostSeatingMenuGuidanceLine;
+
+	UPROPERTY(BlueprintAssignable, Category = "NPC Action Queue|Post Seating")
+	FPostSeatingMenuGuidanceFinishedSignature OnPostSeatingMenuGuidanceFinished;
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void ClearActionQueue();
@@ -90,6 +145,9 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void StartActionQueue();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC|Action Queue")
+	void HandleStrategyAction(const FString& ActionType, const FString& Item, int32 Quantity);
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void RunCounterAndReturnToTable(const FString& ReturnTableID);
@@ -124,6 +182,12 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void RunCounterAndReturnToCurrentTable();
 
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Order")
+	void RunOrderFulfillmentToCurrentTable(const FString& OrderItem);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Post Seating")
+	void RunPostSeatingMenuGuidance();
+
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void SetCurrentServiceTableID(const FString& TableID);
 
@@ -141,7 +205,27 @@ private:
 
 	bool bWaitingForMove;
 
+	bool bPendingOrderFulfillment;
+
+	FString PendingOrderReturnTableID;
+
+	FString PendingOrderItem;
+
+	int32 PendingOrderPrice;
+
 	FTimerHandle WaitTimerHandle;
+
+	FTimerHandle PostServePauseTimerHandle;
+
+	FTimerHandle BillPresentationPauseTimerHandle;
+
+	FTimerHandle ClosingBowPauseTimerHandle;
+
+	FTimerHandle ReturnToCounterAfterClosingTimerHandle;
+
+	FTimerHandle PostSeatingMenuGuidanceTimerHandle;
+
+	FTimerHandle PostSeatingMenuHelpEnableTimerHandle;
 
 	UPROPERTY(Transient)
 	UNPCMoveToTableComponent* MoveComponent;
@@ -173,14 +257,40 @@ private:
 
 	FString ResolveCurrentServiceTableID() const;
 
+	int32 ResolveOrderPrice(const FString& OrderItem) const;
+
 	AActor* FindPlayerActor() const;
 
 	void FaceOwnerTowardActor(AActor* TargetActor) const;
 
 	void PrintDebugMessage(const FString& Message, const FColor& Color) const;
 
+	void ClearOrderFulfillmentTimers();
+
+	void ClearPendingOrderState();
+
+	void BroadcastQueueGesture(FName GestureName);
+
+	void StartOrderServingCompletionFlow();
+
+	void ReturnToCounterAfterServingIfNeeded();
+
+	void HandleReturnToCounterAfterClosingDelayFinished();
+
+	void ClearPostSeatingMenuGuidanceTimers();
+
 	UFUNCTION()
 	void HandleNPCMoveCompleted(FName MoveReason, FString TargetID, bool bSuccess);
 
 	void HandleWaitTimerFinished();
+
+	void HandlePostServePauseTimerFinished();
+
+	void HandleBillPresentationPauseTimerFinished();
+
+	void HandleClosingBowPauseTimerFinished();
+
+	void HandlePostSeatingMenuGuidanceTimerFinished();
+
+	void HandlePostSeatingMenuHelpEnableTimerFinished();
 };

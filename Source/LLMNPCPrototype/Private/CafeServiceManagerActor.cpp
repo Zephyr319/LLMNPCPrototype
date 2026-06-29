@@ -18,7 +18,7 @@ ACafeServiceManagerActor::ACafeServiceManagerActor()
 	TargetTableID = TEXT("");
 	CurrentPartySize = 0;
 	bCurrentWantsDining = false;
-	MaidApproachDistance = 120.0f;
+	MaidApproachDistance = 260.0f;
 	bServiceStarted = false;
 	MaidMoveComponent = nullptr;
 	PlayerSeatComponent = nullptr;

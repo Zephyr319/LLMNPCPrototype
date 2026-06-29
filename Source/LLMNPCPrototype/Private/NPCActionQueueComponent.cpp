@@ -25,7 +25,25 @@ UNPCActionQueueComponent::UNPCActionQueueComponent()
 	bPrintActionQueueDebug = true;
 	CurrentServiceTableID = TEXT("");
 	LastVisitedTableID = TEXT("");
+	PostSeatingMenuGuidanceDelay = 1.8f;
+	PostSeatingMenuHelpEnableDelay = 1.0f;
+	PostSeatingMenuGuidanceLine = TEXT("メニューはテーブルの上にございます。お決まりになりましたら、いつでもお声がけください。");
+	OrderPreparationSeconds = 3.0f;
+	OrderConfirmLine = TEXT("かしこまりました。少々お待ちください。");
+	OrderServedLine = TEXT("お待たせいたしました。ご注文の料理です。");
+	bReturnToCounterAfterServing = true;
+	PostServePauseSeconds = 0.8f;
+	BillPresentationPauseSeconds = 0.8f;
+	ClosingBowPauseSeconds = 0.8f;
+	ReturnToCounterAfterClosingDelaySeconds = 1.5f;
+	DefaultOrderPrice = 800;
+	BillLineFormat = TEXT("お会計は{Price}円でございます。");
+	ServiceClosingLine = TEXT("ご用の際はいつでもお声がけください。");
 	bWaitingForMove = false;
+	bPendingOrderFulfillment = false;
+	PendingOrderReturnTableID = TEXT("");
+	PendingOrderItem = TEXT("");
+	PendingOrderPrice = 0;
 	MoveComponent = nullptr;
 	FaceTargetComponent = nullptr;
 }
@@ -52,11 +70,14 @@ void UNPCActionQueueComponent::ClearActionQueue()
 	CurrentAction = FNPCQueuedAction();
 	bIsRunningQueue = false;
 	bWaitingForMove = false;
+	ClearPendingOrderState();
 
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(WaitTimerHandle);
 	}
+	ClearOrderFulfillmentTimers();
+	ClearPostSeatingMenuGuidanceTimers();
 
 	PrintDebugMessage(TEXT("NPC action queue cleared"), FColor::Yellow);
 }
@@ -67,11 +88,14 @@ void UNPCActionQueueComponent::StopActionQueue()
 	CurrentAction = FNPCQueuedAction();
 	bIsRunningQueue = false;
 	bWaitingForMove = false;
+	ClearPendingOrderState();
 
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(WaitTimerHandle);
 	}
+	ClearOrderFulfillmentTimers();
+	ClearPostSeatingMenuGuidanceTimers();
 
 	CacheOwnerComponents();
 	if (MoveComponent && MoveComponent->bIsMovingToTable)
@@ -292,6 +316,101 @@ void UNPCActionQueueComponent::RunStopGuidePlayer()
 	MoveComponent->StopGuidingPlayer();
 }
 
+void UNPCActionQueueComponent::HandleStrategyAction(const FString& ActionType, const FString& Item, int32 Quantity)
+{
+	FString NormalizedAction = ActionType;
+	NormalizedAction.TrimStartAndEndInline();
+
+	FString NormalizedItem = Item;
+	NormalizedItem.TrimStartAndEndInline();
+
+	UE_LOG(LogTemp, Warning, TEXT("HandleStrategyAction: ActionType=%s, Item=%s, Quantity=%d"), *NormalizedAction, *NormalizedItem, Quantity);
+
+	if (NormalizedAction.Equals(TEXT("place_order"), ESearchCase::IgnoreCase)
+		|| NormalizedAction.Equals(TEXT("PlaceOrder"), ESearchCase::IgnoreCase))
+	{
+		RunOrderFulfillmentToCurrentTable(NormalizedItem);
+		return;
+	}
+
+	if (NormalizedAction.Equals(TEXT("action_sequence"), ESearchCase::IgnoreCase))
+	{
+		RunActionSequenceFromJson(NormalizedItem);
+		return;
+	}
+
+	if (NormalizedAction.Equals(TEXT("follow_player"), ESearchCase::IgnoreCase))
+	{
+		RunStartFollowPlayer(160.0f);
+		return;
+	}
+
+	if (NormalizedAction.Equals(TEXT("stop_follow_player"), ESearchCase::IgnoreCase))
+	{
+		RunStopFollowPlayer();
+		return;
+	}
+
+	if (NormalizedAction.Equals(TEXT("guide_player_to_table"), ESearchCase::IgnoreCase))
+	{
+		RunGuidePlayerToTable(NormalizedItem);
+		return;
+	}
+
+	if (NormalizedAction.Equals(TEXT("guide_player_to_scene_tag"), ESearchCase::IgnoreCase))
+	{
+		RunGuidePlayerToSceneTag(NormalizedItem);
+		return;
+	}
+
+	if (NormalizedAction.Equals(TEXT("stop_guide_player"), ESearchCase::IgnoreCase))
+	{
+		RunStopGuidePlayer();
+		return;
+	}
+
+	if (NormalizedAction.Equals(TEXT("move_near_player"), ESearchCase::IgnoreCase))
+	{
+		RunMoveNearPlayer(140.0f);
+		return;
+	}
+
+	if (NormalizedAction.Equals(TEXT("counter_then_return"), ESearchCase::IgnoreCase))
+	{
+		if (NormalizedItem.IsEmpty() || NormalizedItem.Equals(TEXT("current_table"), ESearchCase::IgnoreCase))
+		{
+			RunCounterAndReturnToCurrentTable();
+		}
+		else
+		{
+			RunCounterAndReturnToTable(NormalizedItem);
+		}
+		return;
+	}
+
+	if (NormalizedAction.Equals(TEXT("table_route"), ESearchCase::IgnoreCase))
+	{
+		RunTableRouteFromString(NormalizedItem);
+		return;
+	}
+
+	if (NormalizedAction.Equals(TEXT("guide_to_table"), ESearchCase::IgnoreCase))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("guide_to_table is legacy/unsupported in HandleStrategyAction. Item=%s"), *NormalizedItem);
+		return;
+	}
+
+	if (NormalizedAction.Equals(TEXT("greet"), ESearchCase::IgnoreCase)
+		|| NormalizedAction.Equals(TEXT("recommend"), ESearchCase::IgnoreCase)
+		|| NormalizedAction.Equals(TEXT("explain"), ESearchCase::IgnoreCase))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("Social legacy action received: %s, item=%s"), *NormalizedAction, *NormalizedItem);
+		return;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("Unknown strategy action: %s, item=%s, quantity=%d"), *NormalizedAction, *NormalizedItem, Quantity);
+}
+
 void UNPCActionQueueComponent::RunTableRouteFromString(const FString& RouteString)
 {
 	const FString TrimmedRouteString = RouteString.TrimStartAndEnd();
@@ -489,6 +608,69 @@ void UNPCActionQueueComponent::RunCounterAndReturnToCurrentTable()
 
 	CurrentServiceTableID = ResolvedTableID;
 	RunCounterAndReturnToTable(ResolvedTableID);
+}
+
+void UNPCActionQueueComponent::RunOrderFulfillmentToCurrentTable(const FString& OrderItem)
+{
+	const FString TrimmedOrderItem = OrderItem.TrimStartAndEnd();
+	const int32 ResolvedOrderPrice = ResolveOrderPrice(TrimmedOrderItem);
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Order item: %s"), *TrimmedOrderItem);
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Order price: %d"), ResolvedOrderPrice);
+
+	const FString ResolvedTableID = ResolveCurrentServiceTableID();
+	if (ResolvedTableID.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Place order: %s"), *TrimmedOrderItem);
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Current service table not known; returning to player instead"));
+		ClearPendingOrderState();
+		RunCounterAndReturnToPlayer();
+		return;
+	}
+
+	CancelFollowingForExplicitCommand();
+	ClearActionQueue();
+
+	CurrentServiceTableID = ResolvedTableID;
+	PendingOrderReturnTableID = ResolvedTableID;
+	PendingOrderItem = TrimmedOrderItem;
+	PendingOrderPrice = ResolvedOrderPrice;
+	bPendingOrderFulfillment = true;
+
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Place order: %s"), *TrimmedOrderItem);
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Order return table: %s"), *PendingOrderReturnTableID);
+	OnQueueSpeakRequested.Broadcast(OrderConfirmLine);
+
+	EnqueueMoveToSceneTag(TEXT("counter"));
+	EnqueueWait(OrderPreparationSeconds);
+	EnqueueMoveToTableID(PendingOrderReturnTableID);
+	StartActionQueue();
+}
+
+void UNPCActionQueueComponent::RunPostSeatingMenuGuidance()
+{
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Post seating menu guidance requested"));
+	ClearPostSeatingMenuGuidanceTimers();
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Post seating menu guidance failed: world not found"));
+		return;
+	}
+
+	const float GuidanceDelay = FMath::Max(PostSeatingMenuGuidanceDelay, 0.0f);
+	if (GuidanceDelay <= KINDA_SMALL_NUMBER)
+	{
+		HandlePostSeatingMenuGuidanceTimerFinished();
+		return;
+	}
+
+	World->GetTimerManager().SetTimer(
+		PostSeatingMenuGuidanceTimerHandle,
+		this,
+		&UNPCActionQueueComponent::HandlePostSeatingMenuGuidanceTimerFinished,
+		GuidanceDelay,
+		false);
 }
 
 void UNPCActionQueueComponent::SetCurrentServiceTableID(const FString& TableID)
@@ -705,10 +887,22 @@ void UNPCActionQueueComponent::ExecuteFacePlayerAction()
 
 void UNPCActionQueueComponent::CompleteCurrentAction(bool bSuccess, const FString& FailureReason)
 {
+	const bool bFailedPendingOrderReturn =
+		!bSuccess
+		&& bPendingOrderFulfillment
+		&& CurrentAction.ActionType == ENPCQueuedActionType::MoveToTableID
+		&& CurrentAction.Target.TrimStartAndEnd().Equals(PendingOrderReturnTableID.TrimStartAndEnd(), ESearchCase::IgnoreCase);
+
 	if (!bSuccess)
 	{
 		const FString Message = FailureReason.IsEmpty() ? TEXT("NPC queued action failed") : FailureReason;
 		PrintDebugMessage(Message, FColor::Red);
+	}
+
+	if (bFailedPendingOrderReturn)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Order return table failed: %s"), *PendingOrderReturnTableID);
+		ClearPendingOrderState();
 	}
 
 	if (!bSuccess && bStopQueueOnActionFailure)
@@ -717,6 +911,8 @@ void UNPCActionQueueComponent::CompleteCurrentAction(bool bSuccess, const FStrin
 		CurrentAction = FNPCQueuedAction();
 		bWaitingForMove = false;
 		bIsRunningQueue = false;
+		ClearPendingOrderState();
+		ClearOrderFulfillmentTimers();
 		PrintDebugMessage(TEXT("NPC action queue stopped after failed action"), FColor::Red);
 		return;
 	}
@@ -769,6 +965,34 @@ FString UNPCActionQueueComponent::ResolveCurrentServiceTableID() const
 	return LastVisitedTableID.TrimStartAndEnd();
 }
 
+int32 UNPCActionQueueComponent::ResolveOrderPrice(const FString& OrderItem) const
+{
+	FString NormalizedOrderItem = OrderItem.TrimStartAndEnd();
+	NormalizedOrderItem.ToLowerInline();
+
+	if (NormalizedOrderItem.Contains(TEXT("coffee")) || NormalizedOrderItem.Contains(TEXT("コーヒー")))
+	{
+		return 500;
+	}
+
+	if (NormalizedOrderItem.Contains(TEXT("cake")) || NormalizedOrderItem.Contains(TEXT("ケーキ")))
+	{
+		return 700;
+	}
+
+	if (NormalizedOrderItem.Contains(TEXT("omurice")) || NormalizedOrderItem.Contains(TEXT("オムライス")))
+	{
+		return 1200;
+	}
+
+	if (NormalizedOrderItem.Contains(TEXT("curry")) || NormalizedOrderItem.Contains(TEXT("カレー")))
+	{
+		return 1000;
+	}
+
+	return DefaultOrderPrice;
+}
+
 AActor* UNPCActionQueueComponent::FindPlayerActor() const
 {
 	if (AActor* PlayerPawn = UGameplayStatics::GetPlayerPawn(GetWorld(), 0))
@@ -809,6 +1033,95 @@ void UNPCActionQueueComponent::PrintDebugMessage(const FString& Message, const F
 	}
 }
 
+void UNPCActionQueueComponent::ClearOrderFulfillmentTimers()
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(PostServePauseTimerHandle);
+		World->GetTimerManager().ClearTimer(BillPresentationPauseTimerHandle);
+		World->GetTimerManager().ClearTimer(ClosingBowPauseTimerHandle);
+		World->GetTimerManager().ClearTimer(ReturnToCounterAfterClosingTimerHandle);
+	}
+}
+
+void UNPCActionQueueComponent::ClearPendingOrderState()
+{
+	bPendingOrderFulfillment = false;
+	PendingOrderReturnTableID = TEXT("");
+	PendingOrderItem = TEXT("");
+	PendingOrderPrice = 0;
+}
+
+void UNPCActionQueueComponent::BroadcastQueueGesture(FName GestureName)
+{
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Gesture requested: %s"), *GestureName.ToString());
+	OnQueueGestureRequested.Broadcast(GestureName);
+}
+
+void UNPCActionQueueComponent::StartOrderServingCompletionFlow()
+{
+	ClearOrderFulfillmentTimers();
+	BroadcastQueueGesture(FName(TEXT("serve_food")));
+
+	UWorld* World = GetWorld();
+	const float ServePause = FMath::Max(PostServePauseSeconds, 0.0f);
+	if (!World || ServePause <= KINDA_SMALL_NUMBER)
+	{
+		HandlePostServePauseTimerFinished();
+		return;
+	}
+
+	World->GetTimerManager().SetTimer(
+		PostServePauseTimerHandle,
+		this,
+		&UNPCActionQueueComponent::HandlePostServePauseTimerFinished,
+		ServePause,
+		false);
+}
+
+void UNPCActionQueueComponent::ReturnToCounterAfterServingIfNeeded()
+{
+	if (!bReturnToCounterAfterServing)
+	{
+		ClearPendingOrderState();
+		return;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Waiting before returning to counter after closing"));
+
+	UWorld* World = GetWorld();
+	const float ReturnDelay = FMath::Max(ReturnToCounterAfterClosingDelaySeconds, 0.0f);
+	if (!World || ReturnDelay <= KINDA_SMALL_NUMBER)
+	{
+		HandleReturnToCounterAfterClosingDelayFinished();
+		return;
+	}
+
+	World->GetTimerManager().SetTimer(
+		ReturnToCounterAfterClosingTimerHandle,
+		this,
+		&UNPCActionQueueComponent::HandleReturnToCounterAfterClosingDelayFinished,
+		ReturnDelay,
+		false);
+}
+
+void UNPCActionQueueComponent::HandleReturnToCounterAfterClosingDelayFinished()
+{
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Returning to counter after service closing"));
+	ClearActionQueue();
+	EnqueueMoveToSceneTag(TEXT("counter"));
+	StartActionQueue();
+}
+
+void UNPCActionQueueComponent::ClearPostSeatingMenuGuidanceTimers()
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(PostSeatingMenuGuidanceTimerHandle);
+		World->GetTimerManager().ClearTimer(PostSeatingMenuHelpEnableTimerHandle);
+	}
+}
+
 void UNPCActionQueueComponent::HandleNPCMoveCompleted(FName MoveReason, FString TargetID, bool bSuccess)
 {
 	if (!bIsRunningQueue || !bWaitingForMove || !IsCurrentActionMove())
@@ -821,11 +1134,27 @@ void UNPCActionQueueComponent::HandleNPCMoveCompleted(FName MoveReason, FString 
 		LastVisitedTableID = TargetID.TrimStartAndEnd();
 	}
 
+	const FString CompletedTargetID = TargetID.TrimStartAndEnd();
+	const FString OrderReturnTableID = PendingOrderReturnTableID.TrimStartAndEnd();
+	const bool bCompletedPendingOrderReturn =
+		bPendingOrderFulfillment
+		&& bSuccess
+		&& MoveReason == FName(TEXT("Table"))
+		&& CompletedTargetID.Equals(OrderReturnTableID, ESearchCase::IgnoreCase);
+
 	bWaitingForMove = false;
 	const FString FailureReason = bSuccess
 		? TEXT("")
 		: FString::Printf(TEXT("NPC queued move failed: %s %s"), *MoveReason.ToString(), *TargetID);
 	CompleteCurrentAction(bSuccess, FailureReason);
+
+	if (bCompletedPendingOrderReturn)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Order served at table: %s"), *CompletedTargetID);
+		bPendingOrderFulfillment = false;
+		PendingOrderReturnTableID = TEXT("");
+		StartOrderServingCompletionFlow();
+	}
 }
 
 void UNPCActionQueueComponent::HandleWaitTimerFinished()
@@ -836,4 +1165,88 @@ void UNPCActionQueueComponent::HandleWaitTimerFinished()
 	}
 
 	CompleteCurrentAction(true, TEXT(""));
+}
+
+void UNPCActionQueueComponent::HandlePostServePauseTimerFinished()
+{
+	OnQueueSpeakRequested.Broadcast(OrderServedLine);
+
+	UWorld* World = GetWorld();
+	const float BillPause = FMath::Max(BillPresentationPauseSeconds, 0.0f);
+	if (!World || BillPause <= KINDA_SMALL_NUMBER)
+	{
+		HandleBillPresentationPauseTimerFinished();
+		return;
+	}
+
+	World->GetTimerManager().SetTimer(
+		BillPresentationPauseTimerHandle,
+		this,
+		&UNPCActionQueueComponent::HandleBillPresentationPauseTimerFinished,
+		BillPause,
+		false);
+}
+
+void UNPCActionQueueComponent::HandleBillPresentationPauseTimerFinished()
+{
+	BroadcastQueueGesture(FName(TEXT("put_bill")));
+
+	FString BillLine = BillLineFormat;
+	BillLine.ReplaceInline(TEXT("{Price}"), *FString::FromInt(PendingOrderPrice));
+	OnQueueSpeakRequested.Broadcast(BillLine);
+
+	UWorld* World = GetWorld();
+	const float BowPause = FMath::Max(ClosingBowPauseSeconds, 0.0f);
+	if (!World || BowPause <= KINDA_SMALL_NUMBER)
+	{
+		HandleClosingBowPauseTimerFinished();
+		return;
+	}
+
+	World->GetTimerManager().SetTimer(
+		ClosingBowPauseTimerHandle,
+		this,
+		&UNPCActionQueueComponent::HandleClosingBowPauseTimerFinished,
+		BowPause,
+		false);
+}
+
+void UNPCActionQueueComponent::HandleClosingBowPauseTimerFinished()
+{
+	BroadcastQueueGesture(FName(TEXT("bow")));
+	OnQueueSpeakRequested.Broadcast(ServiceClosingLine);
+	ReturnToCounterAfterServingIfNeeded();
+}
+
+void UNPCActionQueueComponent::HandlePostSeatingMenuGuidanceTimerFinished()
+{
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Post seating menu guidance line: %s"), *PostSeatingMenuGuidanceLine);
+	OnQueueSpeakRequested.Broadcast(PostSeatingMenuGuidanceLine);
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		HandlePostSeatingMenuHelpEnableTimerFinished();
+		return;
+	}
+
+	const float HelpEnableDelay = FMath::Max(PostSeatingMenuHelpEnableDelay, 0.0f);
+	if (HelpEnableDelay <= KINDA_SMALL_NUMBER)
+	{
+		HandlePostSeatingMenuHelpEnableTimerFinished();
+		return;
+	}
+
+	World->GetTimerManager().SetTimer(
+		PostSeatingMenuHelpEnableTimerHandle,
+		this,
+		&UNPCActionQueueComponent::HandlePostSeatingMenuHelpEnableTimerFinished,
+		HelpEnableDelay,
+		false);
+}
+
+void UNPCActionQueueComponent::HandlePostSeatingMenuHelpEnableTimerFinished()
+{
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Post seating menu guidance finished"));
+	OnPostSeatingMenuGuidanceFinished.Broadcast();
 }
