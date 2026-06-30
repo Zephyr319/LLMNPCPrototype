@@ -9,6 +9,7 @@
 #include "VoicevoxTTSClient.generated.h"
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnVoicevoxSoundGenerated, USoundWave*, SoundWave);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FOnVoicevoxSpeechFinished);
 
 UCLASS(ClassGroup = (Audio), meta = (BlueprintSpawnableComponent))
 class LLMNPCPROTOTYPE_API UVoicevoxTTSClient : public UActorComponent
@@ -18,14 +19,25 @@ class LLMNPCPROTOTYPE_API UVoicevoxTTSClient : public UActorComponent
 public:
     UVoicevoxTTSClient();
 
+protected:
+    virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
+public:
+
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VOICEVOX")
     FString BaseUrl;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VOICEVOX")
     int32 SpeakerId;
 
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VOICEVOX")
+    float VoicevoxWarmupDelaySeconds;
+
     UPROPERTY(BlueprintAssignable, Category = "VOICEVOX")
     FOnVoicevoxSoundGenerated OnVoicevoxSoundGenerated;
+
+    UPROPERTY(BlueprintAssignable, Category = "VOICEVOX")
+    FOnVoicevoxSpeechFinished OnVoicevoxSpeechFinished;
 
     UFUNCTION(BlueprintCallable, Category = "VOICEVOX")
     void GenerateVoice(const FString& Text);
@@ -39,6 +51,9 @@ public:
     UFUNCTION(BlueprintCallable, Category = "VOICEVOX")
     void StopVoicevoxSpeech();
 
+    UFUNCTION(BlueprintCallable, BlueprintPure, Category = "VOICEVOX")
+    bool IsVoicevoxSpeechActive() const;
+
 private:
     UPROPERTY()
     USoundWave* LastGeneratedSound;
@@ -50,6 +65,9 @@ private:
     UAudioComponent* TargetAudioComponent;
 
     UPROPERTY()
+    UAudioComponent* OwnedAudioComponent;
+
+    UPROPERTY()
     TArray<FString> PendingSentenceQueue;
 
     UPROPERTY()
@@ -57,11 +75,17 @@ private:
 
     TArray<float> PendingAudioDurations;
     FTimerHandle PlaybackFinishTimerHandle;
+    FTimerHandle VoicevoxWarmupTimerHandle;
 
     bool bIsSynthesizingSentence;
     bool bIsAudioPlaying;
+    bool bSpeechFinishNotificationPending;
     int32 ActiveGenerationId;
     int32 CurrentPlaybackGenerationId;
+
+    static bool bGlobalVoicevoxWarmupCompleted;
+    static bool bGlobalVoicevoxWarmupInProgress;
+    static TWeakObjectPtr<UVoicevoxTTSClient> GlobalVoicevoxWarmupOwner;
 
     FString BuildVoicevoxUrl(const FString& PathAndQuery) const;
 
@@ -70,9 +94,14 @@ private:
     void FinishSentenceSynthesis(int32 GenerationId);
     void QueueGeneratedAudio(USoundWave* SoundWave, float PlaybackDuration);
     void PlayNextQueuedAudio();
+    UAudioComponent* GetOrCreatePlaybackAudioComponent();
+    void TryBroadcastSpeechFinished();
     void StartPlaybackFinishTimer(float PlaybackDuration);
     void ClearPlaybackFinishTimer();
     float EstimateDurationFromWavData(const TArray<uint8>& WavData) const;
+    void StartDelayedVoicevoxWarmup();
+    void MarkGlobalWarmupSucceeded();
+    void MarkGlobalWarmupFailed();
 
     UFUNCTION()
     void HandleTargetAudioFinished();

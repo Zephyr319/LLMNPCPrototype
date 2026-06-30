@@ -6,7 +6,9 @@
 #include "Components/BoxComponent.h"
 #include "Components/SceneComponent.h"
 #include "Engine/Engine.h"
+#include "EngineUtils.h"
 #include "GameFramework/Pawn.h"
+#include "NPCActionQueueComponent.h"
 
 ATableMarkerActor::ATableMarkerActor()
 {
@@ -41,6 +43,8 @@ ATableMarkerActor::ATableMarkerActor()
 	bIsOccupied = false;
 	SeatCount = 2;
 	Priority = 0;
+	NPCActorForTableArea = nullptr;
+	bShowTableAreaOnScreenDebug = false;
 
 	TriggerBox->OnComponentBeginOverlap.AddDynamic(this, &ATableMarkerActor::OnTriggerBoxBeginOverlap);
 	TriggerBox->OnComponentEndOverlap.AddDynamic(this, &ATableMarkerActor::OnTriggerBoxEndOverlap);
@@ -76,6 +80,40 @@ int32 ATableMarkerActor::GetPriority() const
 	return Priority;
 }
 
+void ATableMarkerActor::NotifyPlayerEnteredThisTableArea(AActor* OtherActor)
+{
+	if (!IsLocalPlayerPawn(OtherActor))
+	{
+		return;
+	}
+
+	UNPCActionQueueComponent* ActionQueueComponent = ResolveActionQueueComponent();
+	if (!ActionQueueComponent)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[TableArea] NPCActionQueueComponent not found for table %s"), *TableID);
+		return;
+	}
+
+	ActionQueueComponent->NotifyPlayerEnteredTableArea(TableID);
+}
+
+void ATableMarkerActor::NotifyPlayerLeftThisTableArea(AActor* OtherActor)
+{
+	if (!IsLocalPlayerPawn(OtherActor))
+	{
+		return;
+	}
+
+	UNPCActionQueueComponent* ActionQueueComponent = ResolveActionQueueComponent();
+	if (!ActionQueueComponent)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[TableArea] NPCActionQueueComponent not found for table %s"), *TableID);
+		return;
+	}
+
+	ActionQueueComponent->NotifyPlayerLeftTableArea(TableID);
+}
+
 void ATableMarkerActor::OnTriggerBoxBeginOverlap(UPrimitiveComponent* OverlappedComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep, const FHitResult& SweepResult)
 {
 	if (!IsLocalPlayerPawn(OtherActor))
@@ -83,10 +121,12 @@ void ATableMarkerActor::OnTriggerBoxBeginOverlap(UPrimitiveComponent* Overlapped
 		return;
 	}
 
-	if (GEngine)
+	if (bShowTableAreaOnScreenDebug && GEngine)
 	{
 		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Green, FString::Printf(TEXT("Enter %s"), *TableID));
 	}
+
+	NotifyPlayerEnteredThisTableArea(OtherActor);
 }
 
 void ATableMarkerActor::OnTriggerBoxEndOverlap(UPrimitiveComponent* OverlappedComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, int32 OtherBodyIndex)
@@ -96,14 +136,49 @@ void ATableMarkerActor::OnTriggerBoxEndOverlap(UPrimitiveComponent* OverlappedCo
 		return;
 	}
 
-	if (GEngine)
+	if (bShowTableAreaOnScreenDebug && GEngine)
 	{
 		GEngine->AddOnScreenDebugMessage(-1, 2.0f, FColor::Yellow, FString::Printf(TEXT("Leave %s"), *TableID));
 	}
+
+	NotifyPlayerLeftThisTableArea(OtherActor);
 }
 
 bool ATableMarkerActor::IsLocalPlayerPawn(AActor* OtherActor) const
 {
 	const APawn* OtherPawn = Cast<APawn>(OtherActor);
 	return OtherPawn && OtherPawn->IsPlayerControlled() && OtherPawn->IsLocallyControlled();
+}
+
+UNPCActionQueueComponent* ATableMarkerActor::ResolveActionQueueComponent() const
+{
+	if (NPCActorForTableArea)
+	{
+		if (UNPCActionQueueComponent* ActionQueueComponent = NPCActorForTableArea->FindComponentByClass<UNPCActionQueueComponent>())
+		{
+			return ActionQueueComponent;
+		}
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return nullptr;
+	}
+
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		AActor* CandidateActor = *It;
+		if (!CandidateActor)
+		{
+			continue;
+		}
+
+		if (UNPCActionQueueComponent* ActionQueueComponent = CandidateActor->FindComponentByClass<UNPCActionQueueComponent>())
+		{
+			return ActionQueueComponent;
+		}
+	}
+
+	return nullptr;
 }

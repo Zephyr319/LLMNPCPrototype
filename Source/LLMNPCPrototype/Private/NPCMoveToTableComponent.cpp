@@ -9,7 +9,9 @@
 #include "EngineUtils.h"
 #include "FurnitureMarkerActor.h"
 #include "GameFramework/Character.h"
+#include "HAL/PlatformTime.h"
 #include "Kismet/GameplayStatics.h"
+#include "NPCActionQueueComponent.h"
 #include "TableMarkerActor.h"
 #include "UObject/UnrealType.h"
 
@@ -117,11 +119,15 @@ UNPCMoveToTableComponent::UNPCMoveToTableComponent()
 	bIsRunning = false;
 	RemainingMoveDistance = 0.0f;
 	bPrintMoveSpeedDebug = false;
+	bLogTickMovement = false;
 	AcceptanceRadius = 20.0f;
 	StopDistanceFromTable = 80.0f;
 	bIsMovingToTable = false;
 	CurrentMoveSpeed = 0.0f;
 	CurrentMoveVelocity = FVector::ZeroVector;
+	bMovementPausedByServiceGesture = false;
+	ServiceGesturePauseAnchorLocation = FVector::ZeroVector;
+	bHasServiceGesturePauseAnchor = false;
 	FacingYawOffsetDegrees = 0.0f;
 	bFaceMovementDirection = true;
 	bFaceTableOnArrival = true;
@@ -192,6 +198,9 @@ UNPCMoveToTableComponent::UNPCMoveToTableComponent()
 	bPreserveMovementModeForGuideMove = false;
 	bGuideStartedEventBroadcasted = false;
 	bGuideArrivedEventBroadcasted = false;
+	GuideStartPauseGraceSeconds = 2.0f;
+	LastGuideStartedTime = 0.0;
+	bGuideStartGraceLogPrinted = false;
 	LastGuidePausedLine = TEXT("");
 	LastGuideResumedLine = TEXT("");
 	LastGuideArrivedLine = TEXT("");
@@ -222,6 +231,15 @@ void UNPCMoveToTableComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 
 	if (DeltaTime <= KINDA_SMALL_NUMBER)
 	{
+		CurrentMoveVelocity = FVector::ZeroVector;
+		CurrentMoveSpeed = 0.0f;
+		SetOwnerComponentVelocity(Owner, CurrentMoveVelocity);
+		return;
+	}
+
+	if (bMovementPausedByServiceGesture)
+	{
+		CheckPausedActorLocation(Owner, TEXT("TickComponent"));
 		CurrentMoveVelocity = FVector::ZeroVector;
 		CurrentMoveSpeed = 0.0f;
 		SetOwnerComponentVelocity(Owner, CurrentMoveVelocity);
@@ -297,6 +315,7 @@ void UNPCMoveToTableComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 	}
 
 	FHitResult SweepHit;
+	LogTickMoveState(OldLocation, MoveTarget);
 	Owner->SetActorLocation(DesiredLocation, true, &SweepHit);
 
 	const FVector NewLocation = Owner->GetActorLocation();
@@ -354,6 +373,14 @@ void UNPCMoveToTableComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 
 bool UNPCMoveToTableComponent::MoveToTableByID(const FString& TargetTableID)
 {
+	LogMovementRequest(TEXT("MoveToTableByID"), TargetTableID);
+
+	if (bMovementPausedByServiceGesture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *TargetTableID);
+		return false;
+	}
+
 	CancelFollowingForExplicitCommand();
 
 	CurrentMoveReason = TEXT("Table");
@@ -381,6 +408,14 @@ bool UNPCMoveToTableComponent::MoveToTableByID(const FString& TargetTableID)
 
 bool UNPCMoveToTableComponent::MoveToTableByHint(const FString& TargetHint, AActor* ReferenceActor)
 {
+	LogMovementRequest(TEXT("MoveToTableByHint"), TargetHint);
+
+	if (bMovementPausedByServiceGesture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *TargetHint);
+		return false;
+	}
+
 	CancelFollowingForExplicitCommand();
 
 	CurrentMoveReason = TEXT("Table");
@@ -468,6 +503,15 @@ bool UNPCMoveToTableComponent::MoveToTableByHint(const FString& TargetHint, AAct
 
 bool UNPCMoveToTableComponent::MoveNearActor(AActor* TargetActor, float StopDistance)
 {
+	const FString RequestedTargetName = TargetActor ? TargetActor->GetName() : TEXT("");
+	LogMovementRequest(TEXT("MoveNearActor"), RequestedTargetName);
+
+	if (bMovementPausedByServiceGesture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *RequestedTargetName);
+		return false;
+	}
+
 	CurrentMoveReason = TEXT("Actor");
 	CurrentMoveTargetID = TargetActor ? TargetActor->GetName() : TEXT("");
 
@@ -531,6 +575,14 @@ AActor* UNPCMoveToTableComponent::FindPlayerActor() const
 
 bool UNPCMoveToTableComponent::MoveNearPlayer(float StopDistance)
 {
+	LogMovementRequest(TEXT("MoveNearPlayer"), TEXT("player"));
+
+	if (bMovementPausedByServiceGesture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=player"));
+		return false;
+	}
+
 	CancelFollowingForExplicitCommand();
 	SetMovementMode(ENPCMovementMode::SeekPlayer);
 
@@ -562,6 +614,14 @@ bool UNPCMoveToTableComponent::MoveNearPlayer(float StopDistance)
 
 void UNPCMoveToTableComponent::StartFollowingPlayer(float DesiredDistance)
 {
+	LogMovementRequest(TEXT("StartFollowingPlayer"), TEXT("player"));
+
+	if (bMovementPausedByServiceGesture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=player"));
+		return;
+	}
+
 	if (bIsGuidingPlayer)
 	{
 		StopGuidingPlayer();
@@ -726,6 +786,13 @@ bool UNPCMoveToTableComponent::StartGuideToTable(const FString& TableID)
 {
 	const FString RequestedTableID = TableID.TrimStartAndEnd();
 	UE_LOG(LogTemp, Warning, TEXT("[Guide] Requested table target: %s"), *RequestedTableID);
+	LogMovementRequest(TEXT("StartGuideToTable"), RequestedTableID);
+
+	if (bMovementPausedByServiceGesture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *RequestedTableID);
+		return false;
+	}
 
 	const FString TrimmedTableID = ResolveGuideTableTarget(RequestedTableID);
 	if (TrimmedTableID.IsEmpty())
@@ -748,6 +815,8 @@ bool UNPCMoveToTableComponent::StartGuideToTable(const FString& TableID)
 	GuidePlayerPhase = EGuidePlayerPhase::None;
 	bGuideStartedEventBroadcasted = false;
 	bGuideArrivedEventBroadcasted = false;
+	LastGuideStartedTime = 0.0;
+	bGuideStartGraceLogPrinted = false;
 
 	const FString Message = FString::Printf(TEXT("Start guide to table: %s"), *TrimmedTableID);
 	UE_LOG(LogTemp, Warning, TEXT("%s"), *Message);
@@ -789,6 +858,14 @@ bool UNPCMoveToTableComponent::StartGuideToTable(const FString& TableID)
 bool UNPCMoveToTableComponent::StartGuideToSceneTag(const FString& TargetTag)
 {
 	const FString TrimmedTargetTag = TargetTag.TrimStartAndEnd();
+	LogMovementRequest(TEXT("StartGuideToSceneTag"), TrimmedTargetTag);
+
+	if (bMovementPausedByServiceGesture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *TrimmedTargetTag);
+		return false;
+	}
+
 	if (TrimmedTargetTag.IsEmpty())
 	{
 		PrintDebugMessage(TEXT("Guide scene tag target is empty"), FColor::Red);
@@ -806,6 +883,8 @@ bool UNPCMoveToTableComponent::StartGuideToSceneTag(const FString& TargetTag)
 	GuidePlayerPhase = EGuidePlayerPhase::None;
 	bGuideStartedEventBroadcasted = false;
 	bGuideArrivedEventBroadcasted = false;
+	LastGuideStartedTime = 0.0;
+	bGuideStartGraceLogPrinted = false;
 
 	const FString Message = FString::Printf(TEXT("Start guide to scene tag: %s"), *TrimmedTargetTag);
 	UE_LOG(LogTemp, Warning, TEXT("%s"), *Message);
@@ -865,6 +944,8 @@ void UNPCMoveToTableComponent::StopGuidingPlayer()
 	bPreserveMovementModeForGuideMove = false;
 	bGuideStartedEventBroadcasted = false;
 	bGuideArrivedEventBroadcasted = false;
+	LastGuideStartedTime = 0.0;
+	bGuideStartGraceLogPrinted = false;
 
 	if (bIsMovingToTable || bWasGuiding)
 	{
@@ -883,6 +964,118 @@ void UNPCMoveToTableComponent::StopGuidingPlayer()
 bool UNPCMoveToTableComponent::IsGuidingPlayer() const
 {
 	return bIsGuidingPlayer;
+}
+
+FString UNPCMoveToTableComponent::GetCurrentGuideTargetID() const
+{
+	return GuideTargetID;
+}
+
+void UNPCMoveToTableComponent::GetOwnerActionQueueState(bool& bOutFarewellBowInProgress, bool& bOutActionQueuePausedForFarewellBow) const
+{
+	bOutFarewellBowInProgress = false;
+	bOutActionQueuePausedForFarewellBow = false;
+
+	const AActor* Owner = GetOwner();
+	if (!Owner)
+	{
+		return;
+	}
+
+	const UNPCActionQueueComponent* ActionQueueComponent = Owner->FindComponentByClass<UNPCActionQueueComponent>();
+	if (!ActionQueueComponent)
+	{
+		return;
+	}
+
+	bOutFarewellBowInProgress = ActionQueueComponent->IsFarewellBowInProgress();
+	bOutActionQueuePausedForFarewellBow = ActionQueueComponent->IsActionQueuePausedForFarewellBow();
+}
+
+void UNPCMoveToTableComponent::LogMovementRequest(const TCHAR* FunctionName, const FString& Target) const
+{
+	bool bFarewellBow = false;
+	bool bActionQueuePaused = false;
+	GetOwnerActionQueueState(bFarewellBow, bActionQueuePaused);
+
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[NPCMove][REQUEST] %s Target=%s Pause=%d FarewellBow=%d ActionQueuePaused=%d IsGuiding=%d GuideTarget=%s"),
+		FunctionName ? FunctionName : TEXT("unknown"),
+		*Target,
+		bMovementPausedByServiceGesture ? 1 : 0,
+		bFarewellBow ? 1 : 0,
+		bActionQueuePaused ? 1 : 0,
+		bIsGuidingPlayer ? 1 : 0,
+		*GuideTargetID);
+}
+
+void UNPCMoveToTableComponent::LogMovementRequestLocation(const TCHAR* FunctionName, const FString& Target, const FVector& MoveLocation) const
+{
+	LogMovementRequest(FunctionName, FString::Printf(TEXT("%s Location=%s"), *Target, *MoveLocation.ToString()));
+}
+
+void UNPCMoveToTableComponent::LogTickMoveState(const FVector& CurrentLocation, const FVector& MoveTarget) const
+{
+	if (!bLogTickMovement)
+	{
+		return;
+	}
+
+	bool bFarewellBow = false;
+	bool bActionQueuePaused = false;
+	GetOwnerActionQueueState(bFarewellBow, bActionQueuePaused);
+
+	UE_LOG(
+		LogTemp,
+		VeryVerbose,
+		TEXT("[NPCMove][TICK_MOVE] Actor moving while Pause=%d FarewellBow=%d ActionQueuePaused=%d IsGuiding=%d Location=%s Target=%s GuideTarget=%s"),
+		bMovementPausedByServiceGesture ? 1 : 0,
+		bFarewellBow ? 1 : 0,
+		bActionQueuePaused ? 1 : 0,
+		bIsGuidingPlayer ? 1 : 0,
+		*CurrentLocation.ToString(),
+		*MoveTarget.ToString(),
+		*GuideTargetID);
+}
+
+void UNPCMoveToTableComponent::CheckPausedActorLocation(AActor* Owner, const TCHAR* Context)
+{
+	if (!Owner || !bHasServiceGesturePauseAnchor)
+	{
+		return;
+	}
+
+	const FVector CurrentLocation = Owner->GetActorLocation();
+	if (bLogTickMovement)
+	{
+		bool bFarewellBow = false;
+		bool bActionQueuePaused = false;
+		GetOwnerActionQueueState(bFarewellBow, bActionQueuePaused);
+
+		UE_LOG(
+			LogTemp,
+			VeryVerbose,
+			TEXT("[NPCMove][BLOCKED_TICK] Movement tick blocked by service gesture pause. Context=%s Pause=1 FarewellBow=%d ActionQueuePaused=%d IsGuiding=%d Location=%s Anchor=%s"),
+			Context ? Context : TEXT("unknown"),
+			bFarewellBow ? 1 : 0,
+			bActionQueuePaused ? 1 : 0,
+			bIsGuidingPlayer ? 1 : 0,
+			*CurrentLocation.ToString(),
+			*ServiceGesturePauseAnchorLocation.ToString());
+	}
+
+	if (!CurrentLocation.Equals(ServiceGesturePauseAnchorLocation, 1.0f))
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[NPCMove][WARNING] Actor location changed while movement is paused. Possible root motion or Blueprint movement. Current=%s Anchor=%s"),
+			*CurrentLocation.ToString(),
+			*ServiceGesturePauseAnchorLocation.ToString());
+		Owner->SetActorLocation(ServiceGesturePauseAnchorLocation, false);
+	}
 }
 
 bool UNPCMoveToTableComponent::MoveToFurnitureByID(const FString& FurnitureID)
@@ -1132,6 +1325,14 @@ bool UNPCMoveToTableComponent::MoveToSceneTargetByID(const FString& TargetID)
 
 bool UNPCMoveToTableComponent::MoveToSceneTargetByTag(const FString& TargetTag)
 {
+	LogMovementRequest(TEXT("MoveToSceneTargetByTag"), TargetTag);
+
+	if (bMovementPausedByServiceGesture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *TargetTag);
+		return false;
+	}
+
 	CancelFollowingForExplicitCommand();
 
 	CurrentMoveReason = TEXT("SceneTarget");
@@ -1256,6 +1457,83 @@ void UNPCMoveToTableComponent::StopMovingToTable()
 	}
 
 	ClearMovementState();
+}
+
+void UNPCMoveToTableComponent::StopCurrentMovement()
+{
+	bIsFollowingPlayer = false;
+	bFollowMoveInProgress = false;
+	FollowPlayerActor.Reset();
+	FollowUpdateTimer = 0.0f;
+	FollowRepathTimer = 0.0f;
+	FollowDebugTimer = 0.0f;
+	LastFollowPlayerLocation = FVector::ZeroVector;
+	LastFollowGoalLocation = FVector::ZeroVector;
+
+	bIsGuidingPlayer = false;
+	bGuidePausedForPlayer = false;
+	GuidePlayerPhase = EGuidePlayerPhase::None;
+	GuidePlayerActor.Reset();
+	GuideCheckTimer = 0.0f;
+	GuideTargetType = TEXT("");
+	GuideTargetID = TEXT("");
+	bPreserveMovementModeForGuideMove = false;
+	bGuideStartedEventBroadcasted = false;
+	bGuideArrivedEventBroadcasted = false;
+	LastGuideStartedTime = 0.0;
+	bGuideStartGraceLogPrinted = false;
+
+	ClearMovementState();
+	TargetLocation = FVector::ZeroVector;
+	TargetTableLocation = FVector::ZeroVector;
+	CurrentTargetTableID = TEXT("");
+	CurrentMoveReason = NAME_None;
+	CurrentMoveTargetID = TEXT("");
+	SetMovementMode(ENPCMovementMode::Idle);
+
+	UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Current movement cancelled."));
+}
+
+void UNPCMoveToTableComponent::SetMovementPausedByServiceGesture(bool bPaused)
+{
+	bMovementPausedByServiceGesture = bPaused;
+	if (bPaused)
+	{
+		if (AActor* Owner = GetOwner())
+		{
+			ServiceGesturePauseAnchorLocation = Owner->GetActorLocation();
+			bHasServiceGesturePauseAnchor = true;
+			UE_LOG(LogTemp, Warning, TEXT("[NPCMove][BOW_LOCATION] movement pause anchor location=%s"), *ServiceGesturePauseAnchorLocation.ToString());
+		}
+		else
+		{
+			ServiceGesturePauseAnchorLocation = FVector::ZeroVector;
+			bHasServiceGesturePauseAnchor = false;
+		}
+
+		CurrentMoveVelocity = FVector::ZeroVector;
+		CurrentMoveSpeed = 0.0f;
+		SetOwnerComponentVelocity(GetOwner(), CurrentMoveVelocity);
+		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Movement paused by service gesture."));
+		return;
+	}
+
+	if (AActor* Owner = GetOwner())
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[NPCMove][BOW_LOCATION] movement pause released location=%s Anchor=%s"),
+			*Owner->GetActorLocation().ToString(),
+			*ServiceGesturePauseAnchorLocation.ToString());
+	}
+	bHasServiceGesturePauseAnchor = false;
+	UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Movement pause released by service gesture."));
+}
+
+bool UNPCMoveToTableComponent::IsMovementPausedByServiceGesture() const
+{
+	return bMovementPausedByServiceGesture;
 }
 
 void UNPCMoveToTableComponent::SetMovementMode(ENPCMovementMode NewMode)
@@ -1399,10 +1677,18 @@ bool UNPCMoveToTableComponent::StartMovingToTargetPoint(const ACafeTargetPointAc
 
 bool UNPCMoveToTableComponent::StartMovingToLocation(const FVector& MoveLocation, const FVector& FaceLocation, const FName& MoveReason, const FString& TargetID, const FString& DebugMessage, bool bRequireNavigationPath)
 {
+	LogMovementRequestLocation(TEXT("StartMovingToLocation"), FString::Printf(TEXT("%s Reason=%s"), *TargetID, *MoveReason.ToString()), MoveLocation);
+
 	AActor* Owner = GetOwner();
 	if (!Owner)
 	{
 		FailMoveToTable(TEXT("NPC movement owner missing"));
+		return false;
+	}
+
+	if (bMovementPausedByServiceGesture)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *TargetID);
 		return false;
 	}
 
@@ -2269,6 +2555,21 @@ void UNPCMoveToTableComponent::UpdateGuidePlayer(AActor* Owner, float DeltaTime)
 		&& DistanceToPlayer > EffectiveMaxDistance
 		&& !bGuidePausedForPlayer)
 	{
+		const double CurrentTime = FPlatformTime::Seconds();
+		const double ElapsedSinceGuideStarted = LastGuideStartedTime > 0.0
+			? CurrentTime - LastGuideStartedTime
+			: TNumericLimits<double>::Max();
+		const float EffectiveGuideStartGrace = FMath::Max(GuideStartPauseGraceSeconds, 0.0f);
+		if (ElapsedSinceGuideStarted >= 0.0 && ElapsedSinceGuideStarted < EffectiveGuideStartGrace)
+		{
+			if (!bGuideStartGraceLogPrinted)
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[Guide] Pause check ignored during start grace period."));
+				bGuideStartGraceLogPrinted = true;
+			}
+			return;
+		}
+
 		ClearMovementState();
 		bGuidePausedForPlayer = true;
 		GuidePlayerPhase = EGuidePlayerPhase::PausedForPlayer;
@@ -2339,10 +2640,14 @@ bool UNPCMoveToTableComponent::StartGuideMovementToSavedTarget()
 	bPreserveMovementModeForGuideMove = bPreviousPreserveGuideMove;
 	if (bMoveStarted)
 	{
+		LastGuideStartedTime = FPlatformTime::Seconds();
+		bGuideStartGraceLogPrinted = false;
 		if (!bGuideStartedEventBroadcasted)
 		{
 			bGuideStartedEventBroadcasted = true;
-			OnGuideStarted.Broadcast(TEXT("guide_started"), ResumeTargetID, GuideStartedLine);
+			const bool bSuppressGuideStartedSpeech = UNPCActionQueueComponent::ConsumeSuppressNextGuideStartedSpeechForStrategyReply();
+			const FString SuggestedLine = bSuppressGuideStartedSpeech ? TEXT("") : GuideStartedLine;
+			OnGuideStarted.Broadcast(TEXT("guide_started"), ResumeTargetID, SuggestedLine);
 			UE_LOG(LogTemp, Warning, TEXT("Broadcast OnGuideStarted: %s"), *ResumeTargetID);
 		}
 		UE_LOG(LogTemp, Warning, TEXT("Guide started moving to saved target: %s"), *ResumeTargetID);

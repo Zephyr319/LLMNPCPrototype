@@ -8,6 +8,7 @@
 
 class UArrowComponent;
 class UBoxComponent;
+class UNPCActionQueueComponent;
 class USceneComponent;
 class UPrimitiveComponent;
 
@@ -25,6 +26,12 @@ public:
 	const TArray<FString>& GetTableTags() const;
 	int32 GetSeatCount() const;
 	int32 GetPriority() const;
+
+	UFUNCTION(BlueprintCallable, Category = "Table Marker|Area")
+	void NotifyPlayerEnteredThisTableArea(AActor* OtherActor);
+
+	UFUNCTION(BlueprintCallable, Category = "Table Marker|Area")
+	void NotifyPlayerLeftThisTableArea(AActor* OtherActor);
 
 protected:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Components")
@@ -57,6 +64,12 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table")
 	int32 Priority;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table|Area")
+	AActor* NPCActorForTableArea;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table|Debug")
+	bool bShowTableAreaOnScreenDebug;
+
 private:
 	UFUNCTION()
 	void OnTriggerBoxBeginOverlap(UPrimitiveComponent* OverlappedComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, int32 OtherBodyIndex, bool bFromSweep, const FHitResult& SweepResult);
@@ -65,4 +78,6 @@ private:
 	void OnTriggerBoxEndOverlap(UPrimitiveComponent* OverlappedComponent, AActor* OtherActor, UPrimitiveComponent* OtherComp, int32 OtherBodyIndex);
 
 	bool IsLocalPlayerPawn(AActor* OtherActor) const;
+
+	UNPCActionQueueComponent* ResolveActionQueueComponent() const;
 };

@@ -78,6 +78,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement|Dynamic Speed")
 	bool bPrintMoveSpeedDebug = false;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")
+	bool bLogTickMovement = false;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement")
 	float AcceptanceRadius;
 
@@ -92,6 +95,9 @@ public:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Table Movement")
 	FVector CurrentMoveVelocity;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "NPC|Movement")
+	bool bMovementPausedByServiceGesture;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement")
 	float FacingYawOffsetDegrees;
@@ -207,6 +213,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide")
 	float GuideStartApproachPlayerDistance = 160.0f;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC|Guide")
+	float GuideStartPauseGraceSeconds = 2.0f;
+
 	UPROPERTY(BlueprintAssignable, Category = "NPC|Guide")
 	FGuidePlayerEvent OnGuideStarted;
 
@@ -285,6 +294,9 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC|Guide")
 	bool IsGuidingPlayer() const;
 
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC|Guide")
+	FString GetCurrentGuideTargetID() const;
+
 	UFUNCTION(BlueprintCallable, Category = "Scene Target Movement")
 	bool MoveToFurnitureByID(const FString& FurnitureID);
 
@@ -308,6 +320,15 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "Table Movement")
 	void StopMovingToTable();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC|Movement")
+	void StopCurrentMovement();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC|Movement")
+	void SetMovementPausedByServiceGesture(bool bPaused);
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC|Movement")
+	bool IsMovementPausedByServiceGesture() const;
 
 	UFUNCTION(BlueprintCallable, Category = "NPC|Movement")
 	void SetMovementMode(ENPCMovementMode NewMode);
@@ -347,11 +368,19 @@ private:
 
 	float GuideCheckTimer = 0.0f;
 
+	double LastGuideStartedTime = 0.0;
+
+	bool bGuideStartGraceLogPrinted = false;
+
 	bool bGuidePausedForPlayer = false;
 
 	FString GuideTargetType;
 
 	FString GuideTargetID;
+
+	FVector ServiceGesturePauseAnchorLocation;
+
+	bool bHasServiceGesturePauseAnchor = false;
 
 	bool bPreserveMovementModeForGuideMove = false;
 
@@ -374,6 +403,16 @@ private:
 	bool StartMovingToTargetPoint(const ACafeTargetPointActor* TargetPoint);
 
 	bool StartMovingToLocation(const FVector& MoveLocation, const FVector& FaceLocation, const FName& MoveReason, const FString& TargetID, const FString& DebugMessage, bool bRequireNavigationPath);
+
+	void LogMovementRequest(const TCHAR* FunctionName, const FString& Target) const;
+
+	void LogMovementRequestLocation(const TCHAR* FunctionName, const FString& Target, const FVector& MoveLocation) const;
+
+	void LogTickMoveState(const FVector& CurrentLocation, const FVector& MoveTarget) const;
+
+	void CheckPausedActorLocation(AActor* Owner, const TCHAR* Context);
+
+	void GetOwnerActionQueueState(bool& bOutFarewellBowInProgress, bool& bOutActionQueuePausedForFarewellBow) const;
 
 	bool BuildNavigationPathToTarget(AActor* Owner);
 

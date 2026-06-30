@@ -10,11 +10,15 @@
 #include "Serialization/JsonWriter.h"
 #include "VoicevoxTTSClient.h"
 #include "Components/ActorComponent.h"
+#include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "HAL/PlatformMisc.h"
+#include "NPCActionQueueComponent.h"
 
 namespace
 {
+    int32 GServiceSpeechDispatchDepth = 0;
+
     const FString OpenAIChatCompletionsUrl = TEXT("https://api.openai.com/v1/chat/completions");
 
     FString GetOpenAIApiKey()
@@ -54,6 +58,41 @@ namespace
         }
 
         return Content;
+    }
+
+    FString BuildStrategyUserContent(const FString& UserMessage)
+    {
+        const bool bPlayerInTableArea = UNPCActionQueueComponent::IsLastKnownPlayerInTableArea();
+        const bool bSeatedForService = UNPCActionQueueComponent::IsLastKnownSeatedForService();
+        const bool bGuidingPlayer = UNPCActionQueueComponent::IsLastKnownGuidePlayerInProgress();
+        const bool bSeatingGuidanceCompleted = UNPCActionQueueComponent::IsLastKnownSeatingGuidanceCompleted();
+        const FString CurrentTableID = UNPCActionQueueComponent::GetLastKnownCurrentServiceTableID();
+        const FString CurrentGuideTargetID = UNPCActionQueueComponent::GetLastKnownGuideTargetID();
+        const FString ServiceState = bGuidingPlayer
+            ? TEXT("guiding")
+            : (bPlayerInTableArea
+            ? TEXT("in_table_area")
+            : (bSeatedForService ? TEXT("seated") : TEXT("reception")));
+        return FString::Printf(
+            TEXT("State: %s\nIsGuidingPlayer: %s\nCurrentGuideTargetID: %s\nIsSeatedForService: %s\nPlayerInTableArea: %s\nbPlayerInTableArea: %s\nCurrentServiceTableID: %s\nbSeatingGuidanceCompleted: %s\nSeatingGuidanceCompleted: %s\nUser: %s"),
+            *ServiceState,
+            bGuidingPlayer ? TEXT("true") : TEXT("false"),
+            CurrentGuideTargetID.IsEmpty() ? TEXT("none") : *CurrentGuideTargetID,
+            bSeatedForService ? TEXT("true") : TEXT("false"),
+            bPlayerInTableArea ? TEXT("true") : TEXT("false"),
+            bPlayerInTableArea ? TEXT("true") : TEXT("false"),
+            CurrentTableID.IsEmpty() ? TEXT("none") : *CurrentTableID,
+            bSeatingGuidanceCompleted ? TEXT("true") : TEXT("false"),
+            bSeatingGuidanceCompleted ? TEXT("true") : TEXT("false"),
+            *UserMessage);
+    }
+
+    bool IsOrderFulfillmentActionType(const FString& ActionType)
+    {
+        return ActionType.Equals(TEXT("place_order"), ESearchCase::IgnoreCase)
+            || ActionType.Equals(TEXT("PlaceOrder"), ESearchCase::IgnoreCase)
+            || ActionType.Equals(TEXT("order"), ESearchCase::IgnoreCase)
+            || ActionType.Equals(TEXT("serve"), ESearchCase::IgnoreCase);
     }
 
     bool ExtractOpenAIMessageContent(
@@ -573,6 +612,18 @@ ULLMClient::ULLMClient()
     OpenAIModelName = TEXT("gpt-4o-mini");
     ActiveLLMRequestId = 0;
     LastStrategyUserMessage = TEXT("");
+    bQueuedSpeechPlaying = false;
+    bCurrentAudioIsQueuedServiceSpeech = false;
+    QueuedSpeechGeneration = 0;
+    ActiveQueuedSpeechGeneration = 0;
+    MinSpeechGapSeconds = 0.35f;
+    QueuedSpeechFallbackTimeoutSeconds = 30.0f;
+    bHasDeferredStrategyAction = false;
+    DeferredStrategyActionType = TEXT("");
+    DeferredStrategyActionTiming = TEXT("");
+    DeferredStrategyActionItem = TEXT("");
+    DeferredStrategyActionQuantity = 0;
+    DeferredStrategyRequestId = 0;
 }
 
 void ULLMClient::SetVoicevoxTTSClient(UVoicevoxTTSClient* InVoicevoxTTSClient)
@@ -588,12 +639,78 @@ void ULLMClient::SpeakDirectText(const FString& Text)
         return;
     }
 
+    if (IsServiceSpeechDispatchActive())
+    {
+        SpeakDirectTextQueued(TrimmedText);
+        return;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Immediate SpeakDirectText requested. Clearing service speech."));
+    ClearQueuedSpeech();
     UE_LOG(LogTemp, Warning, TEXT("[Speech] SpeakDirectText: %s"), *TrimmedText);
-    HandleFinalReplyText(TrimmedText);
+    PlaySpeechInternal(TrimmedText, false, true);
+}
+
+void ULLMClient::SpeakDirectTextQueued(const FString& Text)
+{
+    const FString TrimmedText = Text.TrimStartAndEnd();
+    if (TrimmedText.IsEmpty())
+    {
+        return;
+    }
+
+    PendingServiceSpeechQueue.Add(TrimmedText);
+    UE_LOG(LogTemp, Warning, TEXT("[SpeechQueue] Enqueued service speech: %s"), *TrimmedText);
+    TryPlayNextQueuedSpeech();
+}
+
+void ULLMClient::ClearQueuedSpeech()
+{
+    PendingServiceSpeechQueue.Empty();
+    ++QueuedSpeechGeneration;
+    bQueuedSpeechPlaying = false;
+    ActiveQueuedSpeechGeneration = QueuedSpeechGeneration;
+
+    if (UWorld* World = ResolveSpeechWorld())
+    {
+        World->GetTimerManager().ClearTimer(QueuedSpeechFallbackTimerHandle);
+        World->GetTimerManager().ClearTimer(QueuedSpeechGapTimerHandle);
+    }
+
+    if (bCurrentAudioIsQueuedServiceSpeech)
+    {
+        if (UVoicevoxTTSClient* ResolvedVoicevoxTTSClient = ResolveVoicevoxTTSClient())
+        {
+            ResolvedVoicevoxTTSClient->StopVoicevoxSpeech();
+        }
+
+        bCurrentAudioIsQueuedServiceSpeech = false;
+        UE_LOG(LogTemp, Warning, TEXT("[SpeechQueue] Stopped current queued service audio due to immediate input."));
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("[SpeechQueue] Cleared queued service speech."));
+}
+
+bool ULLMClient::IsQueuedSpeechPlaying() const
+{
+    return bQueuedSpeechPlaying;
+}
+
+void ULLMClient::BeginServiceSpeechDispatch()
+{
+    ++GServiceSpeechDispatchDepth;
+}
+
+void ULLMClient::EndServiceSpeechDispatch()
+{
+    GServiceSpeechDispatchDepth = FMath::Max(GServiceSpeechDispatchDepth - 1, 0);
 }
 
 void ULLMClient::SendDeepSeekMessage(const FString& UserMessage)
 {
+    UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Clearing service speech before user request."));
+    CancelDeferredStrategyAction(true);
+    ClearQueuedSpeech();
     InterruptCurrentVoicevoxSpeech();
 
     const int32 LocalRequestId = ++ActiveLLMRequestId;
@@ -681,6 +798,9 @@ void ULLMClient::SendDeepSeekMessage(const FString& UserMessage)
 
 void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 {
+    UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Clearing service speech before user request."));
+    CancelDeferredStrategyAction(true);
+    ClearQueuedSpeech();
     InterruptCurrentVoicevoxSpeech();
     LastStrategyUserMessage = UserMessage;
 
@@ -739,9 +859,9 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "\n"
 
             "Decision and action rules:\n"
-            "- Include optional \"decision\": \"none|speak|act|act_and_speak\".\n"
+            "- Include optional \"decision\": \"none|speak|act|act_and_speak|guide_player_to_table|place_order\".\n"
             "- If decision is omitted, behavior is inferred from reply and actions.\n"
-            "- Use only these decisions: none, speak, act, act_and_speak.\n"
+            "- Use only these decisions: none, speak, act, act_and_speak, guide_player_to_table, place_order.\n"
             "- reply may be an empty string when no speech is needed.\n"
             "- actions may be used without speech.\n"
             "- If no speech is needed, set \"reply\" to \"\".\n"
@@ -765,6 +885,57 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- Guide-player commands mean the NPC leads the player to a destination and waits if the player falls behind. They are different from ordinary commanded moves and different from follow_player.\n"
             "- If the user says \u5E26\u6211\u53BB3\u53F7\u684C, \u6848\u5185\u6211\u52303\u53F7\u684C, \u5E26\u8DEF\u53BB3\u53F7\u684C, show me to table 3, or guide me to table 3, output {\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"Table_03\",\"quantity\":0}.\n"
             "- In the entrance/reception flow, if the user confirms dining or asks to be seated, such as \u662F, \u53EF\u4EE5, \u6211\u8981\u7528\u9910, \u7528\u9910, \u5E26\u6211\u53BB\u5EA7\u4F4D, \u5E26\u6211\u53BB\u5E2D\u4F4D, yes, sure, seat me, \u306F\u3044, \u304A\u9858\u3044\u3057\u307E\u3059, or \u304A\u5E2D\u3078\u304A\u9858\u3044\u3057\u307E\u3059, output {\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"nearest\",\"quantity\":0}.\n"
+            "\n"
+            "Reception menu inquiry and pre-seating intent rules:\n"
+            "- These reception rules do not apply when State is guiding or IsGuidingPlayer is true; during guiding, keep the current guide and answer verbally.\n"
+            "- Reception means State is reception, IsSeatedForService is false, PlayerInTableArea is false, and seating guidance has not completed.\n"
+            "- At reception, the NPC is asking whether the customer wants to dine. A menu question or recommendation question is not a confirmation to dine.\n"
+            "- If the customer asks about menu items, available foods, recommendations, prices, or choices before confirming dining, answer the menu/recommendation first.\n"
+            "- For reception menu/recommendation questions, do not output guide_player_to_table, place_order, order, serve, counter_then_return, or any action that goes to the counter or serves food.\n"
+            "- For reception menu/recommendation questions, use decision \"speak\" and actions [] or one recommend/explain action only.\n"
+            "- After answering a reception menu/recommendation question, gently ask whether they would like to dine or be seated.\n"
+            "- Only output guide_player_to_table at reception when the customer explicitly confirms dining, asks to be seated, asks to be guided, or states a concrete food/drink order.\n"
+            "- If the customer says a concrete food or drink item before being seated, treat it as intention to dine, not as a final order.\n"
+            "- For pre-seating concrete item requests, do not output place_order. First guide the customer to a table.\n"
+            "- For pre-seating concrete item requests, output decision exactly \"guide_player_to_table\" and actions exactly [{\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"nearest\",\"quantity\":0}].\n"
+            "- State: reception. User: \u6709\u4EC0\u4E48\u83DC\u63A8\u8350\uFF1F Expected decision: speak. Expected reply: \u304A\u3059\u3059\u3081\u306F\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u3002\u30E9\u30FC\u30E1\u30F3\u3084\u30B5\u30E9\u30C0\u3082\u3054\u3056\u3044\u307E\u3059\u3002\u304A\u98DF\u4E8B\u3067\u3057\u305F\u3089\u304A\u5E2D\u3078\u3054\u6848\u5185\u3044\u305F\u3057\u307E\u3059\u304C\u3001\u3054\u5229\u7528\u306B\u306A\u308A\u307E\u3059\u304B\uFF1F Expected actions: [{\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}].\n"
+            "- State: reception. User: \u6709\u4EC0\u4E48\u83DC\uFF1F Expected decision: speak. Expected reply: \u30E1\u30CB\u30E5\u30FC\u306B\u306F\u30E9\u30FC\u30E1\u30F3\u3001\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3001\u30B5\u30E9\u30C0\u304C\u3054\u3056\u3044\u307E\u3059\u3002\u304A\u98F2\u307F\u7269\u306F\u30B3\u30FC\u30D2\u30FC\u3068\u304A\u6C34\u3092\u3054\u7528\u610F\u3067\u304D\u307E\u3059\u3002\u304A\u98DF\u4E8B\u3067\u306E\u3054\u5229\u7528\u3067\u3057\u305F\u3089\u304A\u5E2D\u3078\u3054\u6848\u5185\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"explain\",\"timing\":\"before_speech\",\"item\":\"none\",\"quantity\":0}].\n"
+            "- State: reception. User: \u30E1\u30CB\u30E5\u30FC\u306F\u4F55\u304C\u3042\u308A\u307E\u3059\u304B\uFF1F Expected decision: speak. Expected reply: \u304A\u98DF\u4E8B\u306F\u30E9\u30FC\u30E1\u30F3\u3001\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3001\u30B5\u30E9\u30C0\u304C\u3054\u3056\u3044\u307E\u3059\u3002\u304A\u3059\u3059\u3081\u306F\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u3002\u3054\u5229\u7528\u3067\u3057\u305F\u3089\u304A\u5E2D\u3078\u3054\u6848\u5185\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"explain\",\"timing\":\"before_speech\",\"item\":\"none\",\"quantity\":0}].\n"
+            "- State: reception. User: \u306F\u3044\u3001\u98DF\u3079\u307E\u3059 Expected decision: guide_player_to_table. Expected reply: \u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\u3002\u304A\u5E2D\u3078\u3054\u6848\u5185\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"nearest\",\"quantity\":0}].\n"
+            "- State: reception. User: \u90A3\u5C31\u5496\u55B1\u5427 Expected decision: guide_player_to_table. Expected reply: \u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\u3002\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u306D\u3002\u307E\u305A\u306F\u304A\u5E2D\u3078\u3054\u6848\u5185\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"nearest\",\"quantity\":0}].\n"
+            "- State: reception. User: \u6211\u8981\u5496\u55B1. Expected decision: guide_player_to_table. Expected reply: \u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\u3002\u307E\u305A\u306F\u304A\u5E2D\u3078\u3054\u6848\u5185\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"nearest\",\"quantity\":0}].\n"
+            "- State: reception. User: \u30B3\u30FC\u30D2\u30FC\u304F\u3060\u3055\u3044. Expected decision: guide_player_to_table. Expected reply: \u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\u3002\u307E\u305A\u306F\u304A\u5E2D\u3078\u3054\u6848\u5185\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"nearest\",\"quantity\":0}].\n"
+            "\n"
+            "Guiding phase rules:\n"
+            "- The user message includes IsGuidingPlayer, IsSeatedForService, CurrentServiceTableID, bPlayerInTableArea, and bSeatingGuidanceCompleted.\n"
+            "- If IsGuidingPlayer is true, Haruka is already guiding the customer to a table.\n"
+            "- During guiding, menu or recommendation questions must be answered directly while continuing the current guide.\n"
+            "- During guiding, do not output guide_player_to_table again.\n"
+            "- During guiding, do not output place_order unless IsSeatedForService is true.\n"
+            "- If the user asks \u6709\u4EC0\u4E48\u63A8\u8350? during guiding, reply with a recommendation such as \u30AB\u30EC\u30FC\u30E9\u30A4\u30B9 and use recommend or speak only.\n"
+            "- State: guiding. User: \u6709\u4EC0\u4E48\u63A8\u8350\uFF1F Expected decision: speak. Expected reply: \u304A\u3059\u3059\u3081\u306F\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u3002\u5E2D\u307E\u3067\u3054\u6848\u5185\u3057\u306A\u304C\u3089\u3001\u30E1\u30CB\u30E5\u30FC\u3082\u3054\u8AAC\u660E\u3057\u307E\u3059\u306D\u3002 Expected actions: [{\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}].\n"
+            "- State: guiding. User: \u7ED9\u6211\u6765\u4E00\u4EFD\u62C9\u9762 Expected decision: speak. Expected reply: \u30E9\u30FC\u30E1\u30F3\u3067\u3059\u306D\u3002\u304A\u5E2D\u306B\u7740\u304D\u307E\u3057\u305F\u3089\u78BA\u8A8D\u3044\u305F\u3057\u307E\u3059\u306E\u3067\u3001\u3053\u306E\u307E\u307E\u3054\u6848\u5185\u3057\u307E\u3059\u3002 Expected actions: [].\n"
+            "\n"
+            "Seated/order phase rules:\n"
+            "- The user message includes a State line. If State is seated, guide_player_to_table has completed and the customer is now seated.\n"
+            "- If State is in_table_area or PlayerInTableArea is true, the player is already in the table/menu/interaction area and must be treated as seated.\n"
+            "- After guide_player_to_table has completed, treat the customer as seated and in the order phase.\n"
+            "- If the player is in the table area, treat them as seated.\n"
+            "- In seated/order phase, recommendation or menu questions should be answered directly.\n"
+            "- If the customer is seated or in the table area, never output guide_player_to_table.\n"
+            "- Do not output guide_player_to_table after seating guidance is completed.\n"
+            "- Do not repeat \"the menu is on the table\" as the only answer after the customer asks for recommendations.\n"
+            "- Do not say \"\u307E\u305A\u306F\u304A\u5E2D\u3078\u3054\u6848\u5185\u3057\u307E\u3059\" after the player is in the table area.\n"
+            "- If the customer asks for recommendations after being seated, recommend a concrete item, preferably \u30AB\u30EC\u30FC\u30E9\u30A4\u30B9, and ask if they would like to order it.\n"
+            "- If the customer says \u7ED9\u6211\u6765\u4E00\u4EFD\u62C9\u9762, \u30E9\u30FC\u30E1\u30F3\u304F\u3060\u3055\u3044, or \u6211\u8981\u5496\u55B1 while in table area, output place_order.\n"
+            "- If the customer asks \u6709\u4EC0\u4E48\u63A8\u8350 or \u304A\u3059\u3059\u3081\u306F\uFF1F while in table area, answer with a recommendation directly.\n"
+            "- Only output place_order when the customer explicitly orders or confirms the item.\n"
+            "- State: in_table_area. User: \u7ED9\u6211\u6765\u4E00\u4EFD\u62C9\u9762 Expected decision: place_order. Expected reply: \u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\u3002\u30E9\u30FC\u30E1\u30F3\u3092\u3054\u7528\u610F\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"place_order\",\"timing\":\"immediate\",\"item\":\"\u30E9\u30FC\u30E1\u30F3\",\"quantity\":1}].\n"
+            "- State: in_table_area. User: \u6709\u4EC0\u4E48\u63A8\u8350\uFF1F Expected decision: speak. Expected reply: \u304A\u3059\u3059\u3081\u306F\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u3002\u30B9\u30D1\u30A4\u30B7\u30FC\u3067\u98DF\u3079\u3084\u3059\u304F\u3001\u521D\u3081\u3066\u306E\u304A\u5BA2\u69D8\u306B\u3082\u4EBA\u6C17\u3067\u3059\u3002\u3088\u308D\u3057\u3051\u308C\u3070\u3054\u6CE8\u6587\u3092\u627F\u308A\u307E\u3059\u3002 Expected actions: [{\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}].\n"
+            "- State: seated. User: \u6709\u4EC0\u4E48\u63A8\u8350\uFF1F Expected decision: speak. Expected reply: \u304A\u3059\u3059\u3081\u306F\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u3002\u30B9\u30D1\u30A4\u30B7\u30FC\u3067\u98DF\u3079\u3084\u3059\u304F\u3001\u521D\u3081\u3066\u306E\u304A\u5BA2\u69D8\u306B\u3082\u4EBA\u6C17\u3067\u3059\u3002\u3088\u308D\u3057\u3051\u308C\u3070\u3054\u6CE8\u6587\u3092\u627F\u308A\u307E\u3059\u3002 Expected actions: [{\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}].\n"
+            "- State: seated. User: \u304A\u3059\u3059\u3081\u306F\uFF1F Expected decision: speak. Expected reply: \u304A\u3059\u3059\u3081\u306F\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u3002\u307B\u304B\u306B\u3082\u30E9\u30FC\u30E1\u30F3\u3084\u30B5\u30E9\u30C0\u304C\u3054\u3056\u3044\u307E\u3059\u3002\u6C17\u306B\u306A\u308B\u3082\u306E\u304C\u3042\u308C\u3070\u304A\u7533\u3057\u4ED8\u3051\u304F\u3060\u3055\u3044\u3002 Expected actions: [{\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}].\n"
+            "- State: seated. User: \u3058\u3083\u3042\u30AB\u30EC\u30FC\u3067 Expected decision: place_order. Expected reply: \u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\u3002\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3092\u3054\u7528\u610F\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"place_order\",\"timing\":\"immediate\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":1}].\n"
+            "\n"
             "- If the user asks Haruka to guide, lead, show, or take them to a seat or table without an explicit Table_XX ID, output guide_player_to_table with item \"nearest\" instead of guide_to_table.\n"
             "- If the user says \u5E26\u6211\u53BB\u5427\u53F0, \u6848\u5185\u6211\u5230\u5427\u53F0, or show me to the counter, output {\"type\":\"guide_player_to_scene_tag\",\"timing\":\"immediate\",\"item\":\"counter\",\"quantity\":0}.\n"
             "- If the user says \u4E0D\u7528\u5E26\u8DEF\u4E86, \u505C\u6B62\u6848\u5185, or stop guiding, output {\"type\":\"stop_guide_player\",\"timing\":\"immediate\",\"item\":\"\",\"quantity\":0}.\n"
@@ -792,7 +963,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- guide_player_to_table action format is {\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"table hint or Table_XX\",\"quantity\":0}.\n"
             "- When using guide_player_to_table, the reply may be one short natural Japanese sentence such as \"\u306F\u3044\u3001\u3054\u6848\u5185\u3057\u307E\u3059\u306D\u3002\" or \"\u3053\u3061\u3089\u306E\u304A\u5E2D\u3078\u3054\u6848\u5185\u3057\u307E\u3059\u3002\".\n"
             "- Do not use after_speech for greet, explain, or recommend.\n"
-            "- For a confirmed user order, use place_order.\n"
+            "- For a confirmed user order after the customer is seated, use place_order.\n"
             "- Use after_speech only for place_order if needed.\n"
             "- For recommend, set quantity to 0.\n"
             "- For explain and greet, set item to \"none\" and quantity to 0.\n"
@@ -800,7 +971,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- When the user asks for a recommendation, output exactly one recommend action, preferably for the single best item.\n"
             "- recommend example: {\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}.\n"
             "- action timing may be immediate, before_speech, during_speech, or after_speech.\n"
-            "- Use place_order only when the player clearly orders a specific menu item.\n"
+            "- Use place_order only when the player clearly orders a specific menu item and is already seated.\n"
             "- place_order action format is {\"type\":\"place_order\",\"timing\":\"after_speech\",\"item\":\"menu item\",\"quantity\":1}.\n"
             "- If the player only asks for a recommendation, do not place an order.\n"
             "- If the player is only hesitating or silent, do not place an order.\n"
@@ -810,7 +981,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "\n"
             "Required JSON format:\n"
             "{\n"
-            "  \"decision\": \"none|speak|act|act_and_speak\",\n"
+            "  \"decision\": \"none|speak|act|act_and_speak|guide_player_to_table|place_order\",\n"
             "  \"strategy\": {\n"
             "    \"tone\": \"gentle|reassuring|calm|cheerful|direct\",\n"
             "    \"length\": \"short|normal|medium\",\n"
@@ -834,7 +1005,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 
     TSharedPtr<FJsonObject> UserMsg = MakeShared<FJsonObject>();
     UserMsg->SetStringField(TEXT("role"), TEXT("user"));
-    UserMsg->SetStringField(TEXT("content"), UserMessage);
+    UserMsg->SetStringField(TEXT("content"), BuildStrategyUserContent(UserMessage));
     Messages.Add(MakeShared<FJsonValueObject>(UserMsg));
 
     RootObject->SetArrayField(TEXT("messages"), Messages);
@@ -924,6 +1095,8 @@ void ULLMClient::OnOpenAINormalResponseReceived(
 
     UE_LOG(LogTemp, Warning, TEXT("OpenAI normal reply: %s"), *Content);
 
+    UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Starting immediate normal reply."));
+    ClearQueuedSpeech();
     HandleFinalReplyText(Content);
 }
 
@@ -1186,6 +1359,8 @@ void ULLMClient::OnStrategyResponseReceived(
         }
     }
 
+    const bool bStrategyReplyHasSpeech = !Reply.TrimStartAndEnd().IsEmpty();
+
     if (ParsedActions.Num() > 1)
     {
         const FString SequenceJson = BuildActionSequenceJson(ParsedActions);
@@ -1211,8 +1386,33 @@ void ULLMClient::OnStrategyResponseReceived(
         }
         else
         {
-            UE_LOG(LogTemp, Warning, TEXT("[Strategy] broadcasting action: %s, item=%s"), *ParsedAction.ActionType, *ParsedAction.Item);
-            OnNPCActionRequested.Broadcast(ParsedAction.ActionType, ParsedAction.Timing, ParsedAction.Item, ParsedAction.Quantity);
+            const bool bDeferGuideAction = bStrategyReplyHasSpeech
+                && ShouldDeferGuideActionUntilReplyFinished(ParsedAction.ActionType, Reply);
+            if (bDeferGuideAction)
+            {
+                StoreDeferredStrategyAction(
+                    ParsedAction.ActionType,
+                    ParsedAction.Timing,
+                    ParsedAction.Item,
+                    ParsedAction.Quantity,
+                    RequestId);
+            }
+            else
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[Strategy] broadcasting action: %s, item=%s"), *ParsedAction.ActionType, *ParsedAction.Item);
+                const bool bSuppressOrderConfirmSpeech = bStrategyReplyHasSpeech && IsOrderFulfillmentActionType(ParsedAction.ActionType);
+                if (bSuppressOrderConfirmSpeech)
+                {
+                    UNPCActionQueueComponent::SetSuppressNextOrderConfirmSpeechForStrategyReply(true);
+                }
+
+                OnNPCActionRequested.Broadcast(ParsedAction.ActionType, ParsedAction.Timing, ParsedAction.Item, ParsedAction.Quantity);
+
+                if (bSuppressOrderConfirmSpeech)
+                {
+                    UNPCActionQueueComponent::SetSuppressNextOrderConfirmSpeechForStrategyReply(false);
+                }
+            }
         }
     }
 
@@ -1260,12 +1460,185 @@ void ULLMClient::OnStrategyResponseReceived(
 
     if (!Reply.IsEmpty())
     {
+        UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Starting immediate strategy reply."));
+        ClearQueuedSpeech();
         HandleFinalReplyText(Reply);
     }
     else
     {
         UE_LOG(LogTemp, Warning, TEXT("[Strategy] empty reply, skipping speech"));
     }
+}
+
+void ULLMClient::TryPlayNextQueuedSpeech()
+{
+    if (bQueuedSpeechPlaying || PendingServiceSpeechQueue.Num() == 0)
+    {
+        return;
+    }
+
+    const FString NextSpeech = PendingServiceSpeechQueue[0];
+    PendingServiceSpeechQueue.RemoveAt(0);
+
+    bQueuedSpeechPlaying = true;
+    ActiveQueuedSpeechGeneration = QueuedSpeechGeneration;
+    UE_LOG(LogTemp, Warning, TEXT("[SpeechQueue] Playing queued service speech: %s"), *NextSpeech);
+
+    PlaySpeechInternal(NextSpeech, true, false);
+}
+
+void ULLMClient::HandleQueuedSpeechFinished(int32 Generation)
+{
+    if (Generation != QueuedSpeechGeneration || !bQueuedSpeechPlaying)
+    {
+        return;
+    }
+
+    bQueuedSpeechPlaying = false;
+    bCurrentAudioIsQueuedServiceSpeech = false;
+    if (UWorld* World = ResolveSpeechWorld())
+    {
+        World->GetTimerManager().ClearTimer(QueuedSpeechGapTimerHandle);
+    }
+    UE_LOG(LogTemp, Warning, TEXT("[SpeechQueue] Queued speech finished. Playing next if any."));
+    TryPlayNextQueuedSpeech();
+}
+
+void ULLMClient::HandleQueuedSpeechFallbackTimeout(int32 Generation)
+{
+    if (Generation != QueuedSpeechGeneration || !bQueuedSpeechPlaying)
+    {
+        return;
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("[SpeechQueue] Queued speech fallback timeout. Forcing finish."));
+    bCurrentAudioIsQueuedServiceSpeech = false;
+    HandleQueuedSpeechFinished(Generation);
+}
+
+UWorld* ULLMClient::ResolveSpeechWorld() const
+{
+    if (UWorld* World = GetWorld())
+    {
+        return World;
+    }
+
+    if (VoicevoxTTSClient)
+    {
+        if (UWorld* World = VoicevoxTTSClient->GetWorld())
+        {
+            return World;
+        }
+    }
+
+    if (AActor* OuterActor = GetTypedOuter<AActor>())
+    {
+        return OuterActor->GetWorld();
+    }
+
+    if (UActorComponent* OuterComponent = GetTypedOuter<UActorComponent>())
+    {
+        return OuterComponent->GetWorld();
+    }
+
+    return nullptr;
+}
+
+bool ULLMClient::IsServiceSpeechDispatchActive()
+{
+    return GServiceSpeechDispatchDepth > 0;
+}
+
+void ULLMClient::CancelDeferredStrategyAction(bool bLogCancellation)
+{
+    if (!bHasDeferredStrategyAction)
+    {
+        return;
+    }
+
+    bHasDeferredStrategyAction = false;
+    DeferredStrategyActionType = TEXT("");
+    DeferredStrategyActionTiming = TEXT("");
+    DeferredStrategyActionItem = TEXT("");
+    DeferredStrategyActionQuantity = 0;
+    DeferredStrategyRequestId = 0;
+
+    if (bLogCancellation)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Deferred guide action cancelled by new user input."));
+    }
+}
+
+bool ULLMClient::ShouldDeferGuideActionUntilReplyFinished(const FString& ActionType, const FString& ReplyText)
+{
+    if (ReplyText.TrimStartAndEnd().IsEmpty())
+    {
+        return false;
+    }
+
+    if (SanitizeReplyTextForSpeechAndDisplay(ReplyText).IsEmpty())
+    {
+        return false;
+    }
+
+    if (!ActionType.Equals(TEXT("guide_player_to_table"), ESearchCase::IgnoreCase))
+    {
+        return false;
+    }
+
+    if (UNPCActionQueueComponent::IsLastKnownGuidePlayerInProgress())
+    {
+        return false;
+    }
+
+    if (UNPCActionQueueComponent::IsLastKnownSeatedForService()
+        || UNPCActionQueueComponent::IsLastKnownPlayerInTableArea()
+        || UNPCActionQueueComponent::IsLastKnownSeatingGuidanceCompleted())
+    {
+        return false;
+    }
+
+    if (!bUseVoicevoxTTS)
+    {
+        return false;
+    }
+
+    return ResolveVoicevoxTTSClient() != nullptr;
+}
+
+void ULLMClient::StoreDeferredStrategyAction(const FString& ActionType, const FString& Timing, const FString& Item, int32 Quantity, int32 RequestId)
+{
+    bHasDeferredStrategyAction = true;
+    DeferredStrategyActionType = ActionType;
+    DeferredStrategyActionTiming = Timing;
+    DeferredStrategyActionItem = Item;
+    DeferredStrategyActionQuantity = Quantity;
+    DeferredStrategyRequestId = RequestId;
+    UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Deferring guide action until strategy reply finishes."));
+}
+
+void ULLMClient::DispatchDeferredStrategyActionIfReady()
+{
+    if (!bHasDeferredStrategyAction)
+    {
+        return;
+    }
+
+    if (DeferredStrategyRequestId != ActiveLLMRequestId)
+    {
+        CancelDeferredStrategyAction(false);
+        return;
+    }
+
+    const FString ActionType = DeferredStrategyActionType;
+    const FString Timing = DeferredStrategyActionTiming;
+    const FString Item = DeferredStrategyActionItem;
+    const int32 Quantity = DeferredStrategyActionQuantity;
+    CancelDeferredStrategyAction(false);
+
+    UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Strategy reply finished. Dispatching deferred guide action."));
+    UNPCActionQueueComponent::SetSuppressNextGuideStartedSpeechForStrategyReply(true);
+    OnNPCActionRequested.Broadcast(ActionType, Timing, Item, Quantity);
 }
 
 FString ULLMClient::SanitizeReplyTextForSpeechAndDisplay(const FString& RawText) const
@@ -1294,11 +1667,21 @@ void ULLMClient::InterruptCurrentVoicevoxSpeech()
         return;
     }
 
+    if (!ResolvedVoicevoxTTSClient->IsVoicevoxSpeechActive())
+    {
+        return;
+    }
+
     ResolvedVoicevoxTTSClient->StopVoicevoxSpeech();
-    UE_LOG(LogTemp, Warning, TEXT("[LLM] interrupted current VOICEVOX speech before new request"));
+    UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Interrupted current VOICEVOX speech before new request."));
 }
 
 void ULLMClient::HandleFinalReplyText(const FString& ReplyText)
+{
+    PlaySpeechInternal(ReplyText, false, true);
+}
+
+void ULLMClient::PlaySpeechInternal(const FString& ReplyText, bool bQueuedServiceSpeech, bool bInterruptCurrent)
 {
     const FString CleanReplyText = SanitizeReplyTextForSpeechAndDisplay(ReplyText);
     if (CleanReplyText.IsEmpty())
@@ -1317,7 +1700,40 @@ void ULLMClient::HandleFinalReplyText(const FString& ReplyText)
 
         if (ResolvedVoicevoxTTSClient)
         {
+            ResolvedVoicevoxTTSClient->OnVoicevoxSpeechFinished.RemoveDynamic(
+                this,
+                &ULLMClient::HandleVoicevoxSpeechFinished);
+            ResolvedVoicevoxTTSClient->OnVoicevoxSpeechFinished.AddDynamic(
+                this,
+                &ULLMClient::HandleVoicevoxSpeechFinished);
+
+            if (bInterruptCurrent && ResolvedVoicevoxTTSClient->IsVoicevoxSpeechActive())
+            {
+                UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Immediate speech will interrupt active VOICEVOX playback."));
+            }
+
+            bCurrentAudioIsQueuedServiceSpeech = bQueuedServiceSpeech;
             ResolvedVoicevoxTTSClient->GenerateVoice(CleanReplyText);
+
+            if (bQueuedServiceSpeech)
+            {
+                if (UWorld* World = ResolveSpeechWorld())
+                {
+                    World->GetTimerManager().ClearTimer(QueuedSpeechFallbackTimerHandle);
+                    FTimerDelegate TimerDelegate;
+                    TimerDelegate.BindUObject(
+                        this,
+                        &ULLMClient::HandleQueuedSpeechFallbackTimeout,
+                        ActiveQueuedSpeechGeneration);
+                    const float FallbackSeconds = FMath::Max(QueuedSpeechFallbackTimeoutSeconds, 2.0f);
+                    World->GetTimerManager().SetTimer(
+                        QueuedSpeechFallbackTimerHandle,
+                        TimerDelegate,
+                        FallbackSeconds,
+                        false);
+                }
+            }
+
             return;
         }
 
@@ -1325,6 +1741,77 @@ void ULLMClient::HandleFinalReplyText(const FString& ReplyText)
     }
 
     OnLLMResponseReceived.Broadcast(CleanReplyText);
+
+    if (bQueuedServiceSpeech)
+    {
+        if (UWorld* World = ResolveSpeechWorld())
+        {
+            FTimerDelegate TimerDelegate;
+            TimerDelegate.BindUObject(
+                this,
+                &ULLMClient::HandleQueuedSpeechFallbackTimeout,
+                ActiveQueuedSpeechGeneration);
+            World->GetTimerManager().SetTimer(
+                QueuedSpeechFallbackTimerHandle,
+                TimerDelegate,
+                FMath::Max(QueuedSpeechFallbackTimeoutSeconds, 2.0f),
+                false);
+        }
+    }
+}
+
+void ULLMClient::HandleVoicevoxSpeechFinished()
+{
+    if (!bCurrentAudioIsQueuedServiceSpeech)
+    {
+        DispatchDeferredStrategyActionIfReady();
+    }
+    HandleQueuedVoicevoxSpeechFinished();
+}
+
+void ULLMClient::HandleQueuedVoicevoxSpeechFinished()
+{
+    if (!bCurrentAudioIsQueuedServiceSpeech || !bQueuedSpeechPlaying)
+    {
+        return;
+    }
+
+    if (ActiveQueuedSpeechGeneration != QueuedSpeechGeneration)
+    {
+        return;
+    }
+
+    if (UWorld* World = ResolveSpeechWorld())
+    {
+        World->GetTimerManager().ClearTimer(QueuedSpeechFallbackTimerHandle);
+    }
+
+    bCurrentAudioIsQueuedServiceSpeech = false;
+    UE_LOG(LogTemp, Warning, TEXT("[SpeechQueue] Queued service audio finished."));
+
+    const float SpeechGap = FMath::Max(MinSpeechGapSeconds, 0.0f);
+    if (SpeechGap <= KINDA_SMALL_NUMBER)
+    {
+        HandleQueuedSpeechFinished(ActiveQueuedSpeechGeneration);
+        return;
+    }
+
+    if (UWorld* World = ResolveSpeechWorld())
+    {
+        FTimerDelegate TimerDelegate;
+        TimerDelegate.BindUObject(
+            this,
+            &ULLMClient::HandleQueuedSpeechFinished,
+            ActiveQueuedSpeechGeneration);
+        World->GetTimerManager().SetTimer(
+            QueuedSpeechGapTimerHandle,
+            TimerDelegate,
+            SpeechGap,
+            false);
+        return;
+    }
+
+    HandleQueuedSpeechFinished(ActiveQueuedSpeechGeneration);
 }
 
 UVoicevoxTTSClient* ULLMClient::ResolveVoicevoxTTSClient()

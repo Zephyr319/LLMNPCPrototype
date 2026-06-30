@@ -4,10 +4,15 @@
 #include "Components/AudioComponent.h"
 #include "Engine/World.h"
 #include "GenericPlatform/GenericPlatformHttp.h"
+#include "GameFramework/Actor.h"
 #include "HttpModule.h"
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
 #include "Sound/SoundWaveProcedural.h"
+
+bool UVoicevoxTTSClient::bGlobalVoicevoxWarmupCompleted = false;
+bool UVoicevoxTTSClient::bGlobalVoicevoxWarmupInProgress = false;
+TWeakObjectPtr<UVoicevoxTTSClient> UVoicevoxTTSClient::GlobalVoicevoxWarmupOwner;
 
 UVoicevoxTTSClient::UVoicevoxTTSClient()
 {
@@ -15,20 +20,55 @@ UVoicevoxTTSClient::UVoicevoxTTSClient()
 
     BaseUrl = TEXT("http://127.0.0.1:50021");
     SpeakerId = 17;
+    VoicevoxWarmupDelaySeconds = 1.0f;
     LastGeneratedSound = nullptr;
     LastWarmupSound = nullptr;
     TargetAudioComponent = nullptr;
+    OwnedAudioComponent = nullptr;
     bIsSynthesizingSentence = false;
     bIsAudioPlaying = false;
+    bSpeechFinishNotificationPending = false;
     ActiveGenerationId = 0;
     CurrentPlaybackGenerationId = 0;
 }
 
+void UVoicevoxTTSClient::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+    ClearPlaybackFinishTimer();
+    if (UWorld* World = GetWorld())
+    {
+        World->GetTimerManager().ClearTimer(VoicevoxWarmupTimerHandle);
+    }
+
+    if (GlobalVoicevoxWarmupOwner.Get() == this && bGlobalVoicevoxWarmupInProgress && !bGlobalVoicevoxWarmupCompleted)
+    {
+        bGlobalVoicevoxWarmupInProgress = false;
+        GlobalVoicevoxWarmupOwner.Reset();
+    }
+
+    Super::EndPlay(EndPlayReason);
+}
+
 void UVoicevoxTTSClient::GenerateVoice(const FString& Text)
 {
-    StopVoicevoxSpeech();
+    if (IsVoicevoxSpeechActive())
+    {
+        StopVoicevoxSpeech();
+    }
+    else
+    {
+        ++ActiveGenerationId;
+        PendingSentenceQueue.Empty();
+        PendingAudioQueue.Empty();
+        PendingAudioDurations.Empty();
+        bIsSynthesizingSentence = false;
+        bIsAudioPlaying = false;
+        bSpeechFinishNotificationPending = false;
+        ClearPlaybackFinishTimer();
+    }
 
     PendingSentenceQueue = SplitIntoSentences(Text);
+    bSpeechFinishNotificationPending = PendingSentenceQueue.Num() > 0;
     for (const FString& Sentence : PendingSentenceQueue)
     {
         UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] sentence queued: %s"), *Sentence);
@@ -39,7 +79,38 @@ void UVoicevoxTTSClient::GenerateVoice(const FString& Text)
 
 void UVoicevoxTTSClient::WarmupVoicevox()
 {
-    StartAudioQuery(TEXT("\u3053\u3093\u306B\u3061\u306F\u3002"), false, true, ActiveGenerationId);
+    if (bGlobalVoicevoxWarmupCompleted)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] Warm-up skipped: already completed."));
+        return;
+    }
+
+    if (bGlobalVoicevoxWarmupInProgress)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] Warm-up skipped: already in progress."));
+        return;
+    }
+
+    bGlobalVoicevoxWarmupInProgress = true;
+    GlobalVoicevoxWarmupOwner = this;
+
+    const float WarmupDelay = FMath::Max(VoicevoxWarmupDelaySeconds, 0.0f);
+    if (UWorld* World = GetWorld())
+    {
+        if (WarmupDelay > KINDA_SMALL_NUMBER)
+        {
+            World->GetTimerManager().SetTimer(
+                VoicevoxWarmupTimerHandle,
+                this,
+                &UVoicevoxTTSClient::StartDelayedVoicevoxWarmup,
+                WarmupDelay,
+                false);
+            UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] Global warm-up scheduled after %.1fs."), WarmupDelay);
+            return;
+        }
+    }
+
+    StartDelayedVoicevoxWarmup();
 }
 
 void UVoicevoxTTSClient::SetTargetAudioComponent(UAudioComponent* InAudioComponent)
@@ -53,6 +124,7 @@ void UVoicevoxTTSClient::SetTargetAudioComponent(UAudioComponent* InAudioCompone
 
     if (TargetAudioComponent)
     {
+        TargetAudioComponent->OnAudioFinished.RemoveDynamic(this, &UVoicevoxTTSClient::HandleTargetAudioFinished);
         TargetAudioComponent->OnAudioFinished.AddDynamic(this, &UVoicevoxTTSClient::HandleTargetAudioFinished);
         PlayNextQueuedAudio();
     }
@@ -66,14 +138,71 @@ void UVoicevoxTTSClient::StopVoicevoxSpeech()
     PendingAudioDurations.Empty();
     bIsSynthesizingSentence = false;
     bIsAudioPlaying = false;
+    bSpeechFinishNotificationPending = false;
     ClearPlaybackFinishTimer();
 
     if (TargetAudioComponent)
     {
         TargetAudioComponent->Stop();
     }
+    if (OwnedAudioComponent)
+    {
+        OwnedAudioComponent->Stop();
+    }
 
     UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] speech queue stopped"));
+}
+
+bool UVoicevoxTTSClient::IsVoicevoxSpeechActive() const
+{
+    const bool bTargetAudioPlaying = TargetAudioComponent && TargetAudioComponent->IsPlaying();
+    const bool bOwnedAudioPlaying = OwnedAudioComponent && OwnedAudioComponent->IsPlaying();
+    return bIsSynthesizingSentence
+        || bIsAudioPlaying
+        || bSpeechFinishNotificationPending
+        || PendingSentenceQueue.Num() > 0
+        || PendingAudioQueue.Num() > 0
+        || bTargetAudioPlaying
+        || bOwnedAudioPlaying;
+}
+
+void UVoicevoxTTSClient::StartDelayedVoicevoxWarmup()
+{
+    if (bGlobalVoicevoxWarmupCompleted)
+    {
+        bGlobalVoicevoxWarmupInProgress = false;
+        if (GlobalVoicevoxWarmupOwner.Get() == this)
+        {
+            GlobalVoicevoxWarmupOwner.Reset();
+        }
+        UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] Warm-up skipped: already completed."));
+        return;
+    }
+
+    if (GlobalVoicevoxWarmupOwner.IsValid() && GlobalVoicevoxWarmupOwner.Get() != this)
+    {
+        UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] Warm-up skipped: another owner is running warm-up."));
+        return;
+    }
+
+    bGlobalVoicevoxWarmupInProgress = true;
+    GlobalVoicevoxWarmupOwner = this;
+    StartAudioQuery(TEXT("\u3053\u3093\u306B\u3061\u306F\u3002"), false, true, ActiveGenerationId);
+}
+
+void UVoicevoxTTSClient::MarkGlobalWarmupSucceeded()
+{
+    bGlobalVoicevoxWarmupCompleted = true;
+    bGlobalVoicevoxWarmupInProgress = false;
+    GlobalVoicevoxWarmupOwner.Reset();
+    UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] Global warm-up completed."));
+}
+
+void UVoicevoxTTSClient::MarkGlobalWarmupFailed()
+{
+    bGlobalVoicevoxWarmupInProgress = false;
+    GlobalVoicevoxWarmupOwner.Reset();
+    UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] Global warm-up failed."));
 }
 
 FString UVoicevoxTTSClient::BuildVoicevoxUrl(const FString& PathAndQuery) const
@@ -125,6 +254,7 @@ void UVoicevoxTTSClient::StartNextSentenceSynthesis()
 {
     if (bIsSynthesizingSentence || PendingSentenceQueue.Num() == 0)
     {
+        TryBroadcastSpeechFinished();
         return;
     }
 
@@ -167,8 +297,10 @@ void UVoicevoxTTSClient::QueueGeneratedAudio(USoundWave* SoundWave, float Playba
 
 void UVoicevoxTTSClient::PlayNextQueuedAudio()
 {
-    if (!TargetAudioComponent || bIsAudioPlaying || PendingAudioQueue.Num() == 0)
+    UAudioComponent* PlaybackAudioComponent = GetOrCreatePlaybackAudioComponent();
+    if (!PlaybackAudioComponent || bIsAudioPlaying || PendingAudioQueue.Num() == 0)
     {
+        TryBroadcastSpeechFinished();
         return;
     }
 
@@ -198,9 +330,63 @@ void UVoicevoxTTSClient::PlayNextQueuedAudio()
     }
 
     StartPlaybackFinishTimer(PlaybackDuration + 0.1f);
-    TargetAudioComponent->SetSound(SoundWave);
-    TargetAudioComponent->Play();
+    PlaybackAudioComponent->SetSound(SoundWave);
+    PlaybackAudioComponent->Play();
     UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] play queued audio"));
+}
+
+UAudioComponent* UVoicevoxTTSClient::GetOrCreatePlaybackAudioComponent()
+{
+    if (TargetAudioComponent)
+    {
+        return TargetAudioComponent;
+    }
+
+    if (OwnedAudioComponent)
+    {
+        return OwnedAudioComponent;
+    }
+
+    UObject* ComponentOuter = GetOwner() ? static_cast<UObject*>(GetOwner()) : static_cast<UObject*>(this);
+    OwnedAudioComponent = NewObject<UAudioComponent>(ComponentOuter);
+    if (!OwnedAudioComponent)
+    {
+        return nullptr;
+    }
+
+    OwnedAudioComponent->bAutoActivate = false;
+    OwnedAudioComponent->OnAudioFinished.RemoveDynamic(this, &UVoicevoxTTSClient::HandleTargetAudioFinished);
+    OwnedAudioComponent->OnAudioFinished.AddDynamic(this, &UVoicevoxTTSClient::HandleTargetAudioFinished);
+
+    if (AActor* OwnerActor = GetOwner())
+    {
+        OwnerActor->AddInstanceComponent(OwnedAudioComponent);
+        OwnedAudioComponent->RegisterComponent();
+    }
+    else if (UWorld* World = GetWorld())
+    {
+        OwnedAudioComponent->RegisterComponentWithWorld(World);
+    }
+
+    UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] created internal speech audio component"));
+    return OwnedAudioComponent;
+}
+
+void UVoicevoxTTSClient::TryBroadcastSpeechFinished()
+{
+    if (!bSpeechFinishNotificationPending)
+    {
+        return;
+    }
+
+    if (bIsSynthesizingSentence || bIsAudioPlaying || PendingSentenceQueue.Num() > 0 || PendingAudioQueue.Num() > 0)
+    {
+        return;
+    }
+
+    bSpeechFinishNotificationPending = false;
+    UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] speech finished"));
+    OnVoicevoxSpeechFinished.Broadcast();
 }
 
 void UVoicevoxTTSClient::StartPlaybackFinishTimer(float PlaybackDuration)
@@ -270,6 +456,7 @@ void UVoicevoxTTSClient::HandleTargetAudioFinished()
     bIsAudioPlaying = false;
     UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] audio finished by component"));
     PlayNextQueuedAudio();
+    TryBroadcastSpeechFinished();
 }
 
 void UVoicevoxTTSClient::HandlePlaybackFinishedByTimer(int32 GenerationId)
@@ -282,6 +469,7 @@ void UVoicevoxTTSClient::HandlePlaybackFinishedByTimer(int32 GenerationId)
     bIsAudioPlaying = false;
     UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] audio finished by timer"));
     PlayNextQueuedAudio();
+    TryBroadcastSpeechFinished();
 }
 
 void UVoicevoxTTSClient::StartAudioQuery(const FString& Text, bool bBroadcastSound, bool bIsWarmup, int32 GenerationId)
@@ -289,7 +477,11 @@ void UVoicevoxTTSClient::StartAudioQuery(const FString& Text, bool bBroadcastSou
     if (Text.IsEmpty())
     {
         UE_LOG(LogTemp, Error, TEXT("[VOICEVOX] audio_query failed: text is empty"));
-        if (!bIsWarmup)
+        if (bIsWarmup)
+        {
+            MarkGlobalWarmupFailed();
+        }
+        else
         {
             FinishSentenceSynthesis(GenerationId);
         }
@@ -317,7 +509,18 @@ void UVoicevoxTTSClient::StartAudioQuery(const FString& Text, bool bBroadcastSou
         bIsWarmup,
         GenerationId
     );
-    Request->ProcessRequest();
+    if (!Request->ProcessRequest())
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VOICEVOX] audio_query request failed to start"));
+        if (bIsWarmup)
+        {
+            MarkGlobalWarmupFailed();
+        }
+        else
+        {
+            FinishSentenceSynthesis(GenerationId);
+        }
+    }
 }
 
 void UVoicevoxTTSClient::OnAudioQueryResponseReceived(
@@ -337,7 +540,11 @@ void UVoicevoxTTSClient::OnAudioQueryResponseReceived(
     if (!bWasSuccessful || !Response.IsValid())
     {
         UE_LOG(LogTemp, Error, TEXT("[VOICEVOX] audio_query failed"));
-        if (!bIsWarmup)
+        if (bIsWarmup)
+        {
+            MarkGlobalWarmupFailed();
+        }
+        else
         {
             FinishSentenceSynthesis(GenerationId);
         }
@@ -354,7 +561,11 @@ void UVoicevoxTTSClient::OnAudioQueryResponseReceived(
             ResponseCode,
             *Response->GetContentAsString()
         );
-        if (!bIsWarmup)
+        if (bIsWarmup)
+        {
+            MarkGlobalWarmupFailed();
+        }
+        else
         {
             FinishSentenceSynthesis(GenerationId);
         }
@@ -365,7 +576,11 @@ void UVoicevoxTTSClient::OnAudioQueryResponseReceived(
     if (AudioQueryJson.IsEmpty())
     {
         UE_LOG(LogTemp, Error, TEXT("[VOICEVOX] audio_query failed: response body is empty"));
-        if (!bIsWarmup)
+        if (bIsWarmup)
+        {
+            MarkGlobalWarmupFailed();
+        }
+        else
         {
             FinishSentenceSynthesis(GenerationId);
         }
@@ -394,7 +609,18 @@ void UVoicevoxTTSClient::StartSynthesis(const FString& AudioQueryJson, bool bBro
         bIsWarmup,
         GenerationId
     );
-    Request->ProcessRequest();
+    if (!Request->ProcessRequest())
+    {
+        UE_LOG(LogTemp, Error, TEXT("[VOICEVOX] synthesis request failed to start"));
+        if (bIsWarmup)
+        {
+            MarkGlobalWarmupFailed();
+        }
+        else
+        {
+            FinishSentenceSynthesis(GenerationId);
+        }
+    }
 }
 
 void UVoicevoxTTSClient::OnSynthesisResponseReceived(
@@ -414,7 +640,11 @@ void UVoicevoxTTSClient::OnSynthesisResponseReceived(
     if (!bWasSuccessful || !Response.IsValid())
     {
         UE_LOG(LogTemp, Error, TEXT("[VOICEVOX] synthesis failed"));
-        if (!bIsWarmup)
+        if (bIsWarmup)
+        {
+            MarkGlobalWarmupFailed();
+        }
+        else
         {
             FinishSentenceSynthesis(GenerationId);
         }
@@ -431,7 +661,11 @@ void UVoicevoxTTSClient::OnSynthesisResponseReceived(
             ResponseCode,
             *Response->GetContentAsString()
         );
-        if (!bIsWarmup)
+        if (bIsWarmup)
+        {
+            MarkGlobalWarmupFailed();
+        }
+        else
         {
             FinishSentenceSynthesis(GenerationId);
         }
@@ -444,7 +678,11 @@ void UVoicevoxTTSClient::OnSynthesisResponseReceived(
     if (WavBytes.Num() == 0)
     {
         UE_LOG(LogTemp, Error, TEXT("[VOICEVOX] synthesis failed: wav bytes are empty"));
-        if (!bIsWarmup)
+        if (bIsWarmup)
+        {
+            MarkGlobalWarmupFailed();
+        }
+        else
         {
             FinishSentenceSynthesis(GenerationId);
         }
@@ -455,7 +693,11 @@ void UVoicevoxTTSClient::OnSynthesisResponseReceived(
     if (!SoundWave)
     {
         UE_LOG(LogTemp, Error, TEXT("[VOICEVOX] SoundWave creation failed"));
-        if (!bIsWarmup)
+        if (bIsWarmup)
+        {
+            MarkGlobalWarmupFailed();
+        }
+        else
         {
             FinishSentenceSynthesis(GenerationId);
         }
@@ -467,7 +709,7 @@ void UVoicevoxTTSClient::OnSynthesisResponseReceived(
     if (bIsWarmup)
     {
         LastWarmupSound = SoundWave;
-        UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] Warm-up completed"));
+        MarkGlobalWarmupSucceeded();
         return;
     }
 
@@ -476,14 +718,7 @@ void UVoicevoxTTSClient::OnSynthesisResponseReceived(
 
     if (bBroadcastSound)
     {
-        if (TargetAudioComponent)
-        {
-            QueueGeneratedAudio(LastGeneratedSound, EstimatedPlaybackDuration);
-        }
-        else
-        {
-            OnVoicevoxSoundGenerated.Broadcast(LastGeneratedSound);
-        }
+        QueueGeneratedAudio(LastGeneratedSound, EstimatedPlaybackDuration);
     }
 
     if (!bIsWarmup)

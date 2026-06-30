@@ -7,7 +7,9 @@
 #include "TimerManager.h"
 #include "NPCActionQueueComponent.generated.h"
 
+class AActor;
 class UNPCFaceTargetComponent;
+class UNPCFoodCarryComponent;
 class UNPCMoveToTableComponent;
 
 UENUM(BlueprintType)
@@ -95,6 +97,30 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
 	float ReturnToCounterAfterClosingDelaySeconds;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service|Timing")
+	float BowBeforeReturnDuration;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service|Timing")
+	float BlockingServiceGesturePauseDuration;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service|Timing")
+	float BowGestureFallbackTimeout;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service Gesture")
+	float BowMovementReleaseSafetyDelay;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service|Timing")
+	float PutBillGestureFallbackTimeout;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service|Timing")
+	float ServeFoodGestureFallbackTimeout;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service|Timing")
+	float GuideSeatGestureFallbackTimeout;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service|Timing")
+	float DefaultBlockingGestureFallbackTimeout;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
 	int32 DefaultOrderPrice;
 
@@ -104,8 +130,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
 	FString ServiceClosingLine;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service|Lines")
+	FString BillFarewellLine;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Post Seating")
 	float PostSeatingMenuGuidanceDelay;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Post Seating")
+	float GuideArrivedSeatGestureDuration;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Post Seating")
+	float DuplicateGuideLineSuppressSeconds;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Post Seating")
+	FName GuideArrivedSeatGestureName;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Post Seating")
 	float PostSeatingMenuHelpEnableDelay;
@@ -185,14 +223,71 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Order")
 	void RunOrderFulfillmentToCurrentTable(const FString& OrderItem);
 
+	static void SetSuppressNextOrderConfirmSpeechForStrategyReply(bool bSuppress);
+
+	static void SetSuppressNextGuideStartedSpeechForStrategyReply(bool bSuppress);
+
+	static bool ConsumeSuppressNextGuideStartedSpeechForStrategyReply();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Order")
+	void RunBillDropBowAndReturnToCounter();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Order")
+	bool PlaceCarriedFoodOnCurrentServiceTable();
+
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Post Seating")
 	void RunPostSeatingMenuGuidance();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Post Seating")
+	void GuideSeatPlayerOnce();
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void SetCurrentServiceTableID(const FString& TableID);
 
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void SetPlayerInTableArea(bool bInArea, const FString& TableID);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void NotifyPlayerEnteredTableArea(const FString& TableID);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void NotifyPlayerLeftTableArea(const FString& TableID);
+
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
 	FString GetCurrentServiceTableID() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
+	bool IsSeatedForService() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
+	bool IsGuidePlayerInProgress() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
+	bool IsFarewellBowInProgress() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
+	bool IsActionQueuePausedForFarewellBow() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
+	bool IsBlockingGestureInProgress() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
+	FString GetCurrentBlockingGestureName() const;
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void NotifyServiceGestureFinished(const FString& GestureName);
+
+	static bool IsLastKnownSeatedForService();
+
+	static bool IsLastKnownPlayerInTableArea();
+
+	static bool IsLastKnownGuidePlayerInProgress();
+
+	static bool IsLastKnownSeatingGuidanceCompleted();
+
+	static FString GetLastKnownCurrentServiceTableID();
+
+	static FString GetLastKnownGuideTargetID();
 
 protected:
 	virtual void BeginPlay() override;
@@ -205,11 +300,39 @@ private:
 
 	bool bWaitingForMove;
 
+	bool bPlayerInTableArea;
+
+	bool bSeatingGuidanceCompleted;
+
+	bool bPostSeatingMenuGuidanceDone;
+
 	bool bPendingOrderFulfillment;
+
+	bool bFarewellBowInProgress;
+
+	bool bActionQueuePausedForFarewellBow;
+
+	bool bBlockingGestureInProgress;
+
+	FString CurrentBlockingGestureName;
+
+	bool bBlockingGestureFinishHandled;
+
+	bool bPendingFarewellBowAfterBillGesture;
+
+	bool bPendingPostServeFlowAfterServeGesture;
+
+	bool bSuppressNextOrderConfirmSpeech;
 
 	FString PendingOrderReturnTableID;
 
 	FString PendingOrderItem;
+
+	FString PendingPreSeatingOrderItem;
+
+	FString LastGuideLineText;
+
+	double LastGuideLineTime;
 
 	int32 PendingOrderPrice;
 
@@ -223,6 +346,12 @@ private:
 
 	FTimerHandle ReturnToCounterAfterClosingTimerHandle;
 
+	FTimerHandle FarewellBowTimerHandle;
+
+	FTimerHandle BlockingServiceGesturePauseTimerHandle;
+
+	FTimerHandle BowMovementReleaseSafetyTimerHandle;
+
 	FTimerHandle PostSeatingMenuGuidanceTimerHandle;
 
 	FTimerHandle PostSeatingMenuHelpEnableTimerHandle;
@@ -233,9 +362,16 @@ private:
 	UPROPERTY(Transient)
 	UNPCFaceTargetComponent* FaceTargetComponent;
 
+	UPROPERTY(Transient)
+	UNPCFoodCarryComponent* FoodCarryComponent;
+
 	void CacheOwnerComponents();
 
+	UNPCFoodCarryComponent* ResolveFoodCarryComponent();
+
 	void CancelFollowingForExplicitCommand();
+
+	void UpdateLastKnownServiceState() const;
 
 	void BindMoveCompletedEvent();
 
@@ -265,22 +401,67 @@ private:
 
 	void PrintDebugMessage(const FString& Message, const FColor& Color) const;
 
+	void LogActionQueueMoveRequest(const TCHAR* FunctionName, const FString& Target) const;
+
+	bool IsReceptionPhaseForService() const;
+
+	bool IsReceptionSpeechAction(const FString& ActionType) const;
+
 	void ClearOrderFulfillmentTimers();
 
 	void ClearPendingOrderState();
+
+	void RunOrderFulfillmentToCurrentTableInternal(const FString& OrderItem, bool bSpeakOrderConfirm);
+
+	void PickUpFoodForPendingOrder();
+
+	AActor* FindServiceTableActorByID(const FString& TableID) const;
+
+	void BroadcastServiceSpeech(const FString& Text);
+
+	bool BroadcastGuideLine(const FString& Text);
 
 	void BroadcastQueueGesture(FName GestureName);
 
 	void StartOrderServingCompletionFlow();
 
+	bool IsBlockingServiceGesture(const FString& GestureName) const;
+
+	void BeginBlockingGesture(FName GestureName, float FallbackTimeout);
+
+	float GetBlockingGestureFallbackTimeout(const FString& GestureName) const;
+
+	void CompleteBlockingGesture(const FString& GestureName, bool bForced);
+
+	bool BlockMovementIfBlockingGestureInProgress(const TCHAR* FunctionName) const;
+
+	void HandleBlockingGestureTimeout();
+
+	bool BlockReturnToCounterIfFarewellBowInProgress() const;
+
+	bool IsCounterTarget(const FString& Target) const;
+
+	bool IsCounterMoveAction(const FNPCQueuedAction& Action) const;
+
+	void EnableFarewellBowLock();
+
+	void ReleaseFarewellBowMovementLock();
+
 	void ReturnToCounterAfterServingIfNeeded();
 
 	void HandleReturnToCounterAfterClosingDelayFinished();
+
+	void HandleFarewellBowFinished();
+
+	void HandleBowMovementReleaseSafetyDelayFinished();
 
 	void ClearPostSeatingMenuGuidanceTimers();
 
 	UFUNCTION()
 	void HandleNPCMoveCompleted(FName MoveReason, FString TargetID, bool bSuccess);
+
+	UFUNCTION()
+	void HandleGuideArrived(FName EventName, FString TargetID, FString SuggestedLine);
 
 	void HandleWaitTimerFinished();
 
@@ -293,4 +474,20 @@ private:
 	void HandlePostSeatingMenuGuidanceTimerFinished();
 
 	void HandlePostSeatingMenuHelpEnableTimerFinished();
+
+	static bool bLastKnownSeatedForService;
+
+	static bool bLastKnownPlayerInTableArea;
+
+	static bool bLastKnownGuidePlayerInProgress;
+
+	static bool bLastKnownSeatingGuidanceCompleted;
+
+	static FString LastKnownCurrentServiceTableID;
+
+	static FString LastKnownGuideTargetID;
+
+	static bool bSuppressNextOrderConfirmSpeechForStrategyReply;
+
+	static bool bSuppressNextGuideStartedSpeechForStrategyReply;
 };
