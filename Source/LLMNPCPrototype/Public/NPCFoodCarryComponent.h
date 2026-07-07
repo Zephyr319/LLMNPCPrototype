@@ -70,6 +70,9 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Food Carry")
 	bool IsCarryingFood() const;
 
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Food Carry")
+	bool ShouldUseCarryWalk() const;
+
 private:
 	TSubclassOf<AActor> ResolveFoodActorClass(const FString& ItemName) const;
 	USkeletalMeshComponent* ResolveOwnerMesh() const;

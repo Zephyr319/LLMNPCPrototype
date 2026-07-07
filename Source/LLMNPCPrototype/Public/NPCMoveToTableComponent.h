@@ -9,6 +9,7 @@
 class ATableMarkerActor;
 class AFurnitureMarkerActor;
 class ACafeTargetPointActor;
+class UNPCFoodCarryComponent;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FNPCMoveCompletedSignature, FName, MoveReason, FString, TargetID, bool, bSuccess);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FGuidePlayerEvent, FName, EventName, FString, TargetID, FString, SuggestedLine);
@@ -40,10 +41,18 @@ class UNPCMoveToTableComponent : public UActorComponent
 public:
 	UNPCMoveToTableComponent();
 
+	virtual void BeginPlay() override;
+
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement")
 	float MoveSpeed;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement")
+	float NormalMoveSpeed = 180.0f;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Movement|Carry")
+	float CarryMoveSpeed = 100.0f;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Table Movement|Dynamic Speed")
 	bool bUseDynamicMoveSpeed = true;
@@ -336,10 +345,16 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC|Movement")
 	ENPCMovementMode GetMovementMode() const;
 
+	UFUNCTION(BlueprintCallable, Category = "Movement")
+	float GetCurrentMoveSpeed() const;
+
 	UFUNCTION(BlueprintCallable, Category = "NPC|Player")
 	void CancelFollowingForExplicitCommand();
 
 private:
+	UPROPERTY(Transient)
+	UNPCFoodCarryComponent* FoodCarryComponent = nullptr;
+
 	FVector TargetLocation;
 
 	FVector TargetTableLocation;
@@ -473,4 +488,10 @@ private:
 	void PrintDebugMessage(const FString& Message, const FColor& Color) const;
 
 	float MoveSpeedDebugTimer = 0.0f;
+
+	mutable bool bHasLoggedMoveSpeedChoice = false;
+
+	mutable bool bLastLoggedUsingCarryMoveSpeed = false;
+
+	mutable float LastLoggedMoveSpeedChoice = -1.0f;
 };

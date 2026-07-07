@@ -192,11 +192,15 @@ bool UNPCFoodCarryComponent::PlaceCarriedFoodOnTable(AActor* TableActor)
 void UNPCFoodCarryComponent::ClearCarriedFood()
 {
 	AActor* FoodActorToClear = CarriedFoodActor;
+	const bool bHadCarryState = bIsCarryingFood || CarriedFoodActor != nullptr || !CarriedFoodItemName.IsEmpty();
 
 	CarriedFoodActor = nullptr;
 	CarriedFoodItemName = TEXT("");
 	bIsCarryingFood = false;
-	BroadcastCarryStateChanged();
+	if (bHadCarryState)
+	{
+		BroadcastCarryStateChanged();
+	}
 
 	if (FoodActorToClear)
 	{
@@ -207,6 +211,12 @@ void UNPCFoodCarryComponent::ClearCarriedFood()
 bool UNPCFoodCarryComponent::IsCarryingFood() const
 {
 	return bIsCarryingFood && CarriedFoodActor != nullptr;
+}
+
+bool UNPCFoodCarryComponent::ShouldUseCarryWalk() const
+{
+	return bIsCarryingFood
+		&& CarriedFoodItemName.TrimStartAndEnd().Equals(TEXT("\u30E9\u30FC\u30E1\u30F3"), ESearchCase::CaseSensitive);
 }
 
 TSubclassOf<AActor> UNPCFoodCarryComponent::ResolveFoodActorClass(const FString& ItemName) const

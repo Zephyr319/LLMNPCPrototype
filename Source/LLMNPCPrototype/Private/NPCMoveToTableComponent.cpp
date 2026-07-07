@@ -12,6 +12,7 @@
 #include "HAL/PlatformTime.h"
 #include "Kismet/GameplayStatics.h"
 #include "NPCActionQueueComponent.h"
+#include "NPCFoodCarryComponent.h"
 #include "TableMarkerActor.h"
 #include "UObject/UnrealType.h"
 
@@ -108,6 +109,8 @@ UNPCMoveToTableComponent::UNPCMoveToTableComponent()
 	PrimaryComponentTick.bCanEverTick = true;
 
 	MoveSpeed = 120.0f;
+	NormalMoveSpeed = 180.0f;
+	CarryMoveSpeed = 100.0f;
 	bUseDynamicMoveSpeed = true;
 	WalkSpeed = 90.0f;
 	RunSpeed = 220.0f;
@@ -205,6 +208,20 @@ UNPCMoveToTableComponent::UNPCMoveToTableComponent()
 	LastGuideResumedLine = TEXT("");
 	LastGuideArrivedLine = TEXT("");
 	MoveSpeedDebugTimer = 0.0f;
+	FoodCarryComponent = nullptr;
+	bHasLoggedMoveSpeedChoice = false;
+	bLastLoggedUsingCarryMoveSpeed = false;
+	LastLoggedMoveSpeedChoice = -1.0f;
+}
+
+void UNPCMoveToTableComponent::BeginPlay()
+{
+	Super::BeginPlay();
+
+	if (AActor* Owner = GetOwner())
+	{
+		FoodCarryComponent = Owner->FindComponentByClass<UNPCFoodCarryComponent>();
+	}
 }
 
 void UNPCMoveToTableComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -300,7 +317,7 @@ void UNPCMoveToTableComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 
 	const float DistanceToCurrentMovePoint = FVector::Dist(OldLocation, MoveTarget);
 	RemainingMoveDistance = CalculateRemainingPathDistance();
-	const float DesiredSpeed = GetDesiredMoveSpeed(RemainingMoveDistance);
+	const float DesiredSpeed = GetCurrentMoveSpeed();
 	const float EffectiveSpeedInterpRate = FMath::Max(SpeedInterpRate, 0.0f);
 	CurrentMoveSpeed = EffectiveSpeedInterpRate <= KINDA_SMALL_NUMBER
 		? DesiredSpeed
@@ -2322,6 +2339,43 @@ float UNPCMoveToTableComponent::GetDesiredMoveSpeed(float RemainingDistance)
 	return FMath::Max(DesiredSpeed, 0.0f);
 }
 
+float UNPCMoveToTableComponent::GetCurrentMoveSpeed() const
+{
+	bool bUseCarryMoveSpeed = false;
+
+	if (IsValid(FoodCarryComponent))
+	{
+		const FString TrimmedItemName = FoodCarryComponent->CarriedFoodItemName.TrimStartAndEnd();
+		bUseCarryMoveSpeed = FoodCarryComponent->ShouldUseCarryWalk()
+			|| (FoodCarryComponent->bIsCarryingFood
+				&& TrimmedItemName.Equals(TEXT("\u30E9\u30FC\u30E1\u30F3"), ESearchCase::CaseSensitive));
+	}
+
+	const float SelectedSpeed = bUseCarryMoveSpeed ? CarryMoveSpeed : NormalMoveSpeed;
+	const float EffectiveSpeed = FMath::Max(SelectedSpeed, 0.0f);
+	const bool bShouldLogSpeedChoice = !bHasLoggedMoveSpeedChoice
+		|| bLastLoggedUsingCarryMoveSpeed != bUseCarryMoveSpeed
+		|| !FMath::IsNearlyEqual(LastLoggedMoveSpeedChoice, EffectiveSpeed);
+
+	if (bShouldLogSpeedChoice)
+	{
+		if (bUseCarryMoveSpeed)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Using carry move speed: %.1f"), EffectiveSpeed);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Using normal move speed: %.1f"), EffectiveSpeed);
+		}
+
+		bHasLoggedMoveSpeedChoice = true;
+		bLastLoggedUsingCarryMoveSpeed = bUseCarryMoveSpeed;
+		LastLoggedMoveSpeedChoice = EffectiveSpeed;
+	}
+
+	return EffectiveSpeed;
+}
+
 void UNPCMoveToTableComponent::UpdateFollowPlayer(AActor* Owner, float DeltaTime)
 {
 	if (!bIsFollowingPlayer || !Owner)
@@ -2745,6 +2799,7 @@ void UNPCMoveToTableComponent::ClearMovementState()
 	bIsRunning = false;
 	RemainingMoveDistance = 0.0f;
 	MoveSpeedDebugTimer = 0.0f;
+	bHasLoggedMoveSpeedChoice = false;
 	CurrentPathPoints.Reset();
 	CurrentPathIndex = 0;
 	SetOwnerComponentVelocity(GetOwner(), CurrentMoveVelocity);
