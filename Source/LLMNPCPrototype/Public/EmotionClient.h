@@ -7,6 +7,7 @@
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEmotionResultReceived, const FString&, Emotion);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnEmotionErrorReceived, const FString&, ErrorMessage);
+DECLARE_MULTICAST_DELEGATE_OneParam(FOnPlayerVoiceEmotionNative, const FString&);
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(
     FOnEmotionResultReceivedWithId,
@@ -22,6 +23,10 @@ class LLMNPCPROTOTYPE_API UEmotionClient : public UObject
     GENERATED_BODY()
 
 public:
+	static FOnPlayerVoiceEmotionNative OnAnyPlayerVoiceEmotion;
+
+	static FString GetLatestPlayerVoiceEmotion(float MaximumAgeSeconds = 30.0f);
+
     UFUNCTION(BlueprintCallable, Category = "Emotion")
     void AnalyzeAudioFile(const FString& FilePath);
 
@@ -56,6 +61,9 @@ public:
     FOnEmotionErrorReceived OnEmotionErrorReceived;
 
 private:
+	static FString LatestPlayerVoiceEmotion;
+	static double LatestPlayerVoiceEmotionTimeSeconds;
+
     void OnEmotionResponseReceived(FHttpRequestPtr Request, FHttpResponsePtr Response, bool bWasSuccessful);
 
     void OnEmotionResponseReceivedWithId(

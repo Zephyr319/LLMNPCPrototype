@@ -9,6 +9,7 @@
 class ATableMarkerActor;
 class AFurnitureMarkerActor;
 class ACafeTargetPointActor;
+class AWaterablePlantActor;
 class UNPCFoodCarryComponent;
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FNPCMoveCompletedSignature, FName, MoveReason, FString, TargetID, bool, bSuccess);
@@ -334,6 +335,9 @@ public:
 	void StopCurrentMovement();
 
 	UFUNCTION(BlueprintCallable, Category = "NPC|Movement")
+	void CancelActiveMovementForServiceGesture();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC|Movement")
 	void SetMovementPausedByServiceGesture(bool bPaused);
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC|Movement")
@@ -393,10 +397,6 @@ private:
 
 	FString GuideTargetID;
 
-	FVector ServiceGesturePauseAnchorLocation;
-
-	bool bHasServiceGesturePauseAnchor = false;
-
 	bool bPreserveMovementModeForGuideMove = false;
 
 	bool bGuideStartedEventBroadcasted = false;
@@ -416,6 +416,7 @@ private:
 	bool StartMovingToFurnitureLocation(AFurnitureMarkerActor* FurnitureMarker, const FVector& MoveLocation);
 
 	bool StartMovingToTargetPoint(const ACafeTargetPointActor* TargetPoint);
+	bool StartMovingToWaterablePlant(AWaterablePlantActor* Plant);
 
 	bool StartMovingToLocation(const FVector& MoveLocation, const FVector& FaceLocation, const FName& MoveReason, const FString& TargetID, const FString& DebugMessage, bool bRequireNavigationPath);
 
@@ -425,9 +426,9 @@ private:
 
 	void LogTickMoveState(const FVector& CurrentLocation, const FVector& MoveTarget) const;
 
-	void CheckPausedActorLocation(AActor* Owner, const TCHAR* Context);
+	void GetOwnerActionQueueState(bool& bOutFarewellBowInProgress, bool& bOutActionQueuePausedForFarewellBow, bool& bOutBowMovementLockActive) const;
 
-	void GetOwnerActionQueueState(bool& bOutFarewellBowInProgress, bool& bOutActionQueuePausedForFarewellBow) const;
+	bool BlockMovementStartIfServiceGesturePaused(const TCHAR* FunctionName, const FString& Target) const;
 
 	bool BuildNavigationPathToTarget(AActor* Owner);
 
@@ -439,7 +440,8 @@ private:
 
 	bool ResolveFurnitureMoveLocation(AFurnitureMarkerActor* FurnitureMarker, FVector& OutMoveLocation);
 
-	bool ResolveApproachLocationForActor(AActor* TargetActor, const FString& TargetType, FVector& OutApproachLocation);
+	bool ResolveApproachLocationForActor(AActor* TargetActor, const FString& TargetType, FVector& OutApproachLocation, float DesiredDistanceOverride = -1.0f);
+	bool ResolveWaterablePlantMoveLocation(AWaterablePlantActor* Plant, FVector& OutMoveLocation);
 
 	float ScoreApproachCandidate(const FVector& CandidateLocation, const FVector& OwnerLocation, const FVector& ApproachTargetLocation, const FVector& TargetForward, float DesiredDistance, bool bHasLineOfSight, float PathLength) const;
 

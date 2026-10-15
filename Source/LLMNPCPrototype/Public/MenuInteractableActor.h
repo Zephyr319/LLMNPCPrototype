@@ -8,6 +8,7 @@
 #include "MenuInteractableActor.generated.h"
 
 class UBoxComponent;
+class UMenuUIControllerComponent;
 class USceneComponent;
 
 UCLASS()
@@ -23,6 +24,9 @@ public:
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Menu")
 	UBoxComponent* InteractionBox;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Menu")
+	UMenuUIControllerComponent* MenuUIController;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Menu")
 	FString MenuID;

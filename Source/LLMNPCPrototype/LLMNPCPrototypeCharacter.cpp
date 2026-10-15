@@ -11,6 +11,7 @@
 #include "EnhancedInputSubsystems.h"
 #include "InputActionValue.h"
 #include "LLMNPCPrototype.h"
+#include "PlayerSeatComponent.h"
 
 ALLMNPCPrototypeCharacter::ALLMNPCPrototypeCharacter()
 {
@@ -56,8 +57,8 @@ void ALLMNPCPrototypeCharacter::SetupPlayerInputComponent(UInputComponent* Playe
 	if (UEnhancedInputComponent* EnhancedInputComponent = Cast<UEnhancedInputComponent>(PlayerInputComponent)) {
 		
 		// Jumping
-		EnhancedInputComponent->BindAction(JumpAction, ETriggerEvent::Started, this, &ACharacter::Jump);
-		EnhancedInputComponent->BindAction(JumpAction, ETriggerEvent::Completed, this, &ACharacter::StopJumping);
+		EnhancedInputComponent->BindAction(JumpAction, ETriggerEvent::Started, this, &ALLMNPCPrototypeCharacter::DoJumpStart);
+		EnhancedInputComponent->BindAction(JumpAction, ETriggerEvent::Completed, this, &ALLMNPCPrototypeCharacter::DoJumpEnd);
 
 		// Moving
 		EnhancedInputComponent->BindAction(MoveAction, ETriggerEvent::Triggered, this, &ALLMNPCPrototypeCharacter::Move);
@@ -92,6 +93,18 @@ void ALLMNPCPrototypeCharacter::Look(const FInputActionValue& Value)
 
 void ALLMNPCPrototypeCharacter::DoMove(float Right, float Forward)
 {
+	if (!FMath::IsNearlyZero(Right) || !FMath::IsNearlyZero(Forward))
+	{
+		if (UPlayerSeatComponent* SeatComponent = FindComponentByClass<UPlayerSeatComponent>())
+		{
+			if (SeatComponent->bIsSeated)
+			{
+				SeatComponent->LeaveSeat();
+				return;
+			}
+		}
+	}
+
 	if (GetController() != nullptr)
 	{
 		// find out which way is forward
@@ -122,6 +135,15 @@ void ALLMNPCPrototypeCharacter::DoLook(float Yaw, float Pitch)
 
 void ALLMNPCPrototypeCharacter::DoJumpStart()
 {
+	if (UPlayerSeatComponent* SeatComponent = FindComponentByClass<UPlayerSeatComponent>())
+	{
+		if (SeatComponent->bIsSeated)
+		{
+			SeatComponent->LeaveSeat();
+			return;
+		}
+	}
+
 	// signal the character to jump
 	Jump();
 }

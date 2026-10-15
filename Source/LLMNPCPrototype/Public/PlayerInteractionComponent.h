@@ -6,8 +6,6 @@
 #include "Components/ActorComponent.h"
 #include "PlayerInteractionComponent.generated.h"
 
-class AFurnitureMarkerActor;
-
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FInteractionFocusChangedSignature, AActor*, FocusedActor, FText, InteractionText, bool, bHasFocus);
 
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
@@ -56,8 +54,6 @@ private:
 	void SetFocusedInteractable(AActor* NewFocusedActor, const FText& NewInteractionText, bool bNewHasFocusedInteractable);
 
 	bool GetInteractionTrace(FVector& OutTraceStart, FVector& OutTraceEnd) const;
-
-	AFurnitureMarkerActor* FindNearestSittableFurniture() const;
 
 	void PrintDebugMessage(const FString& Message, const FColor& Color) const;
 };

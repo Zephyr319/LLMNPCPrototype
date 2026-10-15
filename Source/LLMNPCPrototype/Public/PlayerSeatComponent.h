@@ -18,6 +18,14 @@ class UPlayerSeatComponent : public UActorComponent
 public:
 	UPlayerSeatComponent();
 
+	virtual void TickComponent(
+		float DeltaTime,
+		ELevelTick TickType,
+		FActorComponentTickFunction* ThisTickFunction) override;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Seat", meta = (ClampMin = "30.0"))
+	float AutoLeaveSeatDistance;
+
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Seat")
 	bool bIsSeated;
 
@@ -44,4 +52,9 @@ public:
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Seat")
 	FString GetPlayerPostureState() const;
+
+private:
+	FTransform PreSeatTransform;
+
+	bool bHasPreSeatTransform;
 };

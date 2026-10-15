@@ -5,6 +5,9 @@
 #include "Components/BoxComponent.h"
 #include "Components/SceneComponent.h"
 #include "Engine/Engine.h"
+#include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
+#include "MenuUIControllerComponent.h"
 #include "PlayerSeatComponent.h"
 
 AMenuInteractableActor::AMenuInteractableActor()
@@ -22,6 +25,8 @@ AMenuInteractableActor::AMenuInteractableActor()
 	InteractionBox->SetCollisionResponseToAllChannels(ECR_Ignore);
 	InteractionBox->SetCollisionResponseToChannel(ECC_Visibility, ECR_Block);
 	InteractionBox->SetGenerateOverlapEvents(false);
+
+	MenuUIController = CreateDefaultSubobject<UMenuUIControllerComponent>(TEXT("MenuUIController"));
 
 	MenuID = TEXT("Menu_01");
 	RelatedTableID = TEXT("Table_01");
@@ -68,6 +73,24 @@ bool AMenuInteractableActor::Interact_Implementation(AActor* Interactor)
 
 	PrintDebugMessage(ContextMessage, FColor::Cyan);
 	UE_LOG(LogTemp, Log, TEXT("%s"), *ContextMessage);
+
+	APlayerController* PlayerController = nullptr;
+	if (const APawn* InteractorPawn = Cast<APawn>(Interactor))
+	{
+		PlayerController = Cast<APlayerController>(InteractorPawn->GetController());
+	}
+
+	if (!PlayerController)
+	{
+		PlayerController = GetWorld() ? GetWorld()->GetFirstPlayerController() : nullptr;
+	}
+
+	if (MenuUIController)
+	{
+		MenuUIController->SetMenuText(TEXT("カレーライス\nラーメン\nサラダ\nコーヒー"));
+		MenuUIController->ToggleMenuUI(PlayerController);
+	}
+
 	return true;
 }
 

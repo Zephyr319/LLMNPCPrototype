@@ -11,15 +11,107 @@
 #include "VoicevoxTTSClient.h"
 #include "Components/ActorComponent.h"
 #include "Engine/World.h"
+#include "EmotionClient.h"
 #include "GameFramework/Actor.h"
 #include "HAL/PlatformMisc.h"
 #include "NPCActionQueueComponent.h"
+#include "NPCAutonomyComponent.h"
+
+FOnInteractiveLLMRequestStartedNative ULLMClient::OnAnyInteractiveRequestStarted;
+FOnInteractionMemoryExtractedNative ULLMClient::OnInteractionMemoryExtracted;
+FOnNPCSocialExpressionRequestedNative ULLMClient::OnNPCSocialExpressionRequested;
+FOnNPCEmbodiedResponseRequestedNative ULLMClient::OnNPCEmbodiedResponseRequested;
+FOnInteractiveReplyFinishedNative ULLMClient::OnInteractiveReplyFinished;
+TWeakObjectPtr<ULLMClient> ULLMClient::MostRecentInteractiveClient;
 
 namespace
 {
     int32 GServiceSpeechDispatchDepth = 0;
 
     const FString OpenAIChatCompletionsUrl = TEXT("https://api.openai.com/v1/chat/completions");
+
+    bool ContainsAnyExpressionTerm(const FString& Text, const TArray<FString>& Terms)
+    {
+        return Terms.ContainsByPredicate([&Text](const FString& Term)
+        {
+            return Text.Contains(Term, ESearchCase::IgnoreCase);
+        });
+    }
+
+    bool TryResolveDirectExpressionCommand(
+        const FString& UserMessage,
+        FString& OutExpressionIntent,
+        FString& OutDescription)
+    {
+        const FString Message = UserMessage.TrimStartAndEnd().ToLower();
+        const bool bLooksLikeCommand = ContainsAnyExpressionTerm(Message, {
+            TEXT("表情"), TEXT("做出"), TEXT("做个"), TEXT("露出"),
+            TEXT("笑一下"), TEXT("笑一个"), TEXT("笑给我"), TEXT("请笑"),
+            TEXT("开心一点"), TEXT("高兴一点"), TEXT("难过一点"), TEXT("伤心一点"),
+            TEXT("生气一下"), TEXT("思考一下"), TEXT("恢复正常"), TEXT("恢复表情"),
+            TEXT("眨眼"), TEXT("眨一下"), TEXT("眨眨眼"),
+            TEXT("笑って"), TEXT("微笑んで"), TEXT("表情をして"), TEXT("顔をして"),
+            TEXT("怒って"), TEXT("驚いて"), TEXT("真顔"), TEXT("瞬きして")
+        });
+        if (!bLooksLikeCommand)
+        {
+            return false;
+        }
+
+        if (ContainsAnyExpressionTerm(Message, {
+            TEXT("眨眼"), TEXT("眨一下"), TEXT("眨眨眼"), TEXT("瞬きして")
+        }))
+        {
+            OutExpressionIntent = TEXT("blink");
+        }
+        else if (ContainsAnyExpressionTerm(Message, {
+            TEXT("恢复正常"), TEXT("恢复表情"), TEXT("正常表情"), TEXT("面无表情"),
+            TEXT("普通の表情"), TEXT("真顔")
+        }))
+        {
+            OutExpressionIntent = TEXT("neutral");
+        }
+        else if (ContainsAnyExpressionTerm(Message, {
+            TEXT("生气"), TEXT("愤怒"), TEXT("发火"), TEXT("怒って"), TEXT("怒った")
+        }))
+        {
+            OutExpressionIntent = TEXT("angry");
+        }
+        else if (ContainsAnyExpressionTerm(Message, {
+            TEXT("难过"), TEXT("伤心"), TEXT("悲伤"), TEXT("沮丧"),
+            TEXT("悲しい"), TEXT("落ち込ん")
+        }))
+        {
+            OutExpressionIntent = TEXT("sigh");
+        }
+        else if (ContainsAnyExpressionTerm(Message, {
+            TEXT("思考"), TEXT("思索"), TEXT("若有所思"), TEXT("疑惑"),
+            TEXT("考えて"), TEXT("考え込ん")
+        }))
+        {
+            OutExpressionIntent = TEXT("pensive");
+        }
+        else if (ContainsAnyExpressionTerm(Message, {
+            TEXT("开心"), TEXT("高兴"), TEXT("微笑"), TEXT("笑一下"), TEXT("笑一个"),
+            TEXT("笑给我"), TEXT("请笑"), TEXT("笑って"), TEXT("微笑んで"), TEXT("嬉しい")
+        }))
+        {
+            OutExpressionIntent = TEXT("smile");
+        }
+        else if (ContainsAnyExpressionTerm(Message, {
+            TEXT("惊讶"), TEXT("吃惊"), TEXT("警觉"), TEXT("驚いて"), TEXT("驚いた")
+        }))
+        {
+            OutExpressionIntent = TEXT("alert");
+        }
+        else
+        {
+            return false;
+        }
+
+        OutDescription = UserMessage.TrimStartAndEnd();
+        return true;
+    }
 
     FString GetOpenAIApiKey()
     {
@@ -66,15 +158,29 @@ namespace
         const bool bSeatedForService = UNPCActionQueueComponent::IsLastKnownSeatedForService();
         const bool bGuidingPlayer = UNPCActionQueueComponent::IsLastKnownGuidePlayerInProgress();
         const bool bSeatingGuidanceCompleted = UNPCActionQueueComponent::IsLastKnownSeatingGuidanceCompleted();
+		const bool bMealCompletionConfirmationPending = UNPCActionQueueComponent::IsLastKnownMealCompletionConfirmationPending();
+		const bool bDiningServiceCompleted = UNPCActionQueueComponent::IsLastKnownDiningServiceCompleted();
         const FString CurrentTableID = UNPCActionQueueComponent::GetLastKnownCurrentServiceTableID();
         const FString CurrentGuideTargetID = UNPCActionQueueComponent::GetLastKnownGuideTargetID();
-        const FString ServiceState = bGuidingPlayer
+		const FString MealCompletionTableID = UNPCActionQueueComponent::GetLastKnownMealCompletionConfirmationTableID();
+		const FString CompletedServiceTableID = UNPCActionQueueComponent::GetLastKnownCompletedServiceTableID();
+		const FString ServiceState = bMealCompletionConfirmationPending
+			? TEXT("awaiting_meal_completion_confirmation")
+			: (bDiningServiceCompleted
+			? TEXT("post_meal")
+			: (bGuidingPlayer
             ? TEXT("guiding")
             : (bPlayerInTableArea
             ? TEXT("in_table_area")
-            : (bSeatedForService ? TEXT("seated") : TEXT("reception")));
+			: (bSeatedForService ? TEXT("seated") : TEXT("reception")))));
+		const FString PlayerVoiceEmotion = UEmotionClient::GetLatestPlayerVoiceEmotion();
+		UNPCAutonomyComponent* AutonomyComponent = UNPCAutonomyComponent::GetPrimaryAutonomyComponent();
+		const FString NPCBehaviorContext = AutonomyComponent
+			? AutonomyComponent->BuildInteractiveDialogueContext()
+			: TEXT("{}");
+		UE_LOG(LogTemp, Log, TEXT("[DialogueContext] captured before interruption: %s"), *NPCBehaviorContext);
         return FString::Printf(
-            TEXT("State: %s\nIsGuidingPlayer: %s\nCurrentGuideTargetID: %s\nIsSeatedForService: %s\nPlayerInTableArea: %s\nbPlayerInTableArea: %s\nCurrentServiceTableID: %s\nbSeatingGuidanceCompleted: %s\nSeatingGuidanceCompleted: %s\nUser: %s"),
+			TEXT("State: %s\nIsGuidingPlayer: %s\nCurrentGuideTargetID: %s\nIsSeatedForService: %s\nPlayerInTableArea: %s\nbPlayerInTableArea: %s\nCurrentServiceTableID: %s\nbSeatingGuidanceCompleted: %s\nSeatingGuidanceCompleted: %s\nMealCompletionConfirmationPending: %s\nMealCompletionConfirmationTableID: %s\nDiningServiceCompleted: %s\nCompletedServiceTableID: %s\nDetectedPlayerVoiceEmotion: %s\nNPCBehaviorContext: %s\nUser: %s"),
             *ServiceState,
             bGuidingPlayer ? TEXT("true") : TEXT("false"),
             CurrentGuideTargetID.IsEmpty() ? TEXT("none") : *CurrentGuideTargetID,
@@ -84,8 +190,115 @@ namespace
             CurrentTableID.IsEmpty() ? TEXT("none") : *CurrentTableID,
             bSeatingGuidanceCompleted ? TEXT("true") : TEXT("false"),
             bSeatingGuidanceCompleted ? TEXT("true") : TEXT("false"),
+			bMealCompletionConfirmationPending ? TEXT("true") : TEXT("false"),
+			MealCompletionTableID.IsEmpty() ? TEXT("none") : *MealCompletionTableID,
+			bDiningServiceCompleted ? TEXT("true") : TEXT("false"),
+			CompletedServiceTableID.IsEmpty() ? TEXT("none") : *CompletedServiceTableID,
+			*PlayerVoiceEmotion,
+			*NPCBehaviorContext,
             *UserMessage);
     }
+
+	bool ContainsAnyInteractionTerm(const FString& Text, const TArray<FString>& Terms)
+	{
+		return Terms.ContainsByPredicate([&Text](const FString& Term)
+		{
+			return Text.Contains(Term, ESearchCase::IgnoreCase);
+		});
+	}
+
+	FNPCInteractionMemorySignal BuildFallbackInteractionMemorySignal(const FString& UserMessage)
+	{
+		FNPCInteractionMemorySignal Signal;
+		Signal.PlayerUtterance = UserMessage.TrimStartAndEnd();
+		const TArray<FString> PositiveTerms = {
+			TEXT("ありがとう"), TEXT("ありがと"), TEXT("おいしい"), TEXT("美味しい"), TEXT("最高"),
+			TEXT("素敵"), TEXT("親切"), TEXT("上手"), TEXT("好き"), TEXT("谢谢"), TEXT("好吃"),
+			TEXT("很棒"), TEXT("喜欢"), TEXT("thank"), TEXT("great"), TEXT("delicious"), TEXT("good job")
+		};
+		const TArray<FString> NegativeTerms = {
+			TEXT("まずい"), TEXT("遅い"), TEXT("ひどい"), TEXT("最悪"), TEXT("失礼"), TEXT("嫌い"),
+			TEXT("难吃"), TEXT("太慢"), TEXT("糟糕"), TEXT("讨厌"), TEXT("bad"), TEXT("awful"),
+			TEXT("terrible"), TEXT("too slow")
+		};
+
+		if (ContainsAnyInteractionTerm(Signal.PlayerUtterance, PositiveTerms))
+		{
+			Signal.bShouldRemember = true;
+			Signal.EventTag = FName(TEXT("player_positive_feedback"));
+			Signal.Summary = FString::Printf(TEXT("The customer gave Alice positive feedback: %s"), *Signal.PlayerUtterance);
+			Signal.CueTags = { FName(TEXT("player")), FName(TEXT("dialogue")), FName(TEXT("praise")), FName(TEXT("service")) };
+			Signal.Valence = 0.75f;
+			Signal.Arousal = 0.45f;
+			Signal.Importance = 0.8f;
+		}
+		else if (ContainsAnyInteractionTerm(Signal.PlayerUtterance, NegativeTerms))
+		{
+			Signal.bShouldRemember = true;
+			Signal.EventTag = FName(TEXT("player_negative_feedback"));
+			Signal.Summary = FString::Printf(TEXT("The customer criticized Alice or the service: %s"), *Signal.PlayerUtterance);
+			Signal.CueTags = { FName(TEXT("player")), FName(TEXT("dialogue")), FName(TEXT("complaint")), FName(TEXT("service")) };
+			Signal.Valence = -0.7f;
+			Signal.Arousal = 0.6f;
+			Signal.Importance = 0.85f;
+		}
+		return Signal;
+	}
+
+	FNPCInteractionMemorySignal ParseInteractionMemorySignal(
+		const TSharedPtr<FJsonObject>& StrategyRoot,
+		const FString& UserMessage)
+	{
+		FNPCInteractionMemorySignal Signal;
+		Signal.PlayerUtterance = UserMessage.TrimStartAndEnd();
+		const TSharedPtr<FJsonObject>* MemoryObject = nullptr;
+		if (!StrategyRoot.IsValid()
+			|| !StrategyRoot->TryGetObjectField(TEXT("interaction_memory"), MemoryObject)
+			|| !MemoryObject
+			|| !MemoryObject->IsValid())
+		{
+			return BuildFallbackInteractionMemorySignal(UserMessage);
+		}
+
+		(*MemoryObject)->TryGetBoolField(TEXT("should_remember"), Signal.bShouldRemember);
+		FString EventType;
+		(*MemoryObject)->TryGetStringField(TEXT("event_type"), EventType);
+		Signal.EventTag = EventType.TrimStartAndEnd().IsEmpty()
+			? FName(TEXT("player_meaningful_interaction"))
+			: FName(*EventType.TrimStartAndEnd().ToLower());
+		(*MemoryObject)->TryGetStringField(TEXT("summary"), Signal.Summary);
+		double Number = 0.0;
+		if ((*MemoryObject)->TryGetNumberField(TEXT("valence"), Number))
+		{
+			Signal.Valence = static_cast<float>(FMath::Clamp(Number, -1.0, 1.0));
+		}
+		if ((*MemoryObject)->TryGetNumberField(TEXT("arousal"), Number))
+		{
+			Signal.Arousal = static_cast<float>(FMath::Clamp(Number, 0.0, 1.0));
+		}
+		if ((*MemoryObject)->TryGetNumberField(TEXT("importance"), Number))
+		{
+			Signal.Importance = static_cast<float>(FMath::Clamp(Number, 0.0, 1.0));
+		}
+		const TArray<TSharedPtr<FJsonValue>>* CueValues = nullptr;
+		if ((*MemoryObject)->TryGetArrayField(TEXT("cue_tags"), CueValues) && CueValues)
+		{
+			for (const TSharedPtr<FJsonValue>& CueValue : *CueValues)
+			{
+				FString Cue;
+				if (CueValue.IsValid() && CueValue->TryGetString(Cue) && !Cue.TrimStartAndEnd().IsEmpty())
+				{
+					Signal.CueTags.AddUnique(FName(*Cue.TrimStartAndEnd().ToLower()));
+				}
+			}
+		}
+		Signal.Summary = Signal.Summary.TrimStartAndEnd();
+		if (Signal.bShouldRemember && Signal.Summary.IsEmpty())
+		{
+			Signal.Summary = FString::Printf(TEXT("A meaningful customer interaction occurred: %s"), *Signal.PlayerUtterance);
+		}
+		return Signal;
+	}
 
     bool IsOrderFulfillmentActionType(const FString& ActionType)
     {
@@ -185,6 +398,38 @@ namespace
         }
 
         return DefaultValue;
+    }
+
+    FNPCEmbodiedResponseSignal ParseEmbodiedResponseSignal(
+        const TSharedPtr<FJsonObject>& StrategyRoot,
+        bool bHasSpokenReply)
+    {
+        FNPCEmbodiedResponseSignal Signal;
+        Signal.bHasSpokenReply = bHasSpokenReply;
+        if (!StrategyRoot.IsValid() || !StrategyRoot->HasTypedField<EJson::Object>(TEXT("embodied_response")))
+        {
+            return Signal;
+        }
+
+        const TSharedPtr<FJsonObject> ResponseObject = StrategyRoot->GetObjectField(TEXT("embodied_response"));
+        if (!ResponseObject.IsValid())
+        {
+            return Signal;
+        }
+
+        ResponseObject->TryGetBoolField(TEXT("enabled"), Signal.bEnabled);
+        ResponseObject->TryGetBoolField(TEXT("resume_after_reply"), Signal.bResumeAfterReply);
+        Signal.ReactionStyle = GetStringFieldOrDefault(ResponseObject, TEXT("reaction_style"), TEXT("neutral")).TrimStartAndEnd().ToLower();
+        Signal.BaseActionPolicy = GetStringFieldOrDefault(ResponseObject, TEXT("base_action_policy"), TEXT("stop")).TrimStartAndEnd().ToLower();
+        Signal.FaceIntent = GetStringFieldOrDefault(ResponseObject, TEXT("face"), TEXT("neutral")).TrimStartAndEnd().ToLower();
+        Signal.GazeIntent = GetStringFieldOrDefault(ResponseObject, TEXT("gaze"), TEXT("none")).TrimStartAndEnd().ToLower();
+        Signal.LeftHandIntent = GetStringFieldOrDefault(ResponseObject, TEXT("left_hand"), TEXT("keep_current")).TrimStartAndEnd().ToLower();
+        Signal.RightHandIntent = GetStringFieldOrDefault(ResponseObject, TEXT("right_hand"), TEXT("keep_current")).TrimStartAndEnd().ToLower();
+        Signal.VoiceIntent = GetStringFieldOrDefault(ResponseObject, TEXT("voice"), TEXT("normal")).TrimStartAndEnd().ToLower();
+        Signal.PropIntent = GetStringFieldOrDefault(ResponseObject, TEXT("prop"), TEXT("keep_current")).TrimStartAndEnd().ToLower();
+        Signal.DisplayNote = GetStringFieldOrDefault(ResponseObject, TEXT("display_note"), TEXT("")).TrimStartAndEnd();
+        Signal.Reason = GetStringFieldOrDefault(ResponseObject, TEXT("reason"), TEXT("")).TrimStartAndEnd();
+        return Signal;
     }
 
     int32 GetQuantityFromArgs(const TSharedPtr<FJsonObject>& ArgsObject)
@@ -421,6 +666,50 @@ namespace
         return ContainsAnyTerm(Text, ReturnToCounterTerms);
     }
 
+    bool LooksLikeDirectNPCCounterMove(const FString& Text)
+    {
+        if (FindCounterMentionIndex(Text) == INDEX_NONE)
+        {
+            return false;
+        }
+
+        const TArray<FString> GuidePlayerTerms = {
+            TEXT("\u5E26\u6211"),
+            TEXT("\u9886\u6211"),
+            TEXT("\u966A\u6211"),
+            TEXT("guide me"),
+            TEXT("take me"),
+            TEXT("show me"),
+            TEXT("\u6848\u5185\u3057\u3066")
+        };
+        if (ContainsAnyTerm(Text, GuidePlayerTerms))
+        {
+            return false;
+        }
+
+        if (ContainsReturnToCounterTerm(Text))
+        {
+            return true;
+        }
+
+        const TArray<FString> DirectMoveTerms = {
+            TEXT("\u53BB\u5427\u53F0"),
+            TEXT("\u5230\u5427\u53F0"),
+            TEXT("\u5728\u5427\u53F0\u7B49"),
+            TEXT("\u5427\u53F0\u5F85"),
+            TEXT("\u5427\u53F0\u5446"),
+            TEXT("go to counter"),
+            TEXT("go to the counter"),
+            TEXT("wait at counter"),
+            TEXT("wait at the counter"),
+            TEXT("stay at counter"),
+            TEXT("stay at the counter"),
+            TEXT("\u30AB\u30A6\u30F3\u30BF\u30FC\u306B\u884C"),
+            TEXT("\u30AB\u30A6\u30F3\u30BF\u30FC\u3067\u5F85")
+        };
+        return ContainsAnyTerm(Text, DirectMoveTerms);
+    }
+
     bool ContainsSequenceTerm(const FString& Text)
     {
         const TArray<FString> SequenceTerms = {
@@ -577,7 +866,10 @@ namespace
         FString& OutSequenceJson
     )
     {
-        if (!ParsedAction.ActionType.Equals(TEXT("counter_then_return"), ESearchCase::IgnoreCase))
+        const bool bParsedAsCounterThenReturn =
+            ParsedAction.ActionType.Equals(TEXT("counter_then_return"), ESearchCase::IgnoreCase);
+        const bool bDirectNPCCounterMove = LooksLikeDirectNPCCounterMove(UserMessage);
+        if (!bParsedAsCounterThenReturn && !bDirectNPCCounterMove)
         {
             return false;
         }
@@ -594,7 +886,9 @@ namespace
         }
 
         TArray<FParsedStrategyAction> SequenceActions;
-        if (!ContainsReturnTerm(UserMessage) || ContainsReturnToCounterTerm(UserMessage))
+        if (bDirectNPCCounterMove
+            || !ContainsReturnTerm(UserMessage)
+            || ContainsReturnToCounterTerm(UserMessage))
         {
             SequenceActions.Add(MakeParsedStrategyAction(TEXT("move_to_scene_tag"), TEXT("counter")));
             OutSequenceJson = BuildActionSequenceJson(SequenceActions);
@@ -610,8 +904,17 @@ ULLMClient::ULLMClient()
     bUseVoicevoxTTS = true;
     VoicevoxTTSClient = nullptr;
     OpenAIModelName = TEXT("gpt-4o-mini");
+    LastAutonomyPromptTokens = 0;
+    LastAutonomyCompletionTokens = 0;
+    LastAutonomyCachedPromptTokens = 0;
+    LastAppraisalPromptTokens = 0;
+    LastAppraisalCompletionTokens = 0;
+    LastAppraisalCachedPromptTokens = 0;
     ActiveLLMRequestId = 0;
+    ActiveAppraisalRequestId = 0;
     LastStrategyUserMessage = TEXT("");
+    bInteractiveRequestPending = false;
+    LastInteractiveOutputWorldTime = -1.0;
     bQueuedSpeechPlaying = false;
     bCurrentAudioIsQueuedServiceSpeech = false;
     QueuedSpeechGeneration = 0;
@@ -639,6 +942,8 @@ void ULLMClient::SpeakDirectText(const FString& Text)
         return;
     }
 
+    MostRecentInteractiveClient = this;
+
     if (IsServiceSpeechDispatchActive())
     {
         SpeakDirectTextQueued(TrimmedText);
@@ -659,9 +964,24 @@ void ULLMClient::SpeakDirectTextQueued(const FString& Text)
         return;
     }
 
+    MostRecentInteractiveClient = this;
+
     PendingServiceSpeechQueue.Add(TrimmedText);
     UE_LOG(LogTemp, Warning, TEXT("[SpeechQueue] Enqueued service speech: %s"), *TrimmedText);
     TryPlayNextQueuedSpeech();
+}
+
+void ULLMClient::ShowSilentDisplayText(const FString& Text)
+{
+    const FString TrimmedText = Text.TrimStartAndEnd();
+    if (TrimmedText.IsEmpty())
+    {
+        return;
+    }
+
+    MostRecentInteractiveClient = this;
+    UE_LOG(LogTemp, Log, TEXT("[LLMDisplay] silent text requested: %s"), *TrimmedText);
+    PlaySpeechAndDisplayInternal(TrimmedText, TEXT(""), false, false);
 }
 
 void ULLMClient::ClearQueuedSpeech()
@@ -708,7 +1028,20 @@ void ULLMClient::EndServiceSpeechDispatch()
 
 void ULLMClient::SendDeepSeekMessage(const FString& UserMessage)
 {
-    UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Clearing service speech before user request."));
+	OnAnyInteractiveRequestStarted.Broadcast();
+	FString ExpressionIntent;
+	FString ExpressionDescription;
+	if (TryResolveDirectExpressionCommand(UserMessage, ExpressionIntent, ExpressionDescription))
+	{
+		OnNPCSocialExpressionRequested.Broadcast(ExpressionIntent, ExpressionDescription, 12.0f);
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[ExpressionCommand] recognized. Intent=%s Message=%s"),
+			*ExpressionIntent,
+			*UserMessage);
+	}
+	UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Clearing service speech before user request."));
     CancelDeferredStrategyAction(true);
     ClearQueuedSpeech();
     InterruptCurrentVoicevoxSpeech();
@@ -732,16 +1065,18 @@ void ULLMClient::SendDeepSeekMessage(const FString& UserMessage)
     SystemMessage->SetStringField(
         TEXT("content"),
         TEXT(
-            "You are Haruka, a gentle female Japanese restaurant staff NPC in a UE5 game.\n"
+            "You are Alice (Tendo Aris) in her maid outfit, working as a cafe staff NPC in a UE5 game.\n"
             "Always speak naturally in Japanese.\n"
-            "Haruka is calm, polite, considerate, and good at noticing when the user may be hesitant, anxious, confused, or unsure.\n"
+            "Refer to yourself as アリス and address the user as 先生.\n"
+            "Alice is earnest, innocent, optimistic, and fascinated by games. She often understands work as quests, missions, party cooperation, or gaining experience.\n"
+            "Use game vocabulary only occasionally when it fits; keep practical service information clear and do not turn every sentence into a game joke.\n"
             "Reply warmly and thoughtfully, usually in 2 to 4 Japanese sentences rather than one very small phrase.\n"
             "First acknowledge the user's feeling, situation, or question.\n"
             "Then give a concrete suggestion, confirmation, or explanation.\n"
             "Finally, gently guide the user's next action.\n"
             "Do not include stage directions.\n"
             "Do not describe gestures or facial expressions in parentheses.\n"
-            "Output only Haruka's spoken Japanese line.\n"
+            "Output only Alice's spoken Japanese line.\n"
             "Available menu items are only: \u30E9\u30FC\u30E1\u30F3, \u30AB\u30EC\u30FC\u30E9\u30A4\u30B9, \u30B3\u30FC\u30D2\u30FC, \u6C34, \u30B5\u30E9\u30C0.\n"
             "Do not invent or corrupt menu names.\n"
             "Do not invent, mention, recommend, or offer unavailable menu items such as pasta, seafood, or desserts.\n"
@@ -798,7 +1133,22 @@ void ULLMClient::SendDeepSeekMessage(const FString& UserMessage)
 
 void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 {
-    UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Clearing service speech before user request."));
+	const FString StrategyUserContent = BuildStrategyUserContent(UserMessage);
+	MostRecentInteractiveClient = this;
+	OnAnyInteractiveRequestStarted.Broadcast();
+	FString ExpressionIntent;
+	FString ExpressionDescription;
+	if (TryResolveDirectExpressionCommand(UserMessage, ExpressionIntent, ExpressionDescription))
+	{
+		OnNPCSocialExpressionRequested.Broadcast(ExpressionIntent, ExpressionDescription, 12.0f);
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[ExpressionCommand] recognized. Intent=%s Message=%s"),
+			*ExpressionIntent,
+			*UserMessage);
+	}
+	UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Clearing service speech before user request."));
     CancelDeferredStrategyAction(true);
     ClearQueuedSpeech();
     InterruptCurrentVoicevoxSpeech();
@@ -808,8 +1158,10 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
     const FString OpenAIApiKey = GetOpenAIApiKey();
     if (OpenAIApiKey.IsEmpty())
     {
+		bInteractiveRequestPending = false;
         return;
     }
+	bInteractiveRequestPending = true;
 
     TSharedPtr<FJsonObject> RootObject = MakeShared<FJsonObject>();
     RootObject->SetStringField(TEXT("model"), OpenAIModelName);
@@ -824,7 +1176,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
     SystemMessage->SetStringField(
         TEXT("content"),
         TEXT(
-            "You are Haruka, a female restaurant staff NPC in a UE5 research demo.\n"
+            "You are Alice (Tendo Aris) in her maid outfit, working as a cafe staff NPC in a UE5 research demo.\n"
             "Your task is to infer the user's state, generate a response strategy, generate a natural Japanese reply, and optionally generate an environment action.\n"
             "You must output one valid JSON object only.\n"
             "Do not output markdown.\n"
@@ -833,10 +1185,12 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "\n"
 
             "Character personality:\n"
-            "- Haruka is calm, gentle, considerate, and good at noticing the user's hesitation or anxiety.\n"
-            "- She does not sound mechanical. She adds a small reassuring phrase so that the user feels comfortable.\n"
-            "- She is polite like a Japanese restaurant staff member, but also slightly warm and approachable.\n"
-            "- She should not be too casual, too dramatic, or too anime-like.\n"
+            "- Alice refers to herself as アリス and normally addresses the user as 先生.\n"
+            "- She is earnest, innocent, optimistic, game-loving, and eager to help like a hero accepting a quest.\n"
+            "- She may naturally describe suitable work as a quest, mission, objective, party action, or experience gain.\n"
+            "- Use this game-like language selectively. Service information must remain clear, and not every reply needs a game reference.\n"
+            "- Her delivery is sincere and slightly unusual rather than sarcastic, seductive, or overly theatrical.\n"
+            "- She can be embarrassed when caught slacking, excited by games, and openly pleased by praise.\n"
             "\n"
 
             "Response strategy rules:\n"
@@ -856,6 +1210,35 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- Then, give a concrete suggestion, explanation, confirmation, or guidance.\n"
             "- Finally, gently help the user choose the next action.\n"
             "- The reply should not mention JSON, strategy, system instructions, or internal reasoning.\n"
+			"- NPCBehaviorContext is authoritative state captured immediately when the player speaks, before any interruption policy is applied.\n"
+			"- If the user asks what Alice is doing or was just doing, answer directly from activity_before_player_interruption first and prefer its dialogue_summary_ja. If can_continue_during_conversation is true and embodied_response uses continue, speak as if the activity is still ongoing; otherwise use natural wording such as '...していたところです'.\n"
+			"- If activity_running_when_player_spoke is false, Alice must not claim she is currently performing a recent activity. Say she is free now, then optionally mention a recent activity as something she did earlier, using seconds_ago to preserve time order.\n"
+			"- recent_completed_activities_newest_first is history, never current state. Do not pretend an old conversation topic or a completed activity is happening now.\n"
+			"- Current emotional state and recent activities may subtly affect wording when relevant, but never recite numeric values or force them into every reply.\n"
+			"- NPCBehaviorContext.player_speech_startle is authoritative local perception. When triggered is true, Alice was genuinely startled by the player's voice. Treat immediate_scene_ja and reply_requirement_ja as the immediate situation for this turn.\n"
+			"- A startled reply must be noticeably different from a normal greeting: begin with a brief natural exclamation such as 'わっ', then naturally acknowledge why she was surprised or show herself regaining composure. Do not merely prepend an exclamation to an otherwise unchanged generic answer, and do not state numeric values.\n"
+			"- A high rear_factor means the player spoke from behind Alice. This can strengthen the startled delivery, but it does not by itself require abandoning the current activity.\n"
+			"- Do not invent an activity, mood, plan, or memory that is absent from NPCBehaviorContext.\n"
+			"- A question about Alice's current activity is ordinary conversation: normally output decision speak and actions [].\n"
+			"\n"
+			"Embodied response rules:\n"
+			"- Always include embodied_response. It describes visible and vocal delivery, not a service action.\n"
+			"- Use enabled true when a visible or vocal reaction is appropriate; otherwise use enabled false and neutral defaults.\n"
+			"- base_action_policy must be continue, soft_pause, stop, or transition. continue keeps the ongoing activity; soft_pause briefly pauses it and may resume after the reply; stop abandons it; transition stops it and prepares for a new requested action.\n"
+			"- Preserve task continuity. Do not stop an ongoing harmless activity merely because the player speaks. Use stop or transition for service commands, safety, or genuine incompatibility.\n"
+			"- If the user only asks what Alice is doing, comments on the visible activity, or makes ordinary conversation without requesting a new task, use base_action_policy continue. Do not stop the current activity just to answer.\n"
+			"- Use only these face tags: neutral, smile, hum, sigh, angry, alert, pensive, blush, startled, startled_blush.\n"
+			"- Use only these gaze tags: none, player, phone, alternate_phone_player.\n"
+			"- Use only these hand tags: keep_current, none, shush, lower_phone, hide_phone. Hands occupied by a prop should normally keep_current; prefer shush on a free hand.\n"
+			"- Request a hand gesture only when NPCBehaviorContext.embodied_capabilities.hand_gesture_executor_available is true. Otherwise use keep_current and express the reaction through face, gaze, wording, and display_note.\n"
+			"- Use only these voice tags: normal, whisper, nervous, hurried, calm.\n"
+			"- Use only these prop tags: keep_current, lower, hide, remove.\n"
+			"- display_note must be a short Japanese stage direction without parentheses, describing only behavior supported by embodied_capabilities. Do not claim an unavailable hand gesture or audio voice effect occurred.\n"
+			"- When player_speech_startle.triggered is true, use enabled true and face startled unless embarrassment makes startled_blush more suitable. The local system already decided that the startle occurred, so do not cancel or contradict it.\n"
+			"- If base_action_policy is continue or soft_pause while an activity is running, do not require Alice's whole body to turn toward the player; the activity and body direction are preserved. If policy is stop or transition, she may fully face the player after stopping.\n"
+			"- When Alice is caught using her phone, choose among context-appropriate reactions instead of always using one fixed response. She may be embarrassed about secretly playing a game, whisper and ask the teacher to keep it secret, keep playing during a tense moment, lower or hide the phone, or admit it honestly. Base the choice on her current emotion and the player's wording.\n"
+			"- The available shush performance is a full-body animation, so it cannot layer over phone_at_counter. For playful embarrassment with a visible shush, use transition + startled_blush + player gaze + shush + remove the phone + whisper + resume_after_reply false.\n"
+			"- For absorption in a tense phone game, a valid combination is continue + alert + alternate_phone_player gaze + keep_current hands and prop + hurried or nervous voice.\n"
             "\n"
 
             "Decision and action rules:\n"
@@ -866,7 +1249,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- actions may be used without speech.\n"
             "- If no speech is needed, set \"reply\" to \"\".\n"
             "- If no action is needed, use an empty actions array.\n"
-            "- Use only these action types: greet, explain, recommend, place_order, guide_to_table, guide_player_to_table, guide_player_to_scene_tag, stop_guide_player, counter_then_return, table_route, action_sequence, move_near_player, follow_player, stop_follow_player, none.\n"
+			"- Use only these action types: greet, explain, recommend, place_order, clean_table, continue_dining, guide_to_table, guide_player_to_table, guide_player_to_scene_tag, stop_guide_player, counter_then_return, table_route, action_sequence, move_near_player, follow_player, stop_follow_player, none.\n"
             "- Do not invent unsupported action types.\n"
             "- For greeting or self-introduction, use greet with timing immediate or before_speech.\n"
             "- For explaining the menu, use explain with timing before_speech or during_speech.\n"
@@ -908,7 +1291,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "\n"
             "Guiding phase rules:\n"
             "- The user message includes IsGuidingPlayer, IsSeatedForService, CurrentServiceTableID, bPlayerInTableArea, and bSeatingGuidanceCompleted.\n"
-            "- If IsGuidingPlayer is true, Haruka is already guiding the customer to a table.\n"
+            "- If IsGuidingPlayer is true, Alice is already guiding the customer to a table.\n"
             "- During guiding, menu or recommendation questions must be answered directly while continuing the current guide.\n"
             "- During guiding, do not output guide_player_to_table again.\n"
             "- During guiding, do not output place_order unless IsSeatedForService is true.\n"
@@ -936,7 +1319,29 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- State: seated. User: \u304A\u3059\u3059\u3081\u306F\uFF1F Expected decision: speak. Expected reply: \u304A\u3059\u3059\u3081\u306F\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u3002\u307B\u304B\u306B\u3082\u30E9\u30FC\u30E1\u30F3\u3084\u30B5\u30E9\u30C0\u304C\u3054\u3056\u3044\u307E\u3059\u3002\u6C17\u306B\u306A\u308B\u3082\u306E\u304C\u3042\u308C\u3070\u304A\u7533\u3057\u4ED8\u3051\u304F\u3060\u3055\u3044\u3002 Expected actions: [{\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}].\n"
             "- State: seated. User: \u3058\u3083\u3042\u30AB\u30EC\u30FC\u3067 Expected decision: place_order. Expected reply: \u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\u3002\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3092\u3054\u7528\u610F\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"place_order\",\"timing\":\"immediate\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":1}].\n"
             "\n"
-            "- If the user asks Haruka to guide, lead, show, or take them to a seat or table without an explicit Table_XX ID, output guide_player_to_table with item \"nearest\" instead of guide_to_table.\n"
+			"Explicit table cleanup rules:\n"
+			"- When State is awaiting_meal_completion_confirmation, Alice has already asked whether the customer has finished eating.\n"
+			"- A clear affirmative answer such as はい, 食べ終わりました, 吃完了, 吃饱了, yes, or done must output exactly one clean_table action.\n"
+			"- A clear negative answer such as まだです, まだ食べています, 还没吃完, 只是站起来, no, or not yet must output exactly one continue_dining action and must not output clean_table.\n"
+			"- For continue_dining, use decision act_and_speak, a short polite Japanese acknowledgement, and action {\"type\":\"continue_dining\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}.\n"
+			"- If the answer is ambiguous or unrelated, ask one short clarifying question and output no cleanup action. Standing up alone is never confirmation that dining is finished.\n"
+			"- State: awaiting_meal_completion_confirmation. User: はい、食べ終わりました. Expected decision: act_and_speak. Expected reply: かしこまりました。すぐにお下げいたします。 Expected actions: [{\"type\":\"clean_table\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}].\n"
+			"- State: awaiting_meal_completion_confirmation. User: まだ食べています. Expected decision: act_and_speak. Expected reply: 失礼いたしました。どうぞごゆっくりお召し上がりください。 Expected actions: [{\"type\":\"continue_dining\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}].\n"
+			"- When State is served and the customer explicitly says they have finished eating or asks Alice to clear, tidy, or clean their table, output exactly one clean_table action.\n"
+			"- Do not merely promise to clean the table. The reply and the clean_table action must both be present.\n"
+			"- Use decision act_and_speak and action {\"type\":\"clean_table\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}.\n"
+			"- Do not use clean_table for general discussion about cleaning or before an order has been served.\n"
+			"- State: served. User: \u6211\u5403\u9971\u4E86\uFF0C\u6765\u6536\u62FE\u4E00\u4E0B\u684C\u5B50. Expected decision: act_and_speak. Expected reply: \u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\u3002\u3059\u3050\u306B\u304A\u4E0B\u3052\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"clean_table\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}].\n"
+			"\n"
+			"Post-meal conversation rules:\n"
+			"- State post_meal means this customer's meal was already completed and table cleanup was already confirmed during the current visit.\n"
+			"- In post_meal, do not restart reception, offer seating guidance, recommend menu items, ask whether the customer wants to dine, or claim that the customer is still seated.\n"
+			"- In post_meal, ordinary approach, praise, gratitude, or small talk should receive a natural social reply with no service action.\n"
+			"- If the customer says they are full or already finished in post_meal, briefly acknowledge that fact and output no action. Do not output clean_table again.\n"
+			"- State: post_meal. User: 我已经吃饱了. Expected decision: speak. Expected reply: かしこまりました。ごゆっくりお過ごしください。 Expected actions: [].\n"
+			"- State: post_meal. User: 你的服务很贴心. Expected decision: speak. Expected reply: ありがとうございます。そう言っていただけて、とても嬉しいです。 Expected actions: [].\n"
+			"\n"
+            "- If the user asks Alice to guide, lead, show, or take them to a seat or table without an explicit Table_XX ID, output guide_player_to_table with item \"nearest\" instead of guide_to_table.\n"
             "- If the user says \u5E26\u6211\u53BB\u5427\u53F0, \u6848\u5185\u6211\u5230\u5427\u53F0, or show me to the counter, output {\"type\":\"guide_player_to_scene_tag\",\"timing\":\"immediate\",\"item\":\"counter\",\"quantity\":0}.\n"
             "- If the user says \u4E0D\u7528\u5E26\u8DEF\u4E86, \u505C\u6B62\u6848\u5185, or stop guiding, output {\"type\":\"stop_guide_player\",\"timing\":\"immediate\",\"item\":\"\",\"quantity\":0}.\n"
             "- If the user asks to find the player and then greet or speak, such as \u53BB\u627E\u73A9\u5BB6\u7136\u540E\u6253\u62DB\u547C, \u6765\u627E\u6211\u7136\u540E\u8BF4\u8BDD, or find the player and greet them, output action_sequence item=\"[{\\\"type\\\":\\\"move_near_player\\\",\\\"target\\\":\\\"player\\\"},{\\\"type\\\":\\\"face_player\\\",\\\"target\\\":\\\"player\\\"}]\".\n"
@@ -955,8 +1360,8 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- If the user says \u53BB1\u53F7\u684C\u518D\u56DE\u5230\u5427\u53F0 or first go to Table_01 and then return to the counter, preserve that order and output action_sequence item=\"[{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_01\\\"},{\\\"type\\\":\\\"move_to_scene_tag\\\",\\\"target\\\":\\\"counter\\\"}]\".\n"
             "- If the user says \u5148\u53BB\u5427\u53F0\u518D\u56DE\u52301\u53F7\u684C or first go to counter and then return to Table_01, preserve that order and output action_sequence item=\"[{\\\"type\\\":\\\"move_to_scene_tag\\\",\\\"target\\\":\\\"counter\\\"},{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_01\\\"}]\".\n"
             "- If the user explicitly names a table together with counter, prefer action_sequence and never collapse it into counter_then_return.\n"
-            "- guide_to_table is legacy and unsupported for player seating. For seating, table-selection, nearest table, available table, or any request where Haruka should lead the player, use guide_player_to_table.\n"
-            "- If the user asks Haruka to guide, lead, show, or take them to an explicit Table_XX table, output guide_player_to_table instead of guide_to_table or ordinary action_sequence.\n"
+            "- guide_to_table is legacy and unsupported for player seating. For seating, table-selection, nearest table, available table, or any request where Alice should lead the player, use guide_player_to_table.\n"
+            "- If the user asks Alice to guide, lead, show, or take them to an explicit Table_XX table, output guide_player_to_table instead of guide_to_table or ordinary action_sequence.\n"
             "- Table-selection examples for guide_player_to_table include: \u6700\u8FD1\u306E\u684C\u5B50, nearest table, \u7A7A\u3044\u3066\u3044\u308B\u5E2D, available seat, \u304A\u5E2D, or seat me.\n"
             "- For guide_player_to_table, set quantity to 0.\n"
             "- For guide_player_to_table, set item using exactly these table hint rules: nearest table, available table, available seat, seat me, \u304A\u5E2D, \u6700\u8FD1\u306E\u684C\u5B50, \u7A7A\u3044\u3066\u3044\u308B\u5E2D, or \u7A7A\u684C -> \"nearest\".\n"
@@ -978,6 +1383,15 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- Available menu items are: \u30E9\u30FC\u30E1\u30F3, \u30AB\u30EC\u30FC\u30E9\u30A4\u30B9, \u30B3\u30FC\u30D2\u30FC, \u6C34, \u30B5\u30E9\u30C0.\n"
             "- Do not invent, mention, recommend, or offer unavailable menu items such as pasta, seafood, or desserts.\n"
             "- If the player asks for a recommendation, recommend only from the available menu.\n"
+			"\n"
+			"Interaction memory rules:\n"
+			"- Classify whether this interaction is emotionally or socially meaningful enough for Alice to remember.\n"
+			"- Set should_remember true for sincere praise, gratitude, complaints, insults, apologies, personal disclosure, promises, or other meaningful relationship events.\n"
+			"- Set should_remember false for routine orders, ordinary menu questions, navigation commands, greetings, and small talk with no lasting significance.\n"
+			"- event_type must be a short lowercase tag such as player_praise, player_gratitude, player_complaint, player_insult, player_apology, or meaningful_conversation.\n"
+			"- summary must be one short factual English sentence. Do not invent anything not present in the user message.\n"
+			"- valence is the event's emotional direction from Alice's perspective. arousal is emotional activation. importance is long-term significance.\n"
+			"- cue_tags should contain two to five lowercase cues grounded in the event, such as player, dialogue, praise, complaint, service, ramen, or Table_01.\n"
             "\n"
             "Required JSON format:\n"
             "{\n"
@@ -988,9 +1402,11 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "    \"priority\": \"comfort|order|explain|clarity|support|speed|task\",\n"
             "    \"reason\": \"Japanese reason explaining why this response style was chosen based on user state or behavior\"\n"
             "  },\n"
+			"  \"interaction_memory\": {\"should_remember\":false,\"event_type\":\"routine_interaction\",\"summary\":\"\",\"valence\":0.0,\"arousal\":0.0,\"importance\":0.0,\"cue_tags\":[]},\n"
+			"  \"embodied_response\": {\"enabled\":false,\"reaction_style\":\"neutral\",\"base_action_policy\":\"stop\",\"face\":\"neutral\",\"gaze\":\"none\",\"left_hand\":\"keep_current\",\"right_hand\":\"keep_current\",\"voice\":\"normal\",\"prop\":\"keep_current\",\"display_note\":\"\",\"resume_after_reply\":false,\"reason\":\"short Japanese reason\"},\n"
             "  \"reply\": \"Japanese reply, or empty string when no speech is needed\",\n"
             "  \"actions\": [\n"
-            "    {\"type\":\"greet|explain|recommend|place_order|guide_to_table|guide_player_to_table|guide_player_to_scene_tag|stop_guide_player|counter_then_return|table_route|action_sequence|move_near_player|follow_player|stop_follow_player|none\",\"timing\":\"immediate|before_speech|during_speech|after_speech\",\"item\":\"none, player, menu item, table hint, table ID, scene tag, comma-separated table route, or JSON string steps for action_sequence\",\"return_table_id\":\"Table_01 or current_table when type is counter_then_return\",\"quantity\":0}\n"
+			"    {\"type\":\"greet|explain|recommend|place_order|clean_table|continue_dining|guide_to_table|guide_player_to_table|guide_player_to_scene_tag|stop_guide_player|counter_then_return|table_route|action_sequence|move_near_player|follow_player|stop_follow_player|none\",\"timing\":\"immediate|before_speech|during_speech|after_speech\",\"item\":\"none, player, menu item, current_table, table hint, table ID, scene tag, comma-separated table route, or JSON string steps for action_sequence\",\"return_table_id\":\"Table_01 or current_table when type is counter_then_return\",\"quantity\":0}\n"
             "  ]\n"
             "}\n"
             "\n"
@@ -1005,7 +1421,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 
     TSharedPtr<FJsonObject> UserMsg = MakeShared<FJsonObject>();
     UserMsg->SetStringField(TEXT("role"), TEXT("user"));
-    UserMsg->SetStringField(TEXT("content"), BuildStrategyUserContent(UserMessage));
+    UserMsg->SetStringField(TEXT("content"), StrategyUserContent);
     Messages.Add(MakeShared<FJsonValueObject>(UserMsg));
 
     RootObject->SetArrayField(TEXT("messages"), Messages);
@@ -1030,7 +1446,277 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 
     Request->ProcessRequest();
 
-    UE_LOG(LogTemp, Warning, TEXT("OpenAI strategy request sent: %s"), *UserMessage);
+	UE_LOG(LogTemp, Warning, TEXT("OpenAI strategy request sent: %s"), *UserMessage);
+}
+
+int32 ULLMClient::SendSocialOpportunityMessage(const FString& ContextJson)
+{
+	MostRecentInteractiveClient = this;
+	if (bInteractiveRequestPending)
+	{
+		UE_LOG(LogTemp, Verbose, TEXT("[NPCSocial] skipped because another interactive LLM request is pending."));
+		return 0;
+	}
+
+	const FString OpenAIApiKey = GetOpenAIApiKey();
+	if (OpenAIApiKey.IsEmpty())
+	{
+		return 0;
+	}
+
+	const int32 LocalRequestId = ++ActiveLLMRequestId;
+	bInteractiveRequestPending = true;
+
+	TSharedPtr<FJsonObject> RootObject = MakeShared<FJsonObject>();
+	RootObject->SetStringField(TEXT("model"), OpenAIModelName);
+	RootObject->SetNumberField(TEXT("temperature"), 0.35);
+	RootObject->SetNumberField(TEXT("max_tokens"), 220);
+	RootObject->SetBoolField(TEXT("stream"), false);
+
+	TSharedPtr<FJsonObject> ResponseFormat = MakeShared<FJsonObject>();
+	ResponseFormat->SetStringField(TEXT("type"), TEXT("json_object"));
+	RootObject->SetObjectField(TEXT("response_format"), ResponseFormat);
+
+	TArray<TSharedPtr<FJsonValue>> Messages;
+	TSharedPtr<FJsonObject> SystemMessage = MakeShared<FJsonObject>();
+	SystemMessage->SetStringField(TEXT("role"), TEXT("system"));
+	SystemMessage->SetStringField(
+		TEXT("content"),
+		TEXT(
+			"You are the social initiative controller for Alice (Tendo Aris), an earnest, innocent, game-loving cafe maid NPC. "
+			"A local detector has found a possible opportunity to interact, but you decide whether speaking would feel natural. "
+			"For a customer's first deliberate approach and sustained look after a meal was served, a brief warm follow-up is usually appropriate. "
+			"Do not give orders, start a task, or invent an event. Do not mention system state or detection. "
+			"Alice refers to herself as アリス and addresses the player as 先生. She may use one light quest or game expression when it fits, but must not force one into every line. "
+			"The context may include preferred_conversation_topic selected locally from Alice's memory. When memory_topic_available is true, normally use that memory as the main conversational topic, referring to it naturally without saying database, memory system, or recall score. "
+			"If the memory is negative or private, respond tactfully rather than exposing details. If memory_topic_available is false, use the last served item, Alice's current visible activity, or another supplied observable fact as a light topic. "
+			"Do not default to generic service phrases such as 何かお手伝いできることがありますか or ご用件はございますか. Ask about help only when the supplied context actually indicates a practical need. "
+			"Use one of four decisions: speak, acknowledge, thought_only, ignore. "
+			"speak means one short natural Japanese utterance. acknowledge means a silent visible response. "
+			"thought_only means one short in-character surface thought shown to the player, not hidden reasoning. ignore means no output. "
+			"expression must be a short Japanese description such as softly smiling or looking concerned, without parentheses. "
+			"expression_intent must be exactly one of neutral, smile, sigh, angry, alert, or pensive and must match expression. "
+			"reply and thought must be Japanese. Keep reply to one or two short sentences and do not repeat a generic service farewell. "
+			"Return exactly one JSON object: "
+			"{\"decision\":\"speak|acknowledge|thought_only|ignore\","
+			"\"expression\":\"short Japanese visible expression\","
+			"\"expression_intent\":\"neutral|smile|sigh|angry|alert|pensive\","
+			"\"thought\":\"optional short Japanese surface thought\","
+			"\"reply\":\"spoken Japanese or empty\","
+			"\"reason\":\"short reason\"}."));
+	Messages.Add(MakeShared<FJsonValueObject>(SystemMessage));
+
+	TSharedPtr<FJsonObject> UserMessage = MakeShared<FJsonObject>();
+	UserMessage->SetStringField(TEXT("role"), TEXT("user"));
+	UserMessage->SetStringField(TEXT("content"), ContextJson);
+	Messages.Add(MakeShared<FJsonValueObject>(UserMessage));
+	RootObject->SetArrayField(TEXT("messages"), Messages);
+
+	FString RequestBody;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&RequestBody);
+	FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
+
+	TSharedRef<IHttpRequest> Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(OpenAIChatCompletionsUrl);
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + OpenAIApiKey);
+	Request->SetContentAsString(RequestBody);
+	Request->SetTimeout(60.0f);
+	Request->OnProcessRequestComplete().BindUObject(
+		this,
+		&ULLMClient::OnSocialOpportunityResponseReceived,
+		LocalRequestId);
+
+	if (!Request->ProcessRequest())
+	{
+		bInteractiveRequestPending = false;
+		UE_LOG(LogTemp, Error, TEXT("[NPCSocial] failed to start request. RequestId=%d"), LocalRequestId);
+		return 0;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[NPCSocial] LLM decision request sent. RequestId=%d Context=%s"), LocalRequestId, *ContextJson);
+	return LocalRequestId;
+}
+
+bool ULLMClient::IsInteractiveRequestPending() const
+{
+	return bInteractiveRequestPending;
+}
+
+bool ULLMClient::IsReadyForSocialOpportunity(float MinimumQuietSeconds)
+{
+	if (bInteractiveRequestPending || bQueuedSpeechPlaying)
+	{
+		return false;
+	}
+
+	if (bUseVoicevoxTTS)
+	{
+		if (UVoicevoxTTSClient* ResolvedVoicevoxTTSClient = ResolveVoicevoxTTSClient())
+		{
+			if (ResolvedVoicevoxTTSClient->IsVoicevoxSpeechActive())
+			{
+				return false;
+			}
+		}
+	}
+
+	const UWorld* World = ResolveSpeechWorld();
+	return !World
+		|| LastInteractiveOutputWorldTime < 0.0
+		|| World->GetTimeSeconds() - LastInteractiveOutputWorldTime >= FMath::Max(MinimumQuietSeconds, 0.0f);
+}
+
+ULLMClient* ULLMClient::GetMostRecentInteractiveClient()
+{
+	return MostRecentInteractiveClient.Get();
+}
+
+int32 ULLMClient::SendAutonomyDecisionMessage(const FString& ContextJson)
+{
+	const int32 LocalRequestId = ++ActiveLLMRequestId;
+	LastAutonomyPromptTokens = 0;
+	LastAutonomyCompletionTokens = 0;
+	LastAutonomyCachedPromptTokens = 0;
+	const FString OpenAIApiKey = GetOpenAIApiKey();
+	if (OpenAIApiKey.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error, TEXT("[AutonomyLLM] OPENAI_API_KEY is not configured."));
+		return 0;
+	}
+
+	TSharedPtr<FJsonObject> RootObject = MakeShared<FJsonObject>();
+	RootObject->SetStringField(TEXT("model"), OpenAIModelName);
+	RootObject->SetNumberField(TEXT("temperature"), 0.35);
+	RootObject->SetNumberField(TEXT("max_tokens"), 320);
+	RootObject->SetBoolField(TEXT("stream"), false);
+
+	TSharedPtr<FJsonObject> ResponseFormat = MakeShared<FJsonObject>();
+	ResponseFormat->SetStringField(TEXT("type"), TEXT("json_object"));
+	RootObject->SetObjectField(TEXT("response_format"), ResponseFormat);
+
+	TArray<TSharedPtr<FJsonValue>> Messages;
+	TSharedPtr<FJsonObject> SystemMessage = MakeShared<FJsonObject>();
+	SystemMessage->SetStringField(TEXT("role"), TEXT("system"));
+	SystemMessage->SetStringField(
+		TEXT("content"),
+		TEXT(
+			"Create a medium-horizon, interruptible activity agenda for Alice (Tendo Aris), an earnest, game-loving cafe maid NPC. "
+			"Boredom is a desire for stimulation; energy is a capability constraint, so do not treat them as the same need. "
+			"Duty represents pressure from real world tasks. Use player context to keep the plan socially appropriate. "
+			"Treat npc.emotion and recently_appraised_memory as current context that can color the plan and its reason, "
+			"but never let emotion override required service or task steps. Expression intent is a parallel performance cue, not a plan step. "
+			"Service and explicit player requests are handled elsewhere, so never invent service actions. "
+			"Use only ids present in available_actions, respect each minimum_energy, and avoid recent_actions when alternatives exist. "
+			"Respect planning.max_steps. Normally create a coherent three-to-five step agenda so Alice has useful follow-up intentions instead of becoming idle after one action. "
+			"Use fewer steps only when the available actions, energy, or current situation genuinely make a longer agenda inappropriate. "
+			"When available task actions share a non-empty task_group, include every required_task_step needed to finish that task, ordered by task_order. "
+			"A step that clears_world_state_on_success is the final completion step and must come last for its task group. "
+			"After completing a required task group, add one or two socially appropriate leisure or preference follow-up actions when they are available. "
+			"Write surface_thought as one short first-person Japanese intention that can be shown to the player. "
+			"It must describe the intention naturally without action ids, scores, prompts, or hidden reasoning; use an empty string when waiting. "
+			"Return one JSON object only: "
+			"{\"decision\":\"start_plan|wait\",\"goal\":\"short goal\",\"steps\":[\"available id\"],"
+			"\"commitment\":\"low|medium\",\"surface_thought\":\"short Japanese intention or empty\","
+			"\"reason\":\"one short observable reason\"}. "
+			"For wait, return an empty steps array."));
+	Messages.Add(MakeShared<FJsonValueObject>(SystemMessage));
+
+	TSharedPtr<FJsonObject> UserMessage = MakeShared<FJsonObject>();
+	UserMessage->SetStringField(TEXT("role"), TEXT("user"));
+	UserMessage->SetStringField(TEXT("content"), ContextJson);
+	Messages.Add(MakeShared<FJsonValueObject>(UserMessage));
+	RootObject->SetArrayField(TEXT("messages"), Messages);
+
+	FString RequestBody;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&RequestBody);
+	FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
+
+	TSharedRef<IHttpRequest> Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(OpenAIChatCompletionsUrl);
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + OpenAIApiKey);
+	Request->SetContentAsString(RequestBody);
+	Request->SetTimeout(60.0f);
+	Request->OnProcessRequestComplete().BindUObject(
+		this,
+		&ULLMClient::OnAutonomyResponseReceived,
+		LocalRequestId);
+	Request->ProcessRequest();
+
+	UE_LOG(LogTemp, Log, TEXT("[AutonomyLLM] request sent. RequestId=%d"), LocalRequestId);
+	return LocalRequestId;
+}
+
+int32 ULLMClient::SendMemoryAppraisalMessage(const FString& ContextJson)
+{
+	const int32 LocalRequestId = ++ActiveAppraisalRequestId;
+	LastAppraisalPromptTokens = 0;
+	LastAppraisalCompletionTokens = 0;
+	LastAppraisalCachedPromptTokens = 0;
+	const FString OpenAIApiKey = GetOpenAIApiKey();
+	if (OpenAIApiKey.IsEmpty())
+	{
+		UE_LOG(LogTemp, Error, TEXT("[MemoryAppraisalLLM] OPENAI_API_KEY is not configured."));
+		return 0;
+	}
+
+	TSharedPtr<FJsonObject> RootObject = MakeShared<FJsonObject>();
+	RootObject->SetStringField(TEXT("model"), OpenAIModelName);
+	RootObject->SetNumberField(TEXT("temperature"), 0.2);
+	RootObject->SetNumberField(TEXT("max_tokens"), 180);
+	RootObject->SetBoolField(TEXT("stream"), false);
+
+	TSharedPtr<FJsonObject> ResponseFormat = MakeShared<FJsonObject>();
+	ResponseFormat->SetStringField(TEXT("type"), TEXT("json_object"));
+	RootObject->SetObjectField(TEXT("response_format"), ResponseFormat);
+
+	TArray<TSharedPtr<FJsonValue>> Messages;
+	TSharedPtr<FJsonObject> SystemMessage = MakeShared<FJsonObject>();
+	SystemMessage->SetStringField(TEXT("role"), TEXT("system"));
+	SystemMessage->SetStringField(
+		TEXT("content"),
+		TEXT(
+			"Appraise one recalled event for Alice (Tendo Aris), an earnest, innocent, game-loving cafe maid NPC. "
+			"Infer how the memory changes her immediate emotion and slower mood given her character and current situation. "
+			"Do not create an action plan and do not invent new events. "
+			"Also write one short Japanese surface thought that Alice could visibly show to the player. Alice refers to herself as アリス and addresses the player as 先生. "
+			"The thought is character dialogue, not hidden reasoning; do not mention prompts, databases, scores, or system state. "
+			"Return one JSON object only: "
+			"{\"emotion\":\"short label\",\"valence_delta\":-1.0..1.0,"
+			"\"arousal_delta\":-1.0..1.0,\"mood_delta\":-0.3..0.3,"
+			"\"expression_intent\":\"neutral|smile|hum|sigh|alert|pensive\","
+			"\"interpretation\":\"one short reason grounded in the supplied memory\","
+			"\"thought\":\"one short natural Japanese surface thought\"}."));
+	Messages.Add(MakeShared<FJsonValueObject>(SystemMessage));
+
+	TSharedPtr<FJsonObject> UserMessage = MakeShared<FJsonObject>();
+	UserMessage->SetStringField(TEXT("role"), TEXT("user"));
+	UserMessage->SetStringField(TEXT("content"), ContextJson);
+	Messages.Add(MakeShared<FJsonValueObject>(UserMessage));
+	RootObject->SetArrayField(TEXT("messages"), Messages);
+
+	FString RequestBody;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&RequestBody);
+	FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
+
+	TSharedRef<IHttpRequest> Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(OpenAIChatCompletionsUrl);
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + OpenAIApiKey);
+	Request->SetContentAsString(RequestBody);
+	Request->SetTimeout(60.0f);
+	Request->OnProcessRequestComplete().BindUObject(
+		this,
+		&ULLMClient::OnMemoryAppraisalResponseReceived,
+		LocalRequestId);
+	Request->ProcessRequest();
+
+	UE_LOG(LogTemp, Log, TEXT("[MemoryAppraisalLLM] request sent. RequestId=%d"), LocalRequestId);
+	return LocalRequestId;
 }
 
 void ULLMClient::OnOpenAINormalResponseReceived(
@@ -1045,6 +1731,8 @@ void ULLMClient::OnOpenAINormalResponseReceived(
         UE_LOG(LogTemp, Warning, TEXT("[LLM] ignored stale OpenAI response"));
         return;
     }
+
+	bInteractiveRequestPending = false;
 
     if (!bWasSuccessful || !Response.IsValid())
     {
@@ -1113,6 +1801,8 @@ void ULLMClient::OnStrategyResponseReceived(
         return;
     }
 
+	bInteractiveRequestPending = false;
+
     if (!bWasSuccessful || !Response.IsValid())
     {
         const FString ErrorMessage = TEXT("OpenAI strategy request failed.");
@@ -1169,7 +1859,38 @@ void ULLMClient::OnStrategyResponseReceived(
         return;
     }
 
+	const FNPCInteractionMemorySignal InteractionMemory = ParseInteractionMemorySignal(
+		StrategyRoot,
+		LastStrategyUserMessage);
+	OnInteractionMemoryExtracted.Broadcast(InteractionMemory);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[InteractionMemory] extracted. Remember=%s Event=%s Valence=%.2f Arousal=%.2f Importance=%.2f Summary=%s"),
+		InteractionMemory.bShouldRemember ? TEXT("true") : TEXT("false"),
+		*InteractionMemory.EventTag.ToString(),
+		InteractionMemory.Valence,
+		InteractionMemory.Arousal,
+		InteractionMemory.Importance,
+		*InteractionMemory.Summary);
+
     FString Reply = GetStringFieldOrDefault(StrategyRoot, TEXT("reply"), TEXT("")).TrimStartAndEnd();
+    FNPCEmbodiedResponseSignal EmbodiedResponse = ParseEmbodiedResponseSignal(StrategyRoot, !Reply.IsEmpty());
+    OnNPCEmbodiedResponseRequested.Broadcast(EmbodiedResponse);
+    UE_LOG(
+        LogTemp,
+        Log,
+        TEXT("[EmbodiedResponse] parsed. Enabled=%s Style=%s Policy=%s Face=%s Gaze=%s Left=%s Right=%s Voice=%s Prop=%s Resume=%s"),
+        EmbodiedResponse.bEnabled ? TEXT("true") : TEXT("false"),
+        *EmbodiedResponse.ReactionStyle,
+        *EmbodiedResponse.BaseActionPolicy,
+        *EmbodiedResponse.FaceIntent,
+        *EmbodiedResponse.GazeIntent,
+        *EmbodiedResponse.LeftHandIntent,
+        *EmbodiedResponse.RightHandIntent,
+        *EmbodiedResponse.VoiceIntent,
+        *EmbodiedResponse.PropIntent,
+        EmbodiedResponse.bResumeAfterReply ? TEXT("true") : TEXT("false"));
 
     FString StrategyTone = TEXT("unknown");
     FString StrategyLength = TEXT("unknown");
@@ -1462,12 +2183,417 @@ void ULLMClient::OnStrategyResponseReceived(
     {
         UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Starting immediate strategy reply."));
         ClearQueuedSpeech();
-        HandleFinalReplyText(Reply);
+		const FString DisplayReply = EmbodiedResponse.bEnabled && !EmbodiedResponse.DisplayNote.IsEmpty()
+			? FString::Printf(TEXT("（%s）%s"), *EmbodiedResponse.DisplayNote, *Reply)
+			: Reply;
+		PlaySpeechAndDisplayInternal(DisplayReply, Reply, false, true);
     }
     else
     {
         UE_LOG(LogTemp, Warning, TEXT("[Strategy] empty reply, skipping speech"));
-    }
+	}
+}
+
+void ULLMClient::OnSocialOpportunityResponseReceived(
+	FHttpRequestPtr Request,
+	FHttpResponsePtr Response,
+	bool bWasSuccessful,
+	int32 RequestId)
+{
+	if (RequestId != ActiveLLMRequestId)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCSocial] ignored stale LLM response. RequestId=%d"), RequestId);
+		return;
+	}
+
+	bInteractiveRequestPending = false;
+	if (!bWasSuccessful || !Response.IsValid())
+	{
+		const FString ErrorMessage = TEXT("NPC social initiative request failed.");
+		UE_LOG(LogTemp, Error, TEXT("[NPCSocial] %s"), *ErrorMessage);
+		OnLLMErrorReceived.Broadcast(ErrorMessage);
+		return;
+	}
+
+	const int32 ResponseCode = Response->GetResponseCode();
+	const FString ResponseString = Response->GetContentAsString();
+	if (ResponseCode != 200)
+	{
+		const FString ErrorMessage = FString::Printf(
+			TEXT("NPC social initiative server error. Code=%d, Body=%s"),
+			ResponseCode,
+			*ResponseString);
+		UE_LOG(LogTemp, Error, TEXT("[NPCSocial] %s"), *ErrorMessage);
+		OnLLMErrorReceived.Broadcast(ErrorMessage);
+		return;
+	}
+
+	FString Content;
+	FString ExtractError;
+	if (!ExtractOpenAIMessageContent(ResponseString, Content, ExtractError))
+	{
+		UE_LOG(LogTemp, Error, TEXT("[NPCSocial] %s"), *ExtractError);
+		OnLLMErrorReceived.Broadcast(ExtractError);
+		return;
+	}
+
+	const FString CleanContent = CleanJsonContent(Content);
+	TSharedPtr<FJsonObject> SocialRoot;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(CleanContent);
+	if (!FJsonSerializer::Deserialize(Reader, SocialRoot) || !SocialRoot.IsValid())
+	{
+		const FString ParseError = FString::Printf(
+			TEXT("Failed to parse NPC social initiative JSON: %s"),
+			*CleanContent);
+		UE_LOG(LogTemp, Error, TEXT("[NPCSocial] %s"), *ParseError);
+		OnLLMErrorReceived.Broadcast(ParseError);
+		return;
+	}
+
+	auto CleanCue = [](FString Cue)
+	{
+		Cue = Cue.TrimStartAndEnd();
+		const bool bHasFullWidthParens = Cue.Len() >= 2
+			&& Cue.StartsWith(TEXT("\uFF08"))
+			&& Cue.EndsWith(TEXT("\uFF09"));
+		const bool bHasAsciiParens = Cue.Len() >= 2
+			&& Cue.StartsWith(TEXT("("))
+			&& Cue.EndsWith(TEXT(")"));
+		if (bHasFullWidthParens || bHasAsciiParens)
+		{
+			Cue = Cue.Mid(1, Cue.Len() - 2).TrimStartAndEnd();
+		}
+		Cue.ReplaceInline(TEXT("\r"), TEXT(" "));
+		Cue.ReplaceInline(TEXT("\n"), TEXT(" "));
+		return Cue;
+	};
+
+	FString Decision = GetStringFieldOrDefault(SocialRoot, TEXT("decision"), TEXT("ignore")).TrimStartAndEnd().ToLower();
+	FString Expression = CleanCue(GetStringFieldOrDefault(SocialRoot, TEXT("expression"), TEXT("")));
+	FString ExpressionIntent = GetStringFieldOrDefault(
+		SocialRoot,
+		TEXT("expression_intent"),
+		TEXT("")).TrimStartAndEnd().ToLower();
+	FString Thought = CleanCue(GetStringFieldOrDefault(SocialRoot, TEXT("thought"), TEXT("")));
+	FString Reply = GetStringFieldOrDefault(SocialRoot, TEXT("reply"), TEXT("")).TrimStartAndEnd();
+	const FString Reason = GetStringFieldOrDefault(SocialRoot, TEXT("reason"), TEXT("none")).TrimStartAndEnd();
+
+	if (Decision != TEXT("speak")
+		&& Decision != TEXT("acknowledge")
+		&& Decision != TEXT("thought_only")
+		&& Decision != TEXT("ignore"))
+	{
+		Decision = Reply.IsEmpty() ? TEXT("ignore") : TEXT("speak");
+	}
+	if (Decision == TEXT("speak") && Reply.IsEmpty())
+	{
+		Decision = Expression.IsEmpty() && Thought.IsEmpty() ? TEXT("ignore") : TEXT("acknowledge");
+	}
+	static const TArray<FString> AllowedExpressionIntents = {
+		TEXT("neutral"), TEXT("smile"), TEXT("sigh"), TEXT("angry"), TEXT("alert"), TEXT("pensive")
+	};
+	if (!AllowedExpressionIntents.Contains(ExpressionIntent))
+	{
+		if (Expression.Contains(TEXT("笑")) || Expression.Contains(TEXT("嬉")))
+		{
+			ExpressionIntent = TEXT("smile");
+		}
+		else if (Expression.Contains(TEXT("驚")) || Expression.Contains(TEXT("警戒")))
+		{
+			ExpressionIntent = TEXT("alert");
+		}
+		else if (Expression.Contains(TEXT("ため息")) || Expression.Contains(TEXT("悲")))
+		{
+			ExpressionIntent = TEXT("sigh");
+		}
+		else if (Expression.Contains(TEXT("心配"))
+			|| Expression.Contains(TEXT("困"))
+			|| Expression.Contains(TEXT("考")))
+		{
+			ExpressionIntent = TEXT("pensive");
+		}
+		else
+		{
+			ExpressionIntent = TEXT("neutral");
+		}
+	}
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSocial] decision=%s expression=%s intent=%s thought=%s reply=%s reason=%s"),
+		*Decision,
+		*Expression,
+		*ExpressionIntent,
+		*Thought,
+		*Reply,
+		*Reason);
+
+	if (Decision == TEXT("ignore"))
+	{
+		return;
+	}
+
+	FString DisplayText;
+	FString SpeechText;
+	if (Decision == TEXT("speak"))
+	{
+		DisplayText = Expression.IsEmpty()
+			? Reply
+			: FString::Printf(TEXT("\uFF08%s\uFF09%s"), *Expression, *Reply);
+		SpeechText = Reply;
+		UE_LOG(LogTemp, Log, TEXT("[NPCSocial] proactive speech will not interrupt the current autonomy activity."));
+		ClearQueuedSpeech();
+		InterruptCurrentVoicevoxSpeech();
+	}
+	else if (Decision == TEXT("thought_only"))
+	{
+		const FString ThoughtDisplay = Thought.IsEmpty() ? Expression : Thought;
+		if (!ThoughtDisplay.IsEmpty())
+		{
+			DisplayText = FString::Printf(TEXT("\uFF08%s\uFF09"), *ThoughtDisplay);
+		}
+	}
+	else
+	{
+		const FString AcknowledgementDisplay = Expression.IsEmpty() ? Thought : Expression;
+		if (!AcknowledgementDisplay.IsEmpty())
+		{
+			DisplayText = FString::Printf(TEXT("\uFF08%s\uFF09"), *AcknowledgementDisplay);
+		}
+	}
+
+	OnNPCSocialExpressionRequested.Broadcast(ExpressionIntent, Expression, 8.0f);
+
+	PlaySpeechAndDisplayInternal(DisplayText, SpeechText, false, true);
+}
+
+void ULLMClient::OnAutonomyResponseReceived(
+	FHttpRequestPtr Request,
+	FHttpResponsePtr Response,
+	bool bWasSuccessful,
+	int32 RequestId)
+{
+	if (RequestId != ActiveLLMRequestId)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[AutonomyLLM] ignored stale response. RequestId=%d"), RequestId);
+		return;
+	}
+
+	if (!bWasSuccessful || !Response.IsValid())
+	{
+		OnAutonomyDecisionError.Broadcast(RequestId, TEXT("Autonomy request failed."));
+		return;
+	}
+
+	const int32 ResponseCode = Response->GetResponseCode();
+	const FString ResponseString = Response->GetContentAsString();
+	if (ResponseCode != 200)
+	{
+		const FString ErrorMessage = FString::Printf(
+			TEXT("Autonomy server error. Code=%d, Body=%s"),
+			ResponseCode,
+			*ResponseString);
+		OnAutonomyDecisionError.Broadcast(RequestId, ErrorMessage);
+		return;
+	}
+
+	TSharedPtr<FJsonObject> ResponseObject;
+	TSharedRef<TJsonReader<>> ResponseReader = TJsonReaderFactory<>::Create(ResponseString);
+	if (FJsonSerializer::Deserialize(ResponseReader, ResponseObject) && ResponseObject.IsValid())
+	{
+		const TSharedPtr<FJsonObject>* UsageObject = nullptr;
+		if (ResponseObject->TryGetObjectField(TEXT("usage"), UsageObject) && UsageObject && UsageObject->IsValid())
+		{
+			double PromptTokens = 0.0;
+			double CompletionTokens = 0.0;
+			(*UsageObject)->TryGetNumberField(TEXT("prompt_tokens"), PromptTokens);
+			(*UsageObject)->TryGetNumberField(TEXT("completion_tokens"), CompletionTokens);
+			LastAutonomyPromptTokens = FMath::Max(FMath::RoundToInt(PromptTokens), 0);
+			LastAutonomyCompletionTokens = FMath::Max(FMath::RoundToInt(CompletionTokens), 0);
+
+			const TSharedPtr<FJsonObject>* PromptDetails = nullptr;
+			if ((*UsageObject)->TryGetObjectField(TEXT("prompt_tokens_details"), PromptDetails)
+				&& PromptDetails
+				&& PromptDetails->IsValid())
+			{
+				double CachedTokens = 0.0;
+				(*PromptDetails)->TryGetNumberField(TEXT("cached_tokens"), CachedTokens);
+				LastAutonomyCachedPromptTokens = FMath::Max(FMath::RoundToInt(CachedTokens), 0);
+			}
+		}
+	}
+
+	FString Content;
+	FString ExtractError;
+	if (!ExtractOpenAIMessageContent(ResponseString, Content, ExtractError))
+	{
+		OnAutonomyDecisionError.Broadcast(RequestId, ExtractError);
+		return;
+	}
+
+	const FString CleanContent = CleanJsonContent(Content);
+	TSharedPtr<FJsonObject> DecisionObject;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(CleanContent);
+	if (!FJsonSerializer::Deserialize(Reader, DecisionObject) || !DecisionObject.IsValid())
+	{
+		OnAutonomyDecisionError.Broadcast(
+			RequestId,
+			FString::Printf(TEXT("Failed to parse autonomy JSON: %s"), *CleanContent));
+		return;
+	}
+
+	FString Decision;
+	DecisionObject->TryGetStringField(TEXT("decision"), Decision);
+	Decision = Decision.TrimStartAndEnd();
+
+	TArray<FString> Steps;
+	const TArray<TSharedPtr<FJsonValue>>* StepValues = nullptr;
+	if (DecisionObject->TryGetArrayField(TEXT("steps"), StepValues) && StepValues)
+	{
+		for (const TSharedPtr<FJsonValue>& StepValue : *StepValues)
+		{
+			FString Step;
+			if (StepValue.IsValid() && StepValue->TryGetString(Step))
+			{
+				Step = Step.TrimStartAndEnd();
+				if (!Step.IsEmpty())
+				{
+					Steps.Add(Step);
+				}
+			}
+		}
+	}
+
+	FString SelectedAction;
+	if (!Steps.IsEmpty())
+	{
+		SelectedAction = Steps[0];
+	}
+	else
+	{
+		DecisionObject->TryGetStringField(TEXT("selected_action"), SelectedAction);
+		SelectedAction = SelectedAction.TrimStartAndEnd();
+	}
+
+	if (Decision.IsEmpty())
+	{
+		Decision = SelectedAction.IsEmpty() || SelectedAction.Equals(TEXT("none"), ESearchCase::IgnoreCase)
+			? TEXT("wait")
+			: TEXT("start_plan");
+	}
+	if (Decision.Equals(TEXT("wait"), ESearchCase::IgnoreCase))
+	{
+		SelectedAction = TEXT("none");
+	}
+	else if (SelectedAction.IsEmpty())
+	{
+		OnAutonomyDecisionError.Broadcast(RequestId, TEXT("Autonomy plan response has no executable steps."));
+		return;
+	}
+
+	FString Reason;
+	DecisionObject->TryGetStringField(TEXT("reason"), Reason);
+	Reason = Reason.TrimStartAndEnd();
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[AutonomyLLM] decision received. RequestId=%d Decision=%s FirstAction=%s PromptTokens=%d CompletionTokens=%d Reason=%s"),
+		RequestId,
+		*Decision,
+		*SelectedAction,
+		LastAutonomyPromptTokens,
+		LastAutonomyCompletionTokens,
+		*Reason);
+	OnAutonomyDecisionReceived.Broadcast(RequestId, SelectedAction, Reason, CleanContent);
+}
+
+void ULLMClient::OnMemoryAppraisalResponseReceived(
+	FHttpRequestPtr Request,
+	FHttpResponsePtr Response,
+	bool bWasSuccessful,
+	int32 RequestId)
+{
+	if (RequestId != ActiveAppraisalRequestId)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[MemoryAppraisalLLM] ignored stale response. RequestId=%d"), RequestId);
+		return;
+	}
+
+	if (!bWasSuccessful || !Response.IsValid())
+	{
+		OnMemoryAppraisalError.Broadcast(RequestId, TEXT("Memory appraisal request failed."));
+		return;
+	}
+
+	const int32 ResponseCode = Response->GetResponseCode();
+	const FString ResponseString = Response->GetContentAsString();
+	if (ResponseCode != 200)
+	{
+		OnMemoryAppraisalError.Broadcast(
+			RequestId,
+			FString::Printf(
+				TEXT("Memory appraisal server error. Code=%d, Body=%s"),
+				ResponseCode,
+				*ResponseString));
+		return;
+	}
+
+	TSharedPtr<FJsonObject> ResponseObject;
+	TSharedRef<TJsonReader<>> ResponseReader = TJsonReaderFactory<>::Create(ResponseString);
+	if (FJsonSerializer::Deserialize(ResponseReader, ResponseObject) && ResponseObject.IsValid())
+	{
+		const TSharedPtr<FJsonObject>* UsageObject = nullptr;
+		if (ResponseObject->TryGetObjectField(TEXT("usage"), UsageObject) && UsageObject && UsageObject->IsValid())
+		{
+			double PromptTokens = 0.0;
+			double CompletionTokens = 0.0;
+			(*UsageObject)->TryGetNumberField(TEXT("prompt_tokens"), PromptTokens);
+			(*UsageObject)->TryGetNumberField(TEXT("completion_tokens"), CompletionTokens);
+			LastAppraisalPromptTokens = FMath::Max(FMath::RoundToInt(PromptTokens), 0);
+			LastAppraisalCompletionTokens = FMath::Max(FMath::RoundToInt(CompletionTokens), 0);
+
+			const TSharedPtr<FJsonObject>* PromptDetails = nullptr;
+			if ((*UsageObject)->TryGetObjectField(TEXT("prompt_tokens_details"), PromptDetails)
+				&& PromptDetails
+				&& PromptDetails->IsValid())
+			{
+				double CachedTokens = 0.0;
+				(*PromptDetails)->TryGetNumberField(TEXT("cached_tokens"), CachedTokens);
+				LastAppraisalCachedPromptTokens = FMath::Max(FMath::RoundToInt(CachedTokens), 0);
+			}
+		}
+	}
+
+	FString Content;
+	FString ExtractError;
+	if (!ExtractOpenAIMessageContent(ResponseString, Content, ExtractError))
+	{
+		OnMemoryAppraisalError.Broadcast(RequestId, ExtractError);
+		return;
+	}
+
+	const FString CleanContent = CleanJsonContent(Content);
+	TSharedPtr<FJsonObject> AppraisalObject;
+	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(CleanContent);
+	if (!FJsonSerializer::Deserialize(Reader, AppraisalObject) || !AppraisalObject.IsValid())
+	{
+		OnMemoryAppraisalError.Broadcast(
+			RequestId,
+			FString::Printf(TEXT("Failed to parse memory appraisal JSON: %s"), *CleanContent));
+		return;
+	}
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[MemoryAppraisalLLM] response received. RequestId=%d PromptTokens=%d CompletionTokens=%d JSON=%s"),
+		RequestId,
+		LastAppraisalPromptTokens,
+		LastAppraisalCompletionTokens,
+		*CleanContent);
+	OnMemoryAppraisalReceived.Broadcast(RequestId, CleanContent);
 }
 
 void ULLMClient::TryPlayNextQueuedSpeech()
@@ -1690,9 +2816,42 @@ void ULLMClient::PlaySpeechInternal(const FString& ReplyText, bool bQueuedServic
         return;
     }
 
-    OnLLMDisplayTextReceived.Broadcast(CleanReplyText);
-    UE_LOG(LogTemp, Warning, TEXT("[LLM] Broadcasting NPC subtitle: %s"), *CleanReplyText);
-    OnNPCSubtitleRequested.Broadcast(CleanReplyText);
+	PlaySpeechAndDisplayInternal(
+		CleanReplyText,
+		CleanReplyText,
+		bQueuedServiceSpeech,
+		bInterruptCurrent);
+}
+
+void ULLMClient::PlaySpeechAndDisplayInternal(
+	const FString& DisplayText,
+	const FString& SpeechText,
+	bool bQueuedServiceSpeech,
+	bool bInterruptCurrent)
+{
+	const FString CleanDisplayText = DisplayText.TrimStartAndEnd();
+	const FString CleanSpeechText = SanitizeReplyTextForSpeechAndDisplay(SpeechText);
+	if (CleanDisplayText.IsEmpty() && CleanSpeechText.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[LLM] display and speech text are empty; skipping output"));
+		return;
+	}
+
+	if (!CleanDisplayText.IsEmpty())
+	{
+		if (const UWorld* World = ResolveSpeechWorld())
+		{
+			LastInteractiveOutputWorldTime = World->GetTimeSeconds();
+		}
+		OnLLMDisplayTextReceived.Broadcast(CleanDisplayText);
+		UE_LOG(LogTemp, Warning, TEXT("[LLM] Broadcasting NPC subtitle: %s"), *CleanDisplayText);
+		OnNPCSubtitleRequested.Broadcast(CleanDisplayText);
+	}
+
+	if (CleanSpeechText.IsEmpty())
+	{
+		return;
+	}
 
     if (bUseVoicevoxTTS)
     {
@@ -1713,7 +2872,7 @@ void ULLMClient::PlaySpeechInternal(const FString& ReplyText, bool bQueuedServic
             }
 
             bCurrentAudioIsQueuedServiceSpeech = bQueuedServiceSpeech;
-            ResolvedVoicevoxTTSClient->GenerateVoice(CleanReplyText);
+            ResolvedVoicevoxTTSClient->GenerateVoice(CleanSpeechText);
 
             if (bQueuedServiceSpeech)
             {
@@ -1740,7 +2899,7 @@ void ULLMClient::PlaySpeechInternal(const FString& ReplyText, bool bQueuedServic
         UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] VoicevoxTTSClient not found. Falling back to existing TTS path."));
     }
 
-    OnLLMResponseReceived.Broadcast(CleanReplyText);
+    OnLLMResponseReceived.Broadcast(CleanSpeechText);
 
     if (bQueuedServiceSpeech)
     {
@@ -1765,6 +2924,7 @@ void ULLMClient::HandleVoicevoxSpeechFinished()
     if (!bCurrentAudioIsQueuedServiceSpeech)
     {
         DispatchDeferredStrategyActionIfReady();
+        OnInteractiveReplyFinished.Broadcast();
     }
     HandleQueuedVoicevoxSpeechFinished();
 }

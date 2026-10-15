@@ -43,6 +43,9 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Food Carry")
 	FVector TablePlaceOffset;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Food Carry")
+	FVector CounterPlaceOffset;
+
 	UPROPERTY(BlueprintReadOnly, Category = "Food Carry")
 	AActor* CarriedFoodActor;
 
@@ -51,6 +54,15 @@ public:
 
 	UPROPERTY(BlueprintReadOnly, Category = "Food Carry")
 	bool bIsCarryingFood;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Food Carry")
+	AActor* LastPlacedFoodActor;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Food Carry")
+	AActor* LastPlacedTableActor;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Food Carry")
+	FString LastPlacedFoodItemName;
 
 	UPROPERTY(BlueprintAssignable, Category = "Food Carry")
 	FFoodCarryStateChangedSignature OnFoodCarryStateChanged;
@@ -63,6 +75,12 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "Food Carry")
 	bool PlaceCarriedFoodOnTable(AActor* TableActor);
+
+	UFUNCTION(BlueprintCallable, Category = "Food Carry")
+	bool PickUpPlacedFoodFromTable(AActor* TableActor);
+
+	UFUNCTION(BlueprintCallable, Category = "Food Carry")
+	bool PlaceCarriedFoodAtCounter();
 
 	UFUNCTION(BlueprintCallable, Category = "Food Carry")
 	void ClearCarriedFood();

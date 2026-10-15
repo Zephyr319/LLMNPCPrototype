@@ -15,6 +15,7 @@
 #include "NPCFoodCarryComponent.h"
 #include "TableMarkerActor.h"
 #include "UObject/UnrealType.h"
+#include "WaterablePlantActor.h"
 
 namespace
 {
@@ -129,8 +130,6 @@ UNPCMoveToTableComponent::UNPCMoveToTableComponent()
 	CurrentMoveSpeed = 0.0f;
 	CurrentMoveVelocity = FVector::ZeroVector;
 	bMovementPausedByServiceGesture = false;
-	ServiceGesturePauseAnchorLocation = FVector::ZeroVector;
-	bHasServiceGesturePauseAnchor = false;
 	FacingYawOffsetDegrees = 0.0f;
 	bFaceMovementDirection = true;
 	bFaceTableOnArrival = true;
@@ -173,20 +172,20 @@ UNPCMoveToTableComponent::UNPCMoveToTableComponent()
 	GuideStartPlayerDistanceThreshold = 320.0f;
 	GuideStartApproachPlayerDistance = 160.0f;
 	GuidePausedLineVariants = {
-		TEXT("お客様、大丈夫ですか？こちらへどうぞ。"),
-		TEXT("すみません、少し離れてしまいました。こちらです。"),
-		TEXT("お客様、こちらについてきてください。"),
-		TEXT("こちらでお待ちしていますね。")
+		TEXT("先生、大丈夫ですか？アリスはこちらです。"),
+		TEXT("先生との距離が開きました。ここで待機します。"),
+		TEXT("先生、アリスについてきてください。"),
+		TEXT("アリスはここで先生を待ちます。")
 	};
 	GuideResumedLineVariants = {
-		TEXT("ありがとうございます。それではご案内します。"),
-		TEXT("では、続きをご案内しますね。"),
-		TEXT("こちらです。ゆっくりお進みください。")
+		TEXT("合流完了です。それでは案内を再開します！"),
+		TEXT("先生、クエストの続きを始めます。"),
+		TEXT("こちらです。ゆっくり進みましょう、先生。")
 	};
 	GuideArrivedLineVariants = {
-		TEXT("こちらのお席へどうぞ。"),
-		TEXT("こちらがご案内のお席です。"),
-		TEXT("どうぞ、こちらにお掛けください。")
+		TEXT("目的地に到着しました。こちらの席へどうぞ、先生。"),
+		TEXT("案内クエスト完了です。こちらが先生の席です。"),
+		TEXT("先生、どうぞこちらに座ってください。")
 	};
 	LastFollowPlayerLocation = FVector::ZeroVector;
 	LastFollowGoalLocation = FVector::ZeroVector;
@@ -256,7 +255,6 @@ void UNPCMoveToTableComponent::TickComponent(float DeltaTime, ELevelTick TickTyp
 
 	if (bMovementPausedByServiceGesture)
 	{
-		CheckPausedActorLocation(Owner, TEXT("TickComponent"));
 		CurrentMoveVelocity = FVector::ZeroVector;
 		CurrentMoveSpeed = 0.0f;
 		SetOwnerComponentVelocity(Owner, CurrentMoveVelocity);
@@ -392,9 +390,8 @@ bool UNPCMoveToTableComponent::MoveToTableByID(const FString& TargetTableID)
 {
 	LogMovementRequest(TEXT("MoveToTableByID"), TargetTableID);
 
-	if (bMovementPausedByServiceGesture)
+	if (BlockMovementStartIfServiceGesturePaused(TEXT("MoveToTableByID"), TargetTableID))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *TargetTableID);
 		return false;
 	}
 
@@ -427,9 +424,8 @@ bool UNPCMoveToTableComponent::MoveToTableByHint(const FString& TargetHint, AAct
 {
 	LogMovementRequest(TEXT("MoveToTableByHint"), TargetHint);
 
-	if (bMovementPausedByServiceGesture)
+	if (BlockMovementStartIfServiceGesturePaused(TEXT("MoveToTableByHint"), TargetHint))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *TargetHint);
 		return false;
 	}
 
@@ -523,9 +519,8 @@ bool UNPCMoveToTableComponent::MoveNearActor(AActor* TargetActor, float StopDist
 	const FString RequestedTargetName = TargetActor ? TargetActor->GetName() : TEXT("");
 	LogMovementRequest(TEXT("MoveNearActor"), RequestedTargetName);
 
-	if (bMovementPausedByServiceGesture)
+	if (BlockMovementStartIfServiceGesturePaused(TEXT("MoveNearActor"), RequestedTargetName))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *RequestedTargetName);
 		return false;
 	}
 
@@ -594,9 +589,8 @@ bool UNPCMoveToTableComponent::MoveNearPlayer(float StopDistance)
 {
 	LogMovementRequest(TEXT("MoveNearPlayer"), TEXT("player"));
 
-	if (bMovementPausedByServiceGesture)
+	if (BlockMovementStartIfServiceGesturePaused(TEXT("MoveNearPlayer"), TEXT("player")))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=player"));
 		return false;
 	}
 
@@ -633,9 +627,8 @@ void UNPCMoveToTableComponent::StartFollowingPlayer(float DesiredDistance)
 {
 	LogMovementRequest(TEXT("StartFollowingPlayer"), TEXT("player"));
 
-	if (bMovementPausedByServiceGesture)
+	if (BlockMovementStartIfServiceGesturePaused(TEXT("StartFollowingPlayer"), TEXT("player")))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=player"));
 		return;
 	}
 
@@ -805,9 +798,8 @@ bool UNPCMoveToTableComponent::StartGuideToTable(const FString& TableID)
 	UE_LOG(LogTemp, Warning, TEXT("[Guide] Requested table target: %s"), *RequestedTableID);
 	LogMovementRequest(TEXT("StartGuideToTable"), RequestedTableID);
 
-	if (bMovementPausedByServiceGesture)
+	if (BlockMovementStartIfServiceGesturePaused(TEXT("StartGuideToTable"), RequestedTableID))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *RequestedTableID);
 		return false;
 	}
 
@@ -877,9 +869,8 @@ bool UNPCMoveToTableComponent::StartGuideToSceneTag(const FString& TargetTag)
 	const FString TrimmedTargetTag = TargetTag.TrimStartAndEnd();
 	LogMovementRequest(TEXT("StartGuideToSceneTag"), TrimmedTargetTag);
 
-	if (bMovementPausedByServiceGesture)
+	if (BlockMovementStartIfServiceGesturePaused(TEXT("StartGuideToSceneTag"), TrimmedTargetTag))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *TrimmedTargetTag);
 		return false;
 	}
 
@@ -988,10 +979,11 @@ FString UNPCMoveToTableComponent::GetCurrentGuideTargetID() const
 	return GuideTargetID;
 }
 
-void UNPCMoveToTableComponent::GetOwnerActionQueueState(bool& bOutFarewellBowInProgress, bool& bOutActionQueuePausedForFarewellBow) const
+void UNPCMoveToTableComponent::GetOwnerActionQueueState(bool& bOutFarewellBowInProgress, bool& bOutActionQueuePausedForFarewellBow, bool& bOutBowMovementLockActive) const
 {
 	bOutFarewellBowInProgress = false;
 	bOutActionQueuePausedForFarewellBow = false;
+	bOutBowMovementLockActive = false;
 
 	const AActor* Owner = GetOwner();
 	if (!Owner)
@@ -1007,23 +999,26 @@ void UNPCMoveToTableComponent::GetOwnerActionQueueState(bool& bOutFarewellBowInP
 
 	bOutFarewellBowInProgress = ActionQueueComponent->IsFarewellBowInProgress();
 	bOutActionQueuePausedForFarewellBow = ActionQueueComponent->IsActionQueuePausedForFarewellBow();
+	bOutBowMovementLockActive = ActionQueueComponent->IsBowMovementLockActive();
 }
 
 void UNPCMoveToTableComponent::LogMovementRequest(const TCHAR* FunctionName, const FString& Target) const
 {
 	bool bFarewellBow = false;
 	bool bActionQueuePaused = false;
-	GetOwnerActionQueueState(bFarewellBow, bActionQueuePaused);
+	bool bBowMovementLock = false;
+	GetOwnerActionQueueState(bFarewellBow, bActionQueuePaused, bBowMovementLock);
 
 	UE_LOG(
 		LogTemp,
 		Warning,
-		TEXT("[NPCMove][REQUEST] %s Target=%s Pause=%d FarewellBow=%d ActionQueuePaused=%d IsGuiding=%d GuideTarget=%s"),
+		TEXT("[NPCMove][REQUEST] %s Target=%s Pause=%d FarewellBow=%d ActionQueuePaused=%d BowLock=%d IsGuiding=%d GuideTarget=%s"),
 		FunctionName ? FunctionName : TEXT("unknown"),
 		*Target,
 		bMovementPausedByServiceGesture ? 1 : 0,
 		bFarewellBow ? 1 : 0,
 		bActionQueuePaused ? 1 : 0,
+		bBowMovementLock ? 1 : 0,
 		bIsGuidingPlayer ? 1 : 0,
 		*GuideTargetID);
 }
@@ -1042,57 +1037,46 @@ void UNPCMoveToTableComponent::LogTickMoveState(const FVector& CurrentLocation, 
 
 	bool bFarewellBow = false;
 	bool bActionQueuePaused = false;
-	GetOwnerActionQueueState(bFarewellBow, bActionQueuePaused);
+	bool bBowMovementLock = false;
+	GetOwnerActionQueueState(bFarewellBow, bActionQueuePaused, bBowMovementLock);
 
 	UE_LOG(
 		LogTemp,
 		VeryVerbose,
-		TEXT("[NPCMove][TICK_MOVE] Actor moving while Pause=%d FarewellBow=%d ActionQueuePaused=%d IsGuiding=%d Location=%s Target=%s GuideTarget=%s"),
+		TEXT("[NPCMove][TICK_MOVE] Actor moving while Pause=%d FarewellBow=%d ActionQueuePaused=%d BowLock=%d IsGuiding=%d Location=%s Target=%s GuideTarget=%s"),
 		bMovementPausedByServiceGesture ? 1 : 0,
 		bFarewellBow ? 1 : 0,
 		bActionQueuePaused ? 1 : 0,
+		bBowMovementLock ? 1 : 0,
 		bIsGuidingPlayer ? 1 : 0,
 		*CurrentLocation.ToString(),
 		*MoveTarget.ToString(),
 		*GuideTargetID);
 }
 
-void UNPCMoveToTableComponent::CheckPausedActorLocation(AActor* Owner, const TCHAR* Context)
+bool UNPCMoveToTableComponent::BlockMovementStartIfServiceGesturePaused(const TCHAR* FunctionName, const FString& Target) const
 {
-	if (!Owner || !bHasServiceGesturePauseAnchor)
+	bool bFarewellBow = false;
+	bool bActionQueuePaused = false;
+	bool bBowMovementLock = false;
+	GetOwnerActionQueueState(bFarewellBow, bActionQueuePaused, bBowMovementLock);
+	if (!bMovementPausedByServiceGesture && !bActionQueuePaused && !bBowMovementLock)
 	{
-		return;
+		return false;
 	}
 
-	const FVector CurrentLocation = Owner->GetActorLocation();
-	if (bLogTickMovement)
-	{
-		bool bFarewellBow = false;
-		bool bActionQueuePaused = false;
-		GetOwnerActionQueueState(bFarewellBow, bActionQueuePaused);
-
-		UE_LOG(
-			LogTemp,
-			VeryVerbose,
-			TEXT("[NPCMove][BLOCKED_TICK] Movement tick blocked by service gesture pause. Context=%s Pause=1 FarewellBow=%d ActionQueuePaused=%d IsGuiding=%d Location=%s Anchor=%s"),
-			Context ? Context : TEXT("unknown"),
-			bFarewellBow ? 1 : 0,
-			bActionQueuePaused ? 1 : 0,
-			bIsGuidingPlayer ? 1 : 0,
-			*CurrentLocation.ToString(),
-			*ServiceGesturePauseAnchorLocation.ToString());
-	}
-
-	if (!CurrentLocation.Equals(ServiceGesturePauseAnchorLocation, 1.0f))
-	{
-		UE_LOG(
-			LogTemp,
-			Warning,
-			TEXT("[NPCMove][WARNING] Actor location changed while movement is paused. Possible root motion or Blueprint movement. Current=%s Anchor=%s"),
-			*CurrentLocation.ToString(),
-			*ServiceGesturePauseAnchorLocation.ToString());
-		Owner->SetActorLocation(ServiceGesturePauseAnchorLocation, false);
-	}
+	UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Movement start blocked by service gesture pause / bow lock."));
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[NPCMove] Movement start blocked. Function=%s Target=%s Pause=%d FarewellBow=%d ActionQueuePaused=%d BowLock=%d"),
+		FunctionName ? FunctionName : TEXT("unknown"),
+		*Target,
+		bMovementPausedByServiceGesture ? 1 : 0,
+		bFarewellBow ? 1 : 0,
+		bActionQueuePaused ? 1 : 0,
+		bBowMovementLock ? 1 : 0);
+	return true;
 }
 
 bool UNPCMoveToTableComponent::MoveToFurnitureByID(const FString& FurnitureID)
@@ -1327,6 +1311,15 @@ bool UNPCMoveToTableComponent::MoveToSceneTargetByID(const FString& TargetID)
 		}
 	}
 
+	for (TActorIterator<AWaterablePlantActor> It(World); It; ++It)
+	{
+		AWaterablePlantActor* Plant = *It;
+		if (Plant && Plant->bEnabled && Plant->PlantID.Equals(TargetID, ESearchCase::IgnoreCase))
+		{
+			return StartMovingToWaterablePlant(Plant);
+		}
+	}
+
 	for (TActorIterator<ACafeTargetPointActor> It(World); It; ++It)
 	{
 		ACafeTargetPointActor* TargetPoint = *It;
@@ -1344,9 +1337,8 @@ bool UNPCMoveToTableComponent::MoveToSceneTargetByTag(const FString& TargetTag)
 {
 	LogMovementRequest(TEXT("MoveToSceneTargetByTag"), TargetTag);
 
-	if (bMovementPausedByServiceGesture)
+	if (BlockMovementStartIfServiceGesturePaused(TEXT("MoveToSceneTargetByTag"), TargetTag))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *TargetTag);
 		return false;
 	}
 
@@ -1391,7 +1383,9 @@ bool UNPCMoveToTableComponent::MoveToSceneTargetByTag(const FString& TargetTag)
 	for (TActorIterator<ATableMarkerActor> It(World); It; ++It)
 	{
 		ATableMarkerActor* TableMarker = *It;
-		if (!TableMarker || !DoesTagMatchStringArray(TargetTag, TableMarker->GetTableTags()))
+		if (!TableMarker
+			|| (!TableMarker->GetTableID().Equals(TargetTag.TrimStartAndEnd(), ESearchCase::IgnoreCase)
+				&& !DoesTagMatchStringArray(TargetTag, TableMarker->GetTableTags())))
 		{
 			continue;
 		}
@@ -1420,7 +1414,17 @@ bool UNPCMoveToTableComponent::MoveToSceneTargetByTag(const FString& TargetTag)
 		FVector FurnitureMoveLocation = FVector::ZeroVector;
 		if (!ResolveFurnitureMoveLocation(FurnitureMarker, FurnitureMoveLocation))
 		{
-			continue;
+			if (!TargetTag.Equals(TEXT("counter"), ESearchCase::IgnoreCase))
+			{
+				continue;
+			}
+
+			FurnitureMoveLocation = FurnitureMarker->GetNPCStandTransform().GetLocation();
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[NPCMove] Counter navigation approach unavailable; using NPCStandPoint fallback. Furniture=%s"),
+				*FurnitureID);
 		}
 
 		ConsiderTarget(
@@ -1431,6 +1435,31 @@ bool UNPCMoveToTableComponent::MoveToSceneTargetByTag(const FString& TargetTag)
 			TEXT("Furniture"),
 			FurnitureID,
 			FString::Printf(TEXT("Move to furniture: %s"), *FurnitureID));
+	}
+
+	for (TActorIterator<AWaterablePlantActor> It(World); It; ++It)
+	{
+		AWaterablePlantActor* Plant = *It;
+		if (!Plant || !Plant->IsAvailableForTag(TargetTag))
+		{
+			continue;
+		}
+
+		FVector PlantMoveLocation = FVector::ZeroVector;
+		if (!ResolveWaterablePlantMoveLocation(Plant, PlantMoveLocation))
+		{
+			continue;
+		}
+
+		const FVector PlantLocation = Plant->GetPlantTargetLocation();
+		ConsiderTarget(
+			Plant->Priority,
+			PlantLocation,
+			PlantMoveLocation,
+			PlantLocation,
+			TEXT("WaterablePlant"),
+			Plant->PlantID,
+			FString::Printf(TEXT("Move to waterable plant: %s"), *Plant->PlantID));
 	}
 
 	for (TActorIterator<ACafeTargetPointActor> It(World); It; ++It)
@@ -1455,10 +1484,30 @@ bool UNPCMoveToTableComponent::MoveToSceneTargetByTag(const FString& TargetTag)
 
 	if (bHasBestTarget)
 	{
+		if (BestMoveReason == FName(TEXT("WaterablePlant")))
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[WaterablePlantMove] Selected ID=%s MoveLocation=%s PlantLocation=%s Distance=%.1f Priority=%d"),
+				*BestTargetID,
+				*BestMoveLocation.ToCompactString(),
+				*BestFaceLocation.ToCompactString(),
+				FMath::Sqrt(BestDistanceSq),
+				BestPriority);
+		}
+
 		const FString SceneTagDebugMessage = TargetTag.Equals(TEXT("counter"), ESearchCase::IgnoreCase)
 			? FString::Printf(TEXT("Move to scene target by tag: %s"), *TargetTag)
 			: BestDebugMessage;
-		return StartMovingToLocation(BestMoveLocation, BestFaceLocation, BestMoveReason, BestTargetID, SceneTagDebugMessage, true);
+		const bool bRequireNavigationPath = !TargetTag.Equals(TEXT("counter"), ESearchCase::IgnoreCase);
+		return StartMovingToLocation(
+			BestMoveLocation,
+			BestFaceLocation,
+			BestMoveReason,
+			BestTargetID,
+			SceneTagDebugMessage,
+			bRequireNavigationPath);
 	}
 
 	FailMoveToTable(FString::Printf(TEXT("Scene target tag not found: %s"), *TargetTag));
@@ -1511,23 +1560,46 @@ void UNPCMoveToTableComponent::StopCurrentMovement()
 	UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Current movement cancelled."));
 }
 
+void UNPCMoveToTableComponent::CancelActiveMovementForServiceGesture()
+{
+	bIsFollowingPlayer = false;
+	bFollowMoveInProgress = false;
+	FollowPlayerActor.Reset();
+	FollowUpdateTimer = 0.0f;
+	FollowRepathTimer = 0.0f;
+	FollowDebugTimer = 0.0f;
+	LastFollowPlayerLocation = FVector::ZeroVector;
+	LastFollowGoalLocation = FVector::ZeroVector;
+
+	bIsGuidingPlayer = false;
+	bGuidePausedForPlayer = false;
+	GuidePlayerPhase = EGuidePlayerPhase::None;
+	GuidePlayerActor.Reset();
+	GuideCheckTimer = 0.0f;
+	GuideTargetType = TEXT("");
+	GuideTargetID = TEXT("");
+	bPreserveMovementModeForGuideMove = false;
+	bGuideStartedEventBroadcasted = false;
+	bGuideArrivedEventBroadcasted = false;
+	LastGuideStartedTime = 0.0;
+	bGuideStartGraceLogPrinted = false;
+
+	ClearMovementState();
+	TargetLocation = FVector::ZeroVector;
+	TargetTableLocation = FVector::ZeroVector;
+	CurrentTargetTableID = TEXT("");
+	CurrentMoveReason = NAME_None;
+	CurrentMoveTargetID = TEXT("");
+	SetMovementMode(ENPCMovementMode::Idle);
+
+	UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Active movement cancelled for service gesture."));
+}
+
 void UNPCMoveToTableComponent::SetMovementPausedByServiceGesture(bool bPaused)
 {
 	bMovementPausedByServiceGesture = bPaused;
 	if (bPaused)
 	{
-		if (AActor* Owner = GetOwner())
-		{
-			ServiceGesturePauseAnchorLocation = Owner->GetActorLocation();
-			bHasServiceGesturePauseAnchor = true;
-			UE_LOG(LogTemp, Warning, TEXT("[NPCMove][BOW_LOCATION] movement pause anchor location=%s"), *ServiceGesturePauseAnchorLocation.ToString());
-		}
-		else
-		{
-			ServiceGesturePauseAnchorLocation = FVector::ZeroVector;
-			bHasServiceGesturePauseAnchor = false;
-		}
-
 		CurrentMoveVelocity = FVector::ZeroVector;
 		CurrentMoveSpeed = 0.0f;
 		SetOwnerComponentVelocity(GetOwner(), CurrentMoveVelocity);
@@ -1535,16 +1607,6 @@ void UNPCMoveToTableComponent::SetMovementPausedByServiceGesture(bool bPaused)
 		return;
 	}
 
-	if (AActor* Owner = GetOwner())
-	{
-		UE_LOG(
-			LogTemp,
-			Warning,
-			TEXT("[NPCMove][BOW_LOCATION] movement pause released location=%s Anchor=%s"),
-			*Owner->GetActorLocation().ToString(),
-			*ServiceGesturePauseAnchorLocation.ToString());
-	}
-	bHasServiceGesturePauseAnchor = false;
 	UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Movement pause released by service gesture."));
 }
 
@@ -1692,6 +1754,30 @@ bool UNPCMoveToTableComponent::StartMovingToTargetPoint(const ACafeTargetPointAc
 		true);
 }
 
+bool UNPCMoveToTableComponent::StartMovingToWaterablePlant(AWaterablePlantActor* Plant)
+{
+	if (!Plant)
+	{
+		FailMoveToTable(TEXT("Waterable plant missing"));
+		return false;
+	}
+
+	FVector MoveLocation = FVector::ZeroVector;
+	if (!ResolveWaterablePlantMoveLocation(Plant, MoveLocation))
+	{
+		FailMoveToTable(FString::Printf(TEXT("Waterable plant path failed: %s"), *Plant->PlantID));
+		return false;
+	}
+
+	return StartMovingToLocation(
+		MoveLocation,
+		Plant->GetPlantTargetLocation(),
+		TEXT("WaterablePlant"),
+		Plant->PlantID,
+		FString::Printf(TEXT("Move to waterable plant: %s"), *Plant->PlantID),
+		true);
+}
+
 bool UNPCMoveToTableComponent::StartMovingToLocation(const FVector& MoveLocation, const FVector& FaceLocation, const FName& MoveReason, const FString& TargetID, const FString& DebugMessage, bool bRequireNavigationPath)
 {
 	LogMovementRequestLocation(TEXT("StartMovingToLocation"), FString::Printf(TEXT("%s Reason=%s"), *TargetID, *MoveReason.ToString()), MoveLocation);
@@ -1703,9 +1789,8 @@ bool UNPCMoveToTableComponent::StartMovingToLocation(const FVector& MoveLocation
 		return false;
 	}
 
-	if (bMovementPausedByServiceGesture)
+	if (BlockMovementStartIfServiceGesturePaused(TEXT("StartMovingToLocation"), TargetID))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[NPCMove] Move request blocked because movement is paused by service gesture. Target=%s"), *TargetID);
 		return false;
 	}
 
@@ -1948,11 +2033,6 @@ bool UNPCMoveToTableComponent::ResolveFurnitureMoveLocation(AFurnitureMarkerActo
 		return false;
 	}
 
-	if (bUseAutomaticApproachLocation && ResolveApproachLocationForActor(FurnitureMarker, FurnitureMarker->FurnitureType, OutMoveLocation))
-	{
-		return true;
-	}
-
 	auto TryReachableApproachLocation = [&](const FVector& CandidateLocation, FVector& OutReachableLocation) -> bool
 	{
 		FVector ProjectedLocation = CandidateLocation;
@@ -1974,6 +2054,35 @@ bool UNPCMoveToTableComponent::ResolveFurnitureMoveLocation(AFurnitureMarkerActo
 		OutReachableLocation = ProjectedLocation;
 		return true;
 	};
+
+	const bool bIsCounter = FurnitureMarker->FurnitureType.TrimStartAndEnd().Equals(
+		TEXT("counter"),
+		ESearchCase::IgnoreCase);
+	if (bIsCounter
+		&& TryReachableApproachLocation(FurnitureMarker->GetNPCStandTransform().GetLocation(), OutMoveLocation))
+	{
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[NPCMove] Counter uses fixed NPCStandPoint. Furniture=%s Location=%s"),
+			*FurnitureMarker->FurnitureID,
+			*OutMoveLocation.ToCompactString());
+		return true;
+	}
+
+	if (bUseAutomaticApproachLocation && ResolveApproachLocationForActor(FurnitureMarker, FurnitureMarker->FurnitureType, OutMoveLocation))
+	{
+		if (bIsCounter)
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[NPCMove] Counter NPCStandPoint is unreachable; using automatic approach. Furniture=%s Location=%s"),
+				*FurnitureMarker->FurnitureID,
+				*OutMoveLocation.ToCompactString());
+		}
+		return true;
+	}
 
 	if (TryReachableApproachLocation(FurnitureMarker->GetNPCStandTransform().GetLocation(), OutMoveLocation))
 	{
@@ -2048,7 +2157,7 @@ bool UNPCMoveToTableComponent::ResolveFurnitureMoveLocation(AFurnitureMarkerActo
 	return false;
 }
 
-bool UNPCMoveToTableComponent::ResolveApproachLocationForActor(AActor* TargetActor, const FString& TargetType, FVector& OutApproachLocation)
+bool UNPCMoveToTableComponent::ResolveApproachLocationForActor(AActor* TargetActor, const FString& TargetType, FVector& OutApproachLocation, float DesiredDistanceOverride)
 {
 	AActor* Owner = GetOwner();
 	if (!Owner || !IsValid(TargetActor))
@@ -2079,6 +2188,14 @@ bool UNPCMoveToTableComponent::ResolveApproachLocationForActor(AActor* TargetAct
 	else if (NormalizedTargetType.Equals(TEXT("table"), ESearchCase::IgnoreCase))
 	{
 		DesiredDistance = 120.0f;
+	}
+	else if (NormalizedTargetType.Equals(TEXT("plant"), ESearchCase::IgnoreCase))
+	{
+		DesiredDistance = 95.0f;
+	}
+	if (DesiredDistanceOverride > KINDA_SMALL_NUMBER)
+	{
+		DesiredDistance = DesiredDistanceOverride;
 	}
 
 	FVector TargetCenter = TargetActor->GetActorLocation();
@@ -2179,19 +2296,32 @@ bool UNPCMoveToTableComponent::ResolveApproachLocationForActor(AActor* TargetAct
 		}
 	}
 
-	if (bPrintApproachCandidateRejectReasons)
+	const bool bIsPlantTarget = NormalizedTargetType.Equals(TEXT("plant"), ESearchCase::IgnoreCase);
+	if (bPrintApproachCandidateRejectReasons || bIsPlantTarget)
 	{
 		const FString StatsMessage = FString::Printf(
-			TEXT("Approach resolve for %s | NavProjectFailed=%d PathFailed=%d BlockedByOverlap=%d InsideBounds=%d TooClose=%d Valid=%d"),
+			TEXT("[ApproachResolve] Target=%s Type=%s NavProjectFailed=%d PathFailed=%d BlockedByOverlap=%d InsideBounds=%d TooClose=%d Valid=%d"),
 			*GetApproachDebugTargetName(TargetActor),
+			*NormalizedTargetType,
 			RejectStats.NavProjectFailed,
 			RejectStats.PathFailed,
 			RejectStats.BlockedByOverlap,
 			RejectStats.InsideBounds,
 			RejectStats.TooClose,
 			RejectStats.Valid);
-		UE_LOG(LogTemp, Warning, TEXT("%s"), *StatsMessage);
-		PrintDebugMessage(StatsMessage, RejectStats.Valid > 0 ? FColor::Green : FColor::Red);
+		if (RejectStats.Valid > 0)
+		{
+			UE_LOG(LogTemp, Log, TEXT("%s"), *StatsMessage);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("%s"), *StatsMessage);
+		}
+
+		if (bPrintApproachCandidateRejectReasons)
+		{
+			PrintDebugMessage(StatsMessage, RejectStats.Valid > 0 ? FColor::Green : FColor::Red);
+		}
 	}
 
 	if (Candidates.Num() <= 0)
@@ -2220,6 +2350,41 @@ bool UNPCMoveToTableComponent::ResolveApproachLocationForActor(AActor* TargetAct
 	}
 
 	return true;
+}
+
+bool UNPCMoveToTableComponent::ResolveWaterablePlantMoveLocation(AWaterablePlantActor* Plant, FVector& OutMoveLocation)
+{
+	if (!Plant)
+	{
+		return false;
+	}
+
+	AActor* PlantTargetActor = Plant->GetPlantTargetActor();
+	const bool bResolved = PlantTargetActor
+		&& ResolveApproachLocationForActor(PlantTargetActor, TEXT("plant"), OutMoveLocation, Plant->ApproachDistance);
+
+	if (bResolved)
+	{
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[WaterablePlantMove] Candidate ID=%s Target=%s MoveLocation=%s"),
+			*Plant->PlantID,
+			*GetApproachDebugTargetName(PlantTargetActor),
+			*OutMoveLocation.ToCompactString());
+	}
+	else
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[WaterablePlantMove] No reachable approach point. ID=%s Target=%s PlantLocation=%s"),
+			*Plant->PlantID,
+			*GetApproachDebugTargetName(PlantTargetActor),
+			*Plant->GetPlantTargetLocation().ToCompactString());
+	}
+
+	return bResolved;
 }
 
 float UNPCMoveToTableComponent::ScoreApproachCandidate(const FVector& CandidateLocation, const FVector& OwnerLocation, const FVector& ApproachTargetLocation, const FVector& TargetForward, float DesiredDistance, bool bHasLineOfSight, float PathLength) const
@@ -2272,8 +2437,14 @@ bool UNPCMoveToTableComponent::IsApproachLocationFree(const FVector& Location, c
 		QueryParams.AddIgnoredActor(TargetActor);
 	}
 
-	const FCollisionShape CollisionShape = FCollisionShape::MakeCapsule(ApproachCollisionRadius, ApproachCollisionHalfHeight);
-	return !World->OverlapBlockingTestByChannel(Location, FQuat::Identity, ECC_Pawn, CollisionShape, QueryParams);
+	const float SafeCapsuleHalfHeight = FMath::Max(ApproachCollisionHalfHeight, ApproachCollisionRadius);
+	const FCollisionShape CollisionShape = FCollisionShape::MakeCapsule(ApproachCollisionRadius, SafeCapsuleHalfHeight);
+
+	// Navigation points describe the character's feet. Collision overlap tests expect
+	// the capsule center, so testing directly at ground height incorrectly overlaps the floor.
+	FVector CapsuleCenter = Location;
+	CapsuleCenter.Z += SafeCapsuleHalfHeight + 2.0f;
+	return !World->OverlapBlockingTestByChannel(CapsuleCenter, FQuat::Identity, ECC_Pawn, CollisionShape, QueryParams);
 }
 
 float UNPCMoveToTableComponent::CalculateRemainingPathDistance() const

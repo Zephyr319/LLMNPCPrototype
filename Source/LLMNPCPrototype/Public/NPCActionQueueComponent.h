@@ -8,6 +8,12 @@
 #include "NPCActionQueueComponent.generated.h"
 
 class AActor;
+class UAnimInstance;
+class UAnimMontage;
+class UAnimSequenceBase;
+class USkeletalMeshComponent;
+class UStaticMesh;
+class UStaticMeshComponent;
 class UNPCFaceTargetComponent;
 class UNPCFoodCarryComponent;
 class UNPCMoveToTableComponent;
@@ -22,6 +28,11 @@ enum class ENPCQueuedActionType : uint8
 	MoveToFurnitureID,
 	MoveNearPlayer,
 	Wait,
+	Animation,
+	AttachHeldProp,
+	RemoveHeldProp,
+	PickUpPlacedFood,
+	PlaceCarriedFoodAtCounter,
 	FacePlayer,
 	Stop
 };
@@ -38,11 +49,26 @@ struct FNPCQueuedAction
 	float WaitSeconds = 0.0f;
 
 	float StopDistance = 140.0f;
+
+	UAnimSequenceBase* Animation = nullptr;
+
+	FName AnimationSlotName = FName(TEXT("DefaultSlot"));
+
+	float AnimationPlayRate = 1.0f;
+
+	UStaticMesh* HeldPropMesh = nullptr;
+
+	FName HeldPropSocketName = FName(TEXT("RightHand"));
+
+	FTransform HeldPropRelativeTransform = FTransform::Identity;
 };
 
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FQueueSpeakRequestedSignature, FString, Text);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FQueueGestureRequestedSignature, FName, GestureName);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FActionQueueFinishedSignature, bool, bSuccess);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FPostSeatingMenuGuidanceFinishedSignature);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOrderStartedSignature, FString, TableID, FString, Item);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOrderServedSignature, FString, TableID, FString, Item);
 
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class UNPCActionQueueComponent : public UActorComponent
@@ -82,6 +108,15 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "NPC Action Queue|Order")
 	FQueueGestureRequestedSignature OnQueueGestureRequested;
 
+	UPROPERTY(BlueprintAssignable, Category = "NPC Action Queue|Order")
+	FOrderStartedSignature OnOrderStarted;
+
+	UPROPERTY(BlueprintAssignable, Category = "NPC Action Queue|Order")
+	FOrderServedSignature OnOrderServed;
+
+	UPROPERTY(BlueprintAssignable, Category = "NPC Action Queue")
+	FActionQueueFinishedSignature OnActionQueueFinished;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Action Queue|Order")
 	bool bReturnToCounterAfterServing;
 
@@ -106,7 +141,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service|Timing")
 	float BowGestureFallbackTimeout;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service Gesture")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service Gesture|Bow")
+	float BowMinimumLockDurationSeconds;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service Gesture|Bow")
 	float BowMovementReleaseSafetyDelay;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Service|Timing")
@@ -160,6 +198,15 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void StopActionQueue();
 
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Animation")
+	bool PauseActiveQueuedAnimation();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Animation")
+	bool ResumeActiveQueuedAnimation();
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue|Animation")
+	bool HasActiveQueuedAnimation() const;
+
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void EnqueueMoveToTableID(const FString& TableID);
 
@@ -177,6 +224,21 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void EnqueueWait(float Seconds);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void EnqueueAnimation(UAnimSequenceBase* Animation, FName SlotName = NAME_None, float PlayRate = 1.0f, float FallbackSeconds = 3.0f);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Held Prop")
+	void EnqueueAttachHeldProp(UStaticMesh* PropMesh, FName SocketName, const FTransform& RelativeTransform);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Held Prop")
+	void EnqueueRemoveHeldProp();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void EnqueuePickUpPlacedFood(const FString& TableID);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void EnqueuePlaceCarriedFoodAtCounter();
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void EnqueueFacePlayer();
@@ -245,6 +307,9 @@ public:
 	void SetCurrentServiceTableID(const FString& TableID);
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void PrepareForNewReception();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void SetPlayerInTableArea(bool bInArea, const FString& TableID);
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
@@ -252,6 +317,15 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void NotifyPlayerLeftTableArea(const FString& TableID);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void NotifyPlayerDepartureConfirmed(const FString& TableID);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void SetMealCompletionConfirmationPending(bool bPending, const FString& TableID);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
+	void SetDiningServiceCompleted(bool bCompleted, const FString& TableID);
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
 	FString GetCurrentServiceTableID() const;
@@ -269,7 +343,13 @@ public:
 	bool IsActionQueuePausedForFarewellBow() const;
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
+	bool IsBowMovementLockActive() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
 	bool IsBlockingGestureInProgress() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
+	bool IsBusyForAutonomy() const;
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
 	FString GetCurrentBlockingGestureName() const;
@@ -289,6 +369,14 @@ public:
 
 	static FString GetLastKnownGuideTargetID();
 
+	static bool IsLastKnownMealCompletionConfirmationPending();
+
+	static FString GetLastKnownMealCompletionConfirmationTableID();
+
+	static bool IsLastKnownDiningServiceCompleted();
+
+	static FString GetLastKnownCompletedServiceTableID();
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
@@ -299,6 +387,12 @@ private:
 	FNPCQueuedAction CurrentAction;
 
 	bool bWaitingForMove;
+
+	bool bCurrentQueueHadFailure;
+
+	bool bQueuedAnimationInProgress;
+
+	bool bQueuedAnimationPaused;
 
 	bool bPlayerInTableArea;
 
@@ -311,6 +405,16 @@ private:
 	bool bFarewellBowInProgress;
 
 	bool bActionQueuePausedForFarewellBow;
+
+	bool bBowMovementLockActive;
+
+	bool bBowFinishNotifyReceived;
+
+	bool bBowMinimumDurationElapsed;
+
+	bool bBowSafetyDelayElapsed;
+
+	bool bPendingReturnToCounterAfterBow;
 
 	bool bBlockingGestureInProgress;
 
@@ -338,6 +442,23 @@ private:
 
 	FTimerHandle WaitTimerHandle;
 
+	FTimerHandle QueuedAnimationTimerHandle;
+
+	UPROPERTY(Transient)
+	UAnimMontage* ActiveQueuedAnimationMontage;
+
+	UPROPERTY(Transient)
+	UAnimInstance* ActiveQueuedAnimationInstance;
+
+	UPROPERTY(Transient)
+	UStaticMeshComponent* ActiveHeldPropComponent;
+
+	TWeakObjectPtr<UAnimMontage> BlockingGestureMontageBeforeRequest;
+
+	float BlockingGestureMontagePositionBeforeRequest;
+
+	FName PendingGestureAnimationTimingProbe;
+
 	FTimerHandle PostServePauseTimerHandle;
 
 	FTimerHandle BillPresentationPauseTimerHandle;
@@ -350,7 +471,9 @@ private:
 
 	FTimerHandle BlockingServiceGesturePauseTimerHandle;
 
-	FTimerHandle BowMovementReleaseSafetyTimerHandle;
+	FTimerHandle BowMinimumDurationTimerHandle;
+
+	FTimerHandle BowSafetyDelayTimerHandle;
 
 	FTimerHandle PostSeatingMenuGuidanceTimerHandle;
 
@@ -372,6 +495,7 @@ private:
 	void CancelFollowingForExplicitCommand();
 
 	void UpdateLastKnownServiceState() const;
+	bool CancelReceptionForExplicitNPCCommand(const FString& Reason) const;
 
 	void BindMoveCompletedEvent();
 
@@ -384,6 +508,12 @@ private:
 	void ExecuteMoveAction();
 
 	void ExecuteWaitAction();
+
+	void ExecuteAnimationAction();
+
+	void ExecuteHeldPropAction();
+
+	void ExecuteFoodCarryAction();
 
 	void ExecuteFacePlayerAction();
 
@@ -433,15 +563,39 @@ private:
 
 	void CompleteBlockingGesture(const FString& GestureName, bool bForced);
 
-	bool BlockMovementIfBlockingGestureInProgress(const TCHAR* FunctionName) const;
+	bool BlockMovementIfBlockingGestureInProgress(const TCHAR* FunctionName, const FString& Target = FString(), bool bTargetIsCounter = false);
 
 	void HandleBlockingGestureTimeout();
 
-	bool BlockReturnToCounterIfFarewellBowInProgress() const;
+	bool BlockReturnToCounterIfFarewellBowInProgress();
 
 	bool IsCounterTarget(const FString& Target) const;
 
 	bool IsCounterMoveAction(const FNPCQueuedAction& Action) const;
+
+	bool DoesQueuedActionListContainCounterMove() const;
+
+	bool IsBowGestureName(const FString& GestureName) const;
+
+	void StartBowMovementLock(FName GestureName);
+
+	void MarkBowFinishNotifyReceived(FName GestureName);
+
+	void MarkBowMinimumDurationElapsed();
+
+	void MarkBowSafetyDelayElapsed();
+
+	void TryReleaseBowMovementLock();
+
+	void ForceReleaseBowMovementLockByTimeout();
+
+	void UpdateBlockingGestureTimingFromStartedAnimation(FName GestureName);
+
+	bool TryGetActiveGestureAnimationState(
+		UAnimMontage*& OutMontage,
+		float& OutPosition,
+		float& OutRemainingSeconds,
+		FString& OutAnimationName) const;
 
 	void EnableFarewellBowLock();
 
@@ -449,11 +603,11 @@ private:
 
 	void ReturnToCounterAfterServingIfNeeded();
 
+	void ScheduleReturnToCounterAfterClosingDelay();
+
 	void HandleReturnToCounterAfterClosingDelayFinished();
 
 	void HandleFarewellBowFinished();
-
-	void HandleBowMovementReleaseSafetyDelayFinished();
 
 	void ClearPostSeatingMenuGuidanceTimers();
 
@@ -464,6 +618,14 @@ private:
 	void HandleGuideArrived(FName EventName, FString TargetID, FString SuggestedLine);
 
 	void HandleWaitTimerFinished();
+
+	void HandleQueuedAnimationTimerFinished();
+
+	void StopQueuedAnimation(float BlendOutSeconds = 0.2f);
+
+	USkeletalMeshComponent* ResolveHeldPropAttachmentMesh(FName SocketName, FName& OutResolvedSocketName) const;
+
+	void RemoveActiveHeldProp();
 
 	void HandlePostServePauseTimerFinished();
 
@@ -486,6 +648,14 @@ private:
 	static FString LastKnownCurrentServiceTableID;
 
 	static FString LastKnownGuideTargetID;
+
+	static bool bLastKnownMealCompletionConfirmationPending;
+
+	static FString LastKnownMealCompletionConfirmationTableID;
+
+	static bool bLastKnownDiningServiceCompleted;
+
+	static FString LastKnownCompletedServiceTableID;
 
 	static bool bSuppressNextOrderConfirmSpeechForStrategyReply;
 

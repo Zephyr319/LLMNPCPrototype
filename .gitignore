@@ -60,3 +60,10 @@ VoiceVox/
 # OS files
 .DS_Store
 Thumbs.db
+
+# Local Codex working files and generated reports
+.codex_tmp/
+tmp/
+Exports/
+NPC_Autonomy_Research_Progress_Report*.docx
+*git commit -m*

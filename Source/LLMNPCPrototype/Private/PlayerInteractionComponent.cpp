@@ -5,11 +5,10 @@
 #include "Camera/CameraComponent.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/Engine.h"
-#include "EngineUtils.h"
-#include "FurnitureMarkerActor.h"
 #include "GameFramework/Controller.h"
 #include "GameFramework/Pawn.h"
 #include "InteractableInterface.h"
+#include "MenuUIControllerComponent.h"
 #include "PlayerSeatComponent.h"
 
 UPlayerInteractionComponent::UPlayerInteractionComponent()
@@ -39,6 +38,13 @@ bool UPlayerInteractionComponent::TryInteract()
 		return false;
 	}
 
+	if (UMenuUIControllerComponent::IsAnyMenuOpen())
+	{
+		UMenuUIControllerComponent::HideActiveMenuUI();
+		SetFocusedInteractable(nullptr, FText::GetEmpty(), false);
+		return true;
+	}
+
 	if (IsValid(CurrentFocusedActor) && CurrentFocusedActor->GetClass()->ImplementsInterface(UInteractableInterface::StaticClass()))
 	{
 		if (IInteractableInterface::Execute_CanInteract(CurrentFocusedActor, Owner))
@@ -54,14 +60,6 @@ bool UPlayerInteractionComponent::TryInteract()
 	if (SeatComponent && SeatComponent->bIsSeated)
 	{
 		return SeatComponent->LeaveSeat();
-	}
-
-	if (SeatComponent)
-	{
-		if (AFurnitureMarkerActor* NearestSeat = FindNearestSittableFurniture())
-		{
-			return SeatComponent->TrySitAtFurniture(NearestSeat);
-		}
 	}
 
 	PrintDebugMessage(TEXT("No interactable target"), FColor::Yellow);
@@ -84,6 +82,18 @@ void UPlayerInteractionComponent::RefreshFocusedInteractable()
 	UWorld* World = GetWorld();
 	if (!Owner || !World)
 	{
+		SetFocusedInteractable(nullptr, FText::GetEmpty(), false);
+		return;
+	}
+
+	if (UMenuUIControllerComponent::IsAnyMenuOpen())
+	{
+		const bool bHasPromptText = !CurrentInteractionText.EqualTo(FText::GetEmpty());
+		if (bHasFocusedInteractable || CurrentFocusedActor || bHasPromptText)
+		{
+			UE_LOG(LogTemp, Log, TEXT("[InteractPrompt] Hidden because menu UI is open."));
+		}
+
 		SetFocusedInteractable(nullptr, FText::GetEmpty(), false);
 		return;
 	}
@@ -175,37 +185,6 @@ bool UPlayerInteractionComponent::GetInteractionTrace(FVector& OutTraceStart, FV
 
 	OutTraceEnd = OutTraceStart + TraceRotation.Vector() * InteractionDistance;
 	return true;
-}
-
-AFurnitureMarkerActor* UPlayerInteractionComponent::FindNearestSittableFurniture() const
-{
-	const AActor* Owner = GetOwner();
-	UWorld* World = GetWorld();
-	if (!Owner || !World)
-	{
-		return nullptr;
-	}
-
-	AFurnitureMarkerActor* BestSeat = nullptr;
-	float BestDistanceSquared = FMath::Square(InteractionDistance);
-
-	for (TActorIterator<AFurnitureMarkerActor> It(World); It; ++It)
-	{
-		AFurnitureMarkerActor* Seat = *It;
-		if (!Seat || !IInteractableInterface::Execute_CanInteract(Seat, const_cast<AActor*>(Owner)))
-		{
-			continue;
-		}
-
-		const float DistanceSquared = FVector::DistSquared(Owner->GetActorLocation(), Seat->GetActorLocation());
-		if (DistanceSquared <= BestDistanceSquared)
-		{
-			BestSeat = Seat;
-			BestDistanceSquared = DistanceSquared;
-		}
-	}
-
-	return BestSeat;
 }
 
 void UPlayerInteractionComponent::PrintDebugMessage(const FString& Message, const FColor& Color) const

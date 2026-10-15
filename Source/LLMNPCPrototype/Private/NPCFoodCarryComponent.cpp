@@ -18,9 +18,13 @@ UNPCFoodCarryComponent::UNPCFoodCarryComponent()
 	HandAttachLocationOffset = FVector::ZeroVector;
 	HandAttachRotationOffset = FRotator::ZeroRotator;
 	TablePlaceOffset = FVector(0.0f, 0.0f, 85.0f);
+	CounterPlaceOffset = FVector(75.0f, 0.0f, 90.0f);
 	CarriedFoodActor = nullptr;
 	CarriedFoodItemName = TEXT("");
 	bIsCarryingFood = false;
+	LastPlacedFoodActor = nullptr;
+	LastPlacedTableActor = nullptr;
+	LastPlacedFoodItemName = TEXT("");
 }
 
 bool UNPCFoodCarryComponent::SpawnAndAttachFoodToHand(const FString& ItemName)
@@ -177,6 +181,9 @@ bool UNPCFoodCarryComponent::PlaceCarriedFoodOnTable(AActor* TableActor)
 	CarriedFoodActor = nullptr;
 	CarriedFoodItemName = TEXT("");
 	bIsCarryingFood = false;
+	LastPlacedFoodActor = PlacedFoodActor;
+	LastPlacedTableActor = TableActor;
+	LastPlacedFoodItemName = PlacedItemName;
 	BroadcastCarryStateChanged();
 	OnFoodPlaced.Broadcast(PlacedFoodActor, PlacedItemName);
 
@@ -187,6 +194,115 @@ bool UNPCFoodCarryComponent::PlaceCarriedFoodOnTable(AActor* TableActor)
 		*PlacedItemName,
 		*TableActor->GetName());
 	return true;
+}
+
+bool UNPCFoodCarryComponent::PickUpPlacedFoodFromTable(AActor* TableActor)
+{
+	if (IsCarryingFood())
+	{
+		UE_LOG(LogTemp, Log, TEXT("[FoodCarry] Pickup skipped because food is already being carried. Item=%s"), *CarriedFoodItemName);
+		return true;
+	}
+
+	if (!IsValid(LastPlacedFoodActor) || !IsValid(LastPlacedTableActor))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] No tracked tableware is available to collect."));
+		return false;
+	}
+	if (TableActor && LastPlacedTableActor != TableActor)
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[FoodCarry] Tracked tableware belongs to another table. Requested=%s Tracked=%s"),
+			*TableActor->GetName(),
+			*LastPlacedTableActor->GetName());
+		return false;
+	}
+
+	USkeletalMeshComponent* MeshComponent = ResolveOwnerMesh();
+	if (!MeshComponent)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Skeletal mesh component not found while collecting tableware."));
+		return false;
+	}
+
+	USceneComponent* AttachComponent = nullptr;
+	FName AttachSocketName = NAME_None;
+	if (MeshComponent->DoesSocketExist(HandSocketName))
+	{
+		AttachComponent = MeshComponent;
+		AttachSocketName = HandSocketName;
+	}
+	else
+	{
+		AttachComponent = FindFoodCarryPoint();
+	}
+	if (!AttachComponent)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Cannot collect tableware: no socket and no FoodCarryPoint."));
+		return false;
+	}
+
+	AActor* FoodActor = LastPlacedFoodActor;
+	const FString ItemName = LastPlacedFoodItemName;
+	SetFoodCollisionEnabled(FoodActor, ECollisionEnabled::NoCollision);
+	const bool bAttached = FoodActor->AttachToComponent(
+		AttachComponent,
+		FAttachmentTransformRules::SnapToTargetNotIncludingScale,
+		AttachSocketName);
+	if (!bAttached)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Failed to attach collected tableware to the maid."));
+		return false;
+	}
+
+	FoodActor->SetActorRelativeLocation(HandAttachLocationOffset);
+	FoodActor->SetActorRelativeRotation(HandAttachRotationOffset);
+	CarriedFoodActor = FoodActor;
+	CarriedFoodItemName = ItemName;
+	bIsCarryingFood = true;
+	LastPlacedFoodActor = nullptr;
+	LastPlacedTableActor = nullptr;
+	LastPlacedFoodItemName = TEXT("");
+	BroadcastCarryStateChanged();
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[FoodCarry] Existing tableware collected from table. Item=%s Table=%s"),
+		*CarriedFoodItemName,
+		TableActor ? *TableActor->GetName() : TEXT("tracked_table"));
+	return true;
+}
+
+bool UNPCFoodCarryComponent::PlaceCarriedFoodAtCounter()
+{
+	if (!CarriedFoodActor)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] No carried tableware to remove at the counter."));
+		return false;
+	}
+
+	AActor* FoodActor = CarriedFoodActor;
+	const FString ItemName = CarriedFoodItemName;
+	FoodActor->DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+
+	CarriedFoodActor = nullptr;
+	CarriedFoodItemName = TEXT("");
+	bIsCarryingFood = false;
+	BroadcastCarryStateChanged();
+
+	const bool bDestroyRequested = FoodActor->Destroy();
+	if (bDestroyRequested)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[FoodCarry] Tableware removed at counter. Item=%s DestroyRequested=true"), *ItemName);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Failed to remove tableware at counter. Item=%s"), *ItemName);
+	}
+	return bDestroyRequested;
 }
 
 void UNPCFoodCarryComponent::ClearCarriedFood()

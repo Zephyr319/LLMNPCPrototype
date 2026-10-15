@@ -2,16 +2,24 @@
 
 #include "NPCActionQueueComponent.h"
 
+#include "Animation/AnimInstance.h"
+#include "Animation/AnimMontage.h"
+#include "Animation/AnimSequenceBase.h"
 #include "CafeServiceManagerActor.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Components/StaticMeshComponent.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "Engine/Engine.h"
+#include "Engine/SkeletalMesh.h"
+#include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Character.h"
 #include "HAL/PlatformTime.h"
 #include "Kismet/GameplayStatics.h"
 #include "LLMClient.h"
+#include "NPCAutonomyComponent.h"
 #include "NPCFaceTargetComponent.h"
 #include "NPCFoodCarryComponent.h"
 #include "NPCMoveToTableComponent.h"
@@ -26,6 +34,10 @@ bool UNPCActionQueueComponent::bLastKnownGuidePlayerInProgress = false;
 bool UNPCActionQueueComponent::bLastKnownSeatingGuidanceCompleted = false;
 FString UNPCActionQueueComponent::LastKnownCurrentServiceTableID = TEXT("");
 FString UNPCActionQueueComponent::LastKnownGuideTargetID = TEXT("");
+bool UNPCActionQueueComponent::bLastKnownMealCompletionConfirmationPending = false;
+FString UNPCActionQueueComponent::LastKnownMealCompletionConfirmationTableID = TEXT("");
+bool UNPCActionQueueComponent::bLastKnownDiningServiceCompleted = false;
+FString UNPCActionQueueComponent::LastKnownCompletedServiceTableID = TEXT("");
 bool UNPCActionQueueComponent::bSuppressNextOrderConfirmSpeechForStrategyReply = false;
 bool UNPCActionQueueComponent::bSuppressNextGuideStartedSpeechForStrategyReply = false;
 
@@ -43,10 +55,10 @@ UNPCActionQueueComponent::UNPCActionQueueComponent()
 	DuplicateGuideLineSuppressSeconds = 1.0f;
 	GuideArrivedSeatGestureName = FName(TEXT("guide_seat_player"));
 	PostSeatingMenuHelpEnableDelay = 1.0f;
-	PostSeatingMenuGuidanceLine = TEXT("メニューはテーブルの上にございます。お決まりになりましたら、いつでもお声がけください。");
+	PostSeatingMenuGuidanceLine = TEXT("先生、メニューはテーブルの上です。注文が決まったら、いつでもアリスを呼んでください。");
 	OrderPreparationSeconds = 3.0f;
-	OrderConfirmLine = TEXT("かしこまりました。少々お待ちください。");
-	OrderServedLine = TEXT("お待たせいたしました。ご注文の料理です。");
+	OrderConfirmLine = TEXT("注文を受注しました。少々お待ちください、先生。");
+	OrderServedLine = TEXT("お待たせしました、先生。料理をお届けしました！");
 	bReturnToCounterAfterServing = true;
 	PostServePauseSeconds = 0.8f;
 	BillPresentationPauseSeconds = 0.8f;
@@ -55,22 +67,31 @@ UNPCActionQueueComponent::UNPCActionQueueComponent()
 	BowBeforeReturnDuration = 2.5f;
 	BlockingServiceGesturePauseDuration = 1.5f;
 	BowGestureFallbackTimeout = 10.0f;
+	BowMinimumLockDurationSeconds = 2.8f;
 	BowMovementReleaseSafetyDelay = 0.3f;
 	PutBillGestureFallbackTimeout = 3.0f;
 	ServeFoodGestureFallbackTimeout = 3.0f;
 	GuideSeatGestureFallbackTimeout = 2.0f;
 	DefaultBlockingGestureFallbackTimeout = 3.0f;
 	DefaultOrderPrice = 800;
-	BillLineFormat = TEXT("お会計は{Price}円でございます。");
-	ServiceClosingLine = TEXT("ご用の際はいつでもお声がけください。");
-	BillFarewellLine = TEXT("ご用がございましたらお呼びください。");
+	BillLineFormat = TEXT("今回のクエスト報酬は{Price}円です、先生。");
+	ServiceClosingLine = TEXT("次のクエストがあれば、いつでもアリスを呼んでください。");
+	BillFarewellLine = TEXT("何かあれば、アリスを呼んでくださいね、先生。");
 	bWaitingForMove = false;
+	bCurrentQueueHadFailure = false;
+	bQueuedAnimationInProgress = false;
+	bQueuedAnimationPaused = false;
 	bPlayerInTableArea = false;
 	bSeatingGuidanceCompleted = false;
 	bPostSeatingMenuGuidanceDone = false;
 	bPendingOrderFulfillment = false;
 	bFarewellBowInProgress = false;
 	bActionQueuePausedForFarewellBow = false;
+	bBowMovementLockActive = false;
+	bBowFinishNotifyReceived = false;
+	bBowMinimumDurationElapsed = false;
+	bBowSafetyDelayElapsed = false;
+	bPendingReturnToCounterAfterBow = false;
 	bBlockingGestureInProgress = false;
 	CurrentBlockingGestureName = TEXT("");
 	bBlockingGestureFinishHandled = false;
@@ -83,6 +104,12 @@ UNPCActionQueueComponent::UNPCActionQueueComponent()
 	LastGuideLineText = TEXT("");
 	LastGuideLineTime = 0.0;
 	PendingOrderPrice = 0;
+	ActiveQueuedAnimationMontage = nullptr;
+	ActiveQueuedAnimationInstance = nullptr;
+	ActiveHeldPropComponent = nullptr;
+	BlockingGestureMontageBeforeRequest = nullptr;
+	BlockingGestureMontagePositionBeforeRequest = 0.0f;
+	PendingGestureAnimationTimingProbe = NAME_None;
 	MoveComponent = nullptr;
 	FaceTargetComponent = nullptr;
 	FoodCarryComponent = nullptr;
@@ -107,10 +134,13 @@ void UNPCActionQueueComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 void UNPCActionQueueComponent::ClearActionQueue()
 {
+	StopQueuedAnimation();
+	RemoveActiveHeldProp();
 	ActionQueue.Reset();
 	CurrentAction = FNPCQueuedAction();
 	bIsRunningQueue = false;
 	bWaitingForMove = false;
+	bCurrentQueueHadFailure = false;
 	ClearPendingOrderState();
 
 	if (UWorld* World = GetWorld())
@@ -125,10 +155,13 @@ void UNPCActionQueueComponent::ClearActionQueue()
 
 void UNPCActionQueueComponent::StopActionQueue()
 {
+	StopQueuedAnimation();
+	RemoveActiveHeldProp();
 	ActionQueue.Reset();
 	CurrentAction = FNPCQueuedAction();
 	bIsRunningQueue = false;
 	bWaitingForMove = false;
+	bCurrentQueueHadFailure = false;
 	ClearPendingOrderState();
 
 	if (UWorld* World = GetWorld())
@@ -150,6 +183,47 @@ void UNPCActionQueueComponent::StopActionQueue()
 	}
 
 	PrintDebugMessage(TEXT("NPC action queue stopped"), FColor::Yellow);
+}
+
+bool UNPCActionQueueComponent::PauseActiveQueuedAnimation()
+{
+	if (!HasActiveQueuedAnimation() || bQueuedAnimationPaused)
+	{
+		return false;
+	}
+
+	ActiveQueuedAnimationInstance->Montage_Pause(ActiveQueuedAnimationMontage);
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().PauseTimer(QueuedAnimationTimerHandle);
+	}
+	bQueuedAnimationPaused = true;
+	UE_LOG(LogTemp, Log, TEXT("[EmbodiedResponse] base animation paused. Montage=%s"), *ActiveQueuedAnimationMontage->GetName());
+	return true;
+}
+
+bool UNPCActionQueueComponent::ResumeActiveQueuedAnimation()
+{
+	if (!HasActiveQueuedAnimation() || !bQueuedAnimationPaused)
+	{
+		return false;
+	}
+
+	ActiveQueuedAnimationInstance->Montage_Resume(ActiveQueuedAnimationMontage);
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().UnPauseTimer(QueuedAnimationTimerHandle);
+	}
+	bQueuedAnimationPaused = false;
+	UE_LOG(LogTemp, Log, TEXT("[EmbodiedResponse] base animation resumed. Montage=%s"), *ActiveQueuedAnimationMontage->GetName());
+	return true;
+}
+
+bool UNPCActionQueueComponent::HasActiveQueuedAnimation() const
+{
+	return bQueuedAnimationInProgress
+		&& ActiveQueuedAnimationMontage
+		&& ActiveQueuedAnimationInstance;
 }
 
 void UNPCActionQueueComponent::EnqueueMoveToTableID(const FString& TableID)
@@ -200,6 +274,52 @@ void UNPCActionQueueComponent::EnqueueWait(float Seconds)
 	EnqueueAction(Action);
 }
 
+void UNPCActionQueueComponent::EnqueueAnimation(UAnimSequenceBase* Animation, FName SlotName, float PlayRate, float FallbackSeconds)
+{
+	FNPCQueuedAction Action;
+	Action.ActionType = ENPCQueuedActionType::Animation;
+	Action.Animation = Animation;
+	Action.AnimationSlotName = SlotName.IsNone() ? FName(TEXT("DefaultSlot")) : SlotName;
+	Action.AnimationPlayRate = FMath::Max(FMath::Abs(PlayRate), KINDA_SMALL_NUMBER);
+	Action.WaitSeconds = FMath::Max(FallbackSeconds, 0.1f);
+	EnqueueAction(Action);
+}
+
+void UNPCActionQueueComponent::EnqueueAttachHeldProp(
+	UStaticMesh* PropMesh,
+	FName SocketName,
+	const FTransform& RelativeTransform)
+{
+	FNPCQueuedAction Action;
+	Action.ActionType = ENPCQueuedActionType::AttachHeldProp;
+	Action.HeldPropMesh = PropMesh;
+	Action.HeldPropSocketName = SocketName.IsNone() ? FName(TEXT("RightHand")) : SocketName;
+	Action.HeldPropRelativeTransform = RelativeTransform;
+	EnqueueAction(Action);
+}
+
+void UNPCActionQueueComponent::EnqueueRemoveHeldProp()
+{
+	FNPCQueuedAction Action;
+	Action.ActionType = ENPCQueuedActionType::RemoveHeldProp;
+	EnqueueAction(Action);
+}
+
+void UNPCActionQueueComponent::EnqueuePickUpPlacedFood(const FString& TableID)
+{
+	FNPCQueuedAction Action;
+	Action.ActionType = ENPCQueuedActionType::PickUpPlacedFood;
+	Action.Target = TableID.TrimStartAndEnd();
+	EnqueueAction(Action);
+}
+
+void UNPCActionQueueComponent::EnqueuePlaceCarriedFoodAtCounter()
+{
+	FNPCQueuedAction Action;
+	Action.ActionType = ENPCQueuedActionType::PlaceCarriedFoodAtCounter;
+	EnqueueAction(Action);
+}
+
 void UNPCActionQueueComponent::EnqueueFacePlayer()
 {
 	FNPCQueuedAction Action;
@@ -209,7 +329,8 @@ void UNPCActionQueueComponent::EnqueueFacePlayer()
 
 void UNPCActionQueueComponent::StartActionQueue()
 {
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("StartActionQueue")))
+	const bool bQueueContainsCounterMove = DoesQueuedActionListContainCounterMove();
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("StartActionQueue"), bQueueContainsCounterMove ? TEXT("counter") : TEXT("action_queue"), bQueueContainsCounterMove))
 	{
 		return;
 	}
@@ -250,6 +371,7 @@ void UNPCActionQueueComponent::StartActionQueue()
 
 	bIsRunningQueue = true;
 	bWaitingForMove = false;
+	bCurrentQueueHadFailure = false;
 	PrintDebugMessage(TEXT("NPC action queue started"), FColor::Green);
 	ExecuteNextQueuedAction();
 }
@@ -258,7 +380,7 @@ void UNPCActionQueueComponent::RunCounterAndReturnToTable(const FString& ReturnT
 {
 	LogActionQueueMoveRequest(TEXT("RunCounterAndReturnToTable"), ReturnTableID);
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunCounterAndReturnToTable")))
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunCounterAndReturnToTable"), TEXT("counter"), true))
 	{
 		return;
 	}
@@ -287,7 +409,7 @@ void UNPCActionQueueComponent::RunCounterAndReturnToPlayer()
 {
 	LogActionQueueMoveRequest(TEXT("RunCounterAndReturnToPlayer"), TEXT("player"));
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunCounterAndReturnToPlayer")))
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunCounterAndReturnToPlayer"), TEXT("counter"), true))
 	{
 		return;
 	}
@@ -310,7 +432,7 @@ void UNPCActionQueueComponent::RunMoveNearPlayer(float StopDistance)
 {
 	LogActionQueueMoveRequest(TEXT("RunMoveNearPlayer"), TEXT("player"));
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunMoveNearPlayer")))
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunMoveNearPlayer"), TEXT("player"), false))
 	{
 		return;
 	}
@@ -332,7 +454,7 @@ void UNPCActionQueueComponent::RunStartFollowPlayer(float DesiredDistance)
 {
 	LogActionQueueMoveRequest(TEXT("RunStartFollowPlayer"), TEXT("player"));
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunStartFollowPlayer")))
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunStartFollowPlayer"), TEXT("player"), false))
 	{
 		return;
 	}
@@ -375,7 +497,7 @@ void UNPCActionQueueComponent::RunGuidePlayerToTable(const FString& TableID)
 {
 	LogActionQueueMoveRequest(TEXT("RunGuidePlayerToTable"), TableID);
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunGuidePlayerToTable")))
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunGuidePlayerToTable"), TableID, false))
 	{
 		return;
 	}
@@ -426,7 +548,7 @@ void UNPCActionQueueComponent::RunGuidePlayerToSceneTag(const FString& TargetTag
 {
 	LogActionQueueMoveRequest(TEXT("RunGuidePlayerToSceneTag"), TargetTag);
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunGuidePlayerToSceneTag")))
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunGuidePlayerToSceneTag"), TargetTag, IsCounterTarget(TargetTag)))
 	{
 		return;
 	}
@@ -479,7 +601,14 @@ void UNPCActionQueueComponent::HandleStrategyAction(const FString& ActionType, c
 	UE_LOG(LogTemp, Warning, TEXT("HandleStrategyAction: ActionType=%s, Item=%s, Quantity=%d"), *NormalizedAction, *NormalizedItem, Quantity);
 	LogActionQueueMoveRequest(TEXT("HandleStrategyAction"), FString::Printf(TEXT("Action=%s Item=%s"), *NormalizedAction, *NormalizedItem));
 
-	if (bFarewellBowInProgress)
+	const bool bIsCleanTableAction =
+		NormalizedAction.Equals(TEXT("clean_table"), ESearchCase::IgnoreCase)
+		|| NormalizedAction.Equals(TEXT("clear_table"), ESearchCase::IgnoreCase);
+	const bool bIsContinueDiningAction =
+		NormalizedAction.Equals(TEXT("continue_dining"), ESearchCase::IgnoreCase)
+		|| NormalizedAction.Equals(TEXT("not_finished_dining"), ESearchCase::IgnoreCase);
+
+	if (bFarewellBowInProgress && !bIsCleanTableAction && !bIsContinueDiningAction)
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Strategy action ignored because farewell bow is in progress. Action=%s Item=%s"), *NormalizedAction, *NormalizedItem);
 		return;
@@ -491,6 +620,57 @@ void UNPCActionQueueComponent::HandleStrategyAction(const FString& ActionType, c
 		|| NormalizedAction.Equals(TEXT("order"), ESearchCase::IgnoreCase)
 		|| NormalizedAction.Equals(TEXT("serve"), ESearchCase::IgnoreCase);
 	const bool bIsReceptionPhase = IsReceptionPhaseForService();
+
+	if (bIsCleanTableAction || bIsContinueDiningAction)
+	{
+		ACafeServiceManagerActor* MatchingServiceManager = nullptr;
+		if (UWorld* World = GetWorld())
+		{
+			for (TActorIterator<ACafeServiceManagerActor> It(World); It; ++It)
+			{
+				ACafeServiceManagerActor* Candidate = *It;
+				if (Candidate && Candidate->MaidNPCActor == GetOwner())
+				{
+					MatchingServiceManager = Candidate;
+					break;
+				}
+			}
+		}
+
+		if (bIsContinueDiningAction)
+		{
+			if (!MatchingServiceManager
+				|| !MatchingServiceManager->SubmitMealCompletionConfirmation(false))
+			{
+				UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] continue_dining response had no pending confirmation to cancel."));
+			}
+			return;
+		}
+
+		FString CleanupTable = NormalizedItem.IsEmpty()
+			|| NormalizedItem.Equals(TEXT("none"), ESearchCase::IgnoreCase)
+			|| NormalizedItem.Equals(TEXT("current_table"), ESearchCase::IgnoreCase)
+			? CurrentServiceTableID.TrimStartAndEnd()
+			: NormalizedItem;
+		if (CleanupTable.IsEmpty())
+		{
+			CleanupTable = TEXT("current_table");
+		}
+		const bool bConfirmationAccepted = MatchingServiceManager
+			&& MatchingServiceManager->SubmitMealCompletionConfirmation(true);
+		if (!MatchingServiceManager
+			|| !bConfirmationAccepted
+			|| !MatchingServiceManager->AutonomyComponent
+			|| !MatchingServiceManager->AutonomyComponent->RequestDiningAreaCleanup(CleanupTable))
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[ActionQueue] clean_table request could not start. Table=%s"),
+				*CleanupTable);
+		}
+		return;
+	}
 
 	if (IsGuidePlayerInProgress())
 	{
@@ -672,7 +852,7 @@ void UNPCActionQueueComponent::RunTableRouteFromString(const FString& RouteStrin
 {
 	LogActionQueueMoveRequest(TEXT("RunTableRouteFromString"), RouteString);
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunTableRouteFromString")))
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunTableRouteFromString"), RouteString, IsCounterTarget(RouteString)))
 	{
 		return;
 	}
@@ -716,7 +896,7 @@ void UNPCActionQueueComponent::RunActionSequenceFromJson(const FString& Sequence
 {
 	LogActionQueueMoveRequest(TEXT("RunActionSequenceFromJson"), SequenceJson);
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunActionSequenceFromJson")))
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunActionSequenceFromJson"), SequenceJson, IsCounterTarget(SequenceJson)))
 	{
 		return;
 	}
@@ -740,6 +920,7 @@ void UNPCActionQueueComponent::RunActionSequenceFromJson(const FString& Sequence
 
 	bool bFoundFirstValidStep = false;
 	bool bFirstValidStepIsDirectControl = false;
+	bool bFirstValidStepReturnsNPCToCounter = false;
 	for (const TSharedPtr<FJsonValue>& StepValue : SequenceSteps)
 	{
 		const TSharedPtr<FJsonObject> StepObject = StepValue.IsValid() ? StepValue->AsObject() : nullptr;
@@ -767,7 +948,18 @@ void UNPCActionQueueComponent::RunActionSequenceFromJson(const FString& Sequence
 			|| StepType.Equals(TEXT("guide_player_to_table"), ESearchCase::IgnoreCase)
 			|| StepType.Equals(TEXT("guide_player_to_scene_tag"), ESearchCase::IgnoreCase)
 			|| StepType.Equals(TEXT("stop_guide_player"), ESearchCase::IgnoreCase);
+
+		FString FirstTarget;
+		StepObject->TryGetStringField(TEXT("target"), FirstTarget);
+		bFirstValidStepReturnsNPCToCounter =
+			StepType.Equals(TEXT("move_to_scene_tag"), ESearchCase::IgnoreCase)
+			&& IsCounterTarget(FirstTarget);
 		break;
+	}
+
+	if (bFirstValidStepReturnsNPCToCounter)
+	{
+		CancelReceptionForExplicitNPCCommand(TEXT("explicit_return_to_counter"));
 	}
 
 	if (bFoundFirstValidStep && !bFirstValidStepIsDirectControl)
@@ -881,7 +1073,7 @@ void UNPCActionQueueComponent::RunCounterAndReturnToCurrentTable()
 {
 	LogActionQueueMoveRequest(TEXT("RunCounterAndReturnToCurrentTable"), ResolveCurrentServiceTableID());
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunCounterAndReturnToCurrentTable")))
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunCounterAndReturnToCurrentTable"), TEXT("counter"), true))
 	{
 		return;
 	}
@@ -914,7 +1106,7 @@ void UNPCActionQueueComponent::RunOrderFulfillmentToCurrentTableInternal(const F
 {
 	LogActionQueueMoveRequest(TEXT("RunOrderFulfillmentToCurrentTable"), OrderItem);
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunOrderFulfillmentToCurrentTable")))
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("RunOrderFulfillmentToCurrentTable"), OrderItem, false))
 	{
 		return;
 	}
@@ -947,6 +1139,7 @@ void UNPCActionQueueComponent::RunOrderFulfillmentToCurrentTableInternal(const F
 	PendingOrderItem = TrimmedOrderItem;
 	PendingOrderPrice = ResolvedOrderPrice;
 	bPendingOrderFulfillment = true;
+	OnOrderStarted.Broadcast(PendingOrderReturnTableID, PendingOrderItem);
 
 	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Place order: %s"), *TrimmedOrderItem);
 	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Order return table: %s"), *PendingOrderReturnTableID);
@@ -1030,11 +1223,50 @@ void UNPCActionQueueComponent::SetCurrentServiceTableID(const FString& TableID)
 	UpdateLastKnownServiceState();
 }
 
+void UNPCActionQueueComponent::PrepareForNewReception()
+{
+	const FString PreviousTableID = CurrentServiceTableID.TrimStartAndEnd();
+	const bool bHadStaleTableState =
+		bPlayerInTableArea
+		|| bSeatingGuidanceCompleted
+		|| !PreviousTableID.IsEmpty();
+
+	bPlayerInTableArea = false;
+	bSeatingGuidanceCompleted = false;
+	bPostSeatingMenuGuidanceDone = false;
+	CurrentServiceTableID = TEXT("");
+	SetMealCompletionConfirmationPending(false, TEXT(""));
+	SetDiningServiceCompleted(false, TEXT(""));
+	UpdateLastKnownServiceState();
+
+	if (bHadStaleTableState)
+	{
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[ActionQueue] Cleared pre-reception table state. PreviousTableID=%s"),
+			*PreviousTableID);
+	}
+}
+
 void UNPCActionQueueComponent::SetPlayerInTableArea(bool bInArea, const FString& TableID)
 {
 	const FString TrimmedTableID = TableID.TrimStartAndEnd();
 	if (bInArea)
 	{
+		const FString ActiveTableID = CurrentServiceTableID.TrimStartAndEnd();
+		if (!ActiveTableID.IsEmpty()
+			&& !TrimmedTableID.IsEmpty()
+			&& !ActiveTableID.Equals(TrimmedTableID, ESearchCase::IgnoreCase))
+		{
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("[ActionQueue] Ignored unrelated table enter. ActiveTable=%s EnteredTable=%s"),
+				*ActiveTableID,
+				*TrimmedTableID);
+			return;
+		}
 		const bool bSameTable =
 			TrimmedTableID.IsEmpty()
 			|| CurrentServiceTableID.TrimStartAndEnd().Equals(TrimmedTableID, ESearchCase::IgnoreCase);
@@ -1051,13 +1283,26 @@ void UNPCActionQueueComponent::SetPlayerInTableArea(bool bInArea, const FString&
 			CurrentServiceTableID = TrimmedTableID;
 		}
 
-		bSeatingGuidanceCompleted = true;
 		UpdateLastKnownServiceState();
 		UE_LOG(
 			LogTemp,
 			Warning,
-			TEXT("[ActionQueue] Player entered table area. CurrentServiceTableID=%s"),
+			TEXT("[ActionQueue] Player entered table area without completing seating guidance. CurrentServiceTableID=%s"),
 			*CurrentServiceTableID);
+		return;
+	}
+
+	const FString ActiveTableID = CurrentServiceTableID.TrimStartAndEnd();
+	if (!ActiveTableID.IsEmpty()
+		&& !TrimmedTableID.IsEmpty()
+		&& !ActiveTableID.Equals(TrimmedTableID, ESearchCase::IgnoreCase))
+	{
+		UE_LOG(
+			LogTemp,
+			Verbose,
+			TEXT("[ActionQueue] Ignored unrelated table leave. ActiveTable=%s LeftTable=%s"),
+			*ActiveTableID,
+			*TrimmedTableID);
 		return;
 	}
 
@@ -1068,8 +1313,17 @@ void UNPCActionQueueComponent::SetPlayerInTableArea(bool bInArea, const FString&
 	}
 
 	bPlayerInTableArea = false;
+	if (!bSeatingGuidanceCompleted)
+	{
+		CurrentServiceTableID = TEXT("");
+	}
 	UpdateLastKnownServiceState();
-	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Player left table area, keeping service seated state."));
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[ActionQueue] Player left table area. SeatingGuidanceCompleted=%d CurrentServiceTableID=%s"),
+		bSeatingGuidanceCompleted ? 1 : 0,
+		*CurrentServiceTableID);
 }
 
 void UNPCActionQueueComponent::NotifyPlayerEnteredTableArea(const FString& TableID)
@@ -1082,6 +1336,68 @@ void UNPCActionQueueComponent::NotifyPlayerLeftTableArea(const FString& TableID)
 	SetPlayerInTableArea(false, TableID);
 }
 
+void UNPCActionQueueComponent::NotifyPlayerDepartureConfirmed(const FString& TableID)
+{
+	const FString ConfirmedTableID = TableID.TrimStartAndEnd();
+	const FString ActiveTableID = CurrentServiceTableID.TrimStartAndEnd();
+	if (!ConfirmedTableID.IsEmpty()
+		&& !ActiveTableID.IsEmpty()
+		&& !ActiveTableID.Equals(ConfirmedTableID, ESearchCase::IgnoreCase))
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ActionQueue] Departure table differs from active service table. Active=%s Confirmed=%s"),
+			*ActiveTableID,
+			*ConfirmedTableID);
+	}
+
+	bPlayerInTableArea = false;
+	bSeatingGuidanceCompleted = false;
+	bPostSeatingMenuGuidanceDone = false;
+	CurrentServiceTableID = TEXT("");
+	SetMealCompletionConfirmationPending(false, TEXT(""));
+	SetDiningServiceCompleted(true, ConfirmedTableID);
+	UpdateLastKnownServiceState();
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[ActionQueue] Confirmed player departure; cleared seated service state. Table=%s"),
+		*ConfirmedTableID);
+}
+
+void UNPCActionQueueComponent::SetMealCompletionConfirmationPending(bool bPending, const FString& TableID)
+{
+	bLastKnownMealCompletionConfirmationPending = bPending;
+	LastKnownMealCompletionConfirmationTableID = bPending
+		? TableID.TrimStartAndEnd()
+		: TEXT("");
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[ActionQueue] meal completion confirmation pending=%s Table=%s"),
+		bPending ? TEXT("true") : TEXT("false"),
+		LastKnownMealCompletionConfirmationTableID.IsEmpty()
+			? TEXT("none")
+			: *LastKnownMealCompletionConfirmationTableID);
+}
+
+void UNPCActionQueueComponent::SetDiningServiceCompleted(bool bCompleted, const FString& TableID)
+{
+	bLastKnownDiningServiceCompleted = bCompleted;
+	LastKnownCompletedServiceTableID = bCompleted
+		? TableID.TrimStartAndEnd()
+		: TEXT("");
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[ActionQueue] dining service completed=%s Table=%s"),
+		bCompleted ? TEXT("true") : TEXT("false"),
+		LastKnownCompletedServiceTableID.IsEmpty()
+			? TEXT("none")
+			: *LastKnownCompletedServiceTableID);
+}
+
 FString UNPCActionQueueComponent::GetCurrentServiceTableID() const
 {
 	return CurrentServiceTableID;
@@ -1089,7 +1405,16 @@ FString UNPCActionQueueComponent::GetCurrentServiceTableID() const
 
 bool UNPCActionQueueComponent::IsSeatedForService() const
 {
-	return bPlayerInTableArea || bSeatingGuidanceCompleted || !CurrentServiceTableID.TrimStartAndEnd().IsEmpty();
+	bool bPlayerActuallySeated = false;
+	if (const AActor* PlayerActor = FindPlayerActor())
+	{
+		if (const UPlayerSeatComponent* SeatComponent = PlayerActor->FindComponentByClass<UPlayerSeatComponent>())
+		{
+			bPlayerActuallySeated = SeatComponent->bIsSeated;
+		}
+	}
+
+	return bSeatingGuidanceCompleted || bPlayerActuallySeated;
 }
 
 bool UNPCActionQueueComponent::IsReceptionPhaseForService() const
@@ -1129,9 +1454,33 @@ bool UNPCActionQueueComponent::IsActionQueuePausedForFarewellBow() const
 	return bActionQueuePausedForFarewellBow;
 }
 
+bool UNPCActionQueueComponent::IsBowMovementLockActive() const
+{
+	return bBowMovementLockActive;
+}
+
 bool UNPCActionQueueComponent::IsBlockingGestureInProgress() const
 {
 	return bBlockingGestureInProgress;
+}
+
+bool UNPCActionQueueComponent::IsBusyForAutonomy() const
+{
+	const bool bMoveComponentBusy = MoveComponent
+		&& (MoveComponent->bIsMovingToTable
+			|| MoveComponent->IsFollowingPlayer()
+			|| MoveComponent->IsGuidingPlayer()
+			|| MoveComponent->IsMovementPausedByServiceGesture());
+
+	return bIsRunningQueue
+		|| bWaitingForMove
+		|| bMoveComponentBusy
+		|| bPendingOrderFulfillment
+		|| bFarewellBowInProgress
+		|| bActionQueuePausedForFarewellBow
+		|| bBowMovementLockActive
+		|| bBlockingGestureInProgress
+		|| bQueuedAnimationInProgress;
 }
 
 FString UNPCActionQueueComponent::GetCurrentBlockingGestureName() const
@@ -1202,6 +1551,26 @@ FString UNPCActionQueueComponent::GetLastKnownCurrentServiceTableID()
 FString UNPCActionQueueComponent::GetLastKnownGuideTargetID()
 {
 	return LastKnownGuideTargetID;
+}
+
+bool UNPCActionQueueComponent::IsLastKnownMealCompletionConfirmationPending()
+{
+	return bLastKnownMealCompletionConfirmationPending;
+}
+
+FString UNPCActionQueueComponent::GetLastKnownMealCompletionConfirmationTableID()
+{
+	return LastKnownMealCompletionConfirmationTableID;
+}
+
+bool UNPCActionQueueComponent::IsLastKnownDiningServiceCompleted()
+{
+	return bLastKnownDiningServiceCompleted;
+}
+
+FString UNPCActionQueueComponent::GetLastKnownCompletedServiceTableID()
+{
+	return LastKnownCompletedServiceTableID;
 }
 
 void UNPCActionQueueComponent::SetSuppressNextOrderConfirmSpeechForStrategyReply(bool bSuppress)
@@ -1282,6 +1651,27 @@ void UNPCActionQueueComponent::UpdateLastKnownServiceState() const
 		: TEXT("");
 }
 
+bool UNPCActionQueueComponent::CancelReceptionForExplicitNPCCommand(const FString& Reason) const
+{
+	UWorld* World = GetWorld();
+	AActor* Owner = GetOwner();
+	if (!World || !Owner)
+	{
+		return false;
+	}
+
+	for (TActorIterator<ACafeServiceManagerActor> It(World); It; ++It)
+	{
+		ACafeServiceManagerActor* ServiceManager = *It;
+		if (ServiceManager && ServiceManager->MaidNPCActor == Owner)
+		{
+			return ServiceManager->CancelReceptionForExplicitNPCCommand(Reason);
+		}
+	}
+
+	return false;
+}
+
 void UNPCActionQueueComponent::BindMoveCompletedEvent()
 {
 	if (!MoveComponent)
@@ -1319,7 +1709,8 @@ void UNPCActionQueueComponent::ExecuteNextQueuedAction()
 		return;
 	}
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("ExecuteNextQueuedAction")))
+	const bool bQueueContainsCounterMove = DoesQueuedActionListContainCounterMove();
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("ExecuteNextQueuedAction"), bQueueContainsCounterMove ? TEXT("counter") : TEXT("action_queue"), bQueueContainsCounterMove))
 	{
 		return;
 	}
@@ -1332,10 +1723,13 @@ void UNPCActionQueueComponent::ExecuteNextQueuedAction()
 
 	if (ActionQueue.Num() <= 0)
 	{
+		const bool bQueueSucceeded = !bCurrentQueueHadFailure;
 		CurrentAction = FNPCQueuedAction();
 		bWaitingForMove = false;
 		bIsRunningQueue = false;
+		bCurrentQueueHadFailure = false;
 		PrintDebugMessage(TEXT("NPC action queue completed"), FColor::Cyan);
+		OnActionQueueFinished.Broadcast(bQueueSucceeded);
 		return;
 	}
 
@@ -1355,6 +1749,20 @@ void UNPCActionQueueComponent::ExecuteNextQueuedAction()
 
 	case ENPCQueuedActionType::Wait:
 		ExecuteWaitAction();
+		break;
+
+	case ENPCQueuedActionType::Animation:
+		ExecuteAnimationAction();
+		break;
+
+	case ENPCQueuedActionType::AttachHeldProp:
+	case ENPCQueuedActionType::RemoveHeldProp:
+		ExecuteHeldPropAction();
+		break;
+
+	case ENPCQueuedActionType::PickUpPlacedFood:
+	case ENPCQueuedActionType::PlaceCarriedFoodAtCounter:
+		ExecuteFoodCarryAction();
 		break;
 
 	case ENPCQueuedActionType::FacePlayer:
@@ -1377,7 +1785,9 @@ void UNPCActionQueueComponent::ExecuteMoveAction()
 	BindMoveCompletedEvent();
 	LogActionQueueMoveRequest(TEXT("ExecuteMoveAction"), CurrentAction.Target);
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("ExecuteMoveAction")))
+	const FString Target = CurrentAction.Target.TrimStartAndEnd();
+	const bool bCurrentActionTargetsCounter = IsCounterMoveAction(CurrentAction);
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("ExecuteMoveAction"), bCurrentActionTargetsCounter ? TEXT("counter") : Target, bCurrentActionTargetsCounter))
 	{
 		bWaitingForMove = false;
 		bIsRunningQueue = false;
@@ -1400,7 +1810,6 @@ void UNPCActionQueueComponent::ExecuteMoveAction()
 		return;
 	}
 
-	const FString Target = CurrentAction.Target.TrimStartAndEnd();
 	if (IsCounterMoveAction(CurrentAction) && BlockReturnToCounterIfFarewellBowInProgress())
 	{
 		bWaitingForMove = false;
@@ -1480,6 +1889,220 @@ void UNPCActionQueueComponent::ExecuteWaitAction()
 		false);
 }
 
+void UNPCActionQueueComponent::ExecuteAnimationAction()
+{
+	if (!CurrentAction.Animation)
+	{
+		CompleteCurrentAction(false, TEXT("Queued animation is not configured"));
+		return;
+	}
+
+	AActor* OwnerActor = GetOwner();
+	if (!OwnerActor)
+	{
+		CompleteCurrentAction(false, TEXT("NPC owner not found for queued animation"));
+		return;
+	}
+
+	USkeletalMeshComponent* MeshComponent = nullptr;
+	TArray<USkeletalMeshComponent*> MeshComponents;
+	OwnerActor->GetComponents<USkeletalMeshComponent>(MeshComponents);
+	const USkeleton* AnimationSkeleton = CurrentAction.Animation->GetSkeleton();
+	for (USkeletalMeshComponent* CandidateMesh : MeshComponents)
+	{
+		const USkeletalMesh* SkeletalMeshAsset = CandidateMesh ? CandidateMesh->GetSkeletalMeshAsset() : nullptr;
+		if (CandidateMesh
+			&& CandidateMesh->GetAnimInstance()
+			&& SkeletalMeshAsset
+			&& (!AnimationSkeleton || SkeletalMeshAsset->GetSkeleton() == AnimationSkeleton))
+		{
+			MeshComponent = CandidateMesh;
+			break;
+		}
+	}
+	if (!MeshComponent && AnimationSkeleton)
+	{
+		CompleteCurrentAction(false, FString::Printf(
+			TEXT("No skeletal mesh compatible with queued animation %s (skeleton: %s)"),
+			*CurrentAction.Animation->GetName(),
+			*AnimationSkeleton->GetName()));
+		return;
+	}
+	if (!MeshComponent)
+	{
+		if (ACharacter* CharacterOwner = Cast<ACharacter>(OwnerActor))
+		{
+			MeshComponent = CharacterOwner->GetMesh();
+		}
+	}
+	if (!MeshComponent)
+	{
+		MeshComponent = OwnerActor->FindComponentByClass<USkeletalMeshComponent>();
+	}
+
+	UAnimInstance* AnimInstance = MeshComponent ? MeshComponent->GetAnimInstance() : nullptr;
+	if (!AnimInstance)
+	{
+		CompleteCurrentAction(false, TEXT("NPC animation instance not found"));
+		return;
+	}
+
+	const FName SlotName = CurrentAction.AnimationSlotName.IsNone()
+		? FName(TEXT("DefaultSlot"))
+		: CurrentAction.AnimationSlotName;
+	const float PlayRate = FMath::Max(FMath::Abs(CurrentAction.AnimationPlayRate), KINDA_SMALL_NUMBER);
+	ActiveQueuedAnimationMontage = AnimInstance->PlaySlotAnimationAsDynamicMontage(
+		CurrentAction.Animation,
+		SlotName,
+		0.2f,
+		0.2f,
+		PlayRate,
+		1,
+		-1.0f,
+		0.0f);
+
+	if (!ActiveQueuedAnimationMontage)
+	{
+		CompleteCurrentAction(false, FString::Printf(
+			TEXT("Failed to play queued animation: %s"),
+			*CurrentAction.Animation->GetName()));
+		return;
+	}
+
+	bQueuedAnimationInProgress = true;
+	bQueuedAnimationPaused = false;
+	ActiveQueuedAnimationInstance = AnimInstance;
+	const float MontagePosition = AnimInstance->Montage_GetPosition(ActiveQueuedAnimationMontage);
+	const float MontageRate = FMath::Max(FMath::Abs(AnimInstance->Montage_GetPlayRate(ActiveQueuedAnimationMontage)), KINDA_SMALL_NUMBER);
+	const float MontageRemainingSeconds = FMath::Max(
+		(ActiveQueuedAnimationMontage->GetPlayLength() - MontagePosition) / MontageRate,
+		0.0f);
+	const float WaitSeconds = MontageRemainingSeconds > KINDA_SMALL_NUMBER
+		? MontageRemainingSeconds + 0.1f
+		: CurrentAction.WaitSeconds;
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		StopQueuedAnimation(0.0f);
+		CompleteCurrentAction(false, TEXT("World not found for queued animation"));
+		return;
+	}
+
+	World->GetTimerManager().SetTimer(
+		QueuedAnimationTimerHandle,
+		this,
+		&UNPCActionQueueComponent::HandleQueuedAnimationTimerFinished,
+		FMath::Max(WaitSeconds, 0.1f),
+		false);
+}
+
+void UNPCActionQueueComponent::ExecuteHeldPropAction()
+{
+	if (CurrentAction.ActionType == ENPCQueuedActionType::RemoveHeldProp)
+	{
+		RemoveActiveHeldProp();
+		CompleteCurrentAction(true, TEXT(""));
+		return;
+	}
+
+	if (CurrentAction.ActionType != ENPCQueuedActionType::AttachHeldProp || !CurrentAction.HeldPropMesh)
+	{
+		CompleteCurrentAction(false, TEXT("Held prop mesh is not configured"));
+		return;
+	}
+
+	AActor* OwnerActor = GetOwner();
+	FName ResolvedSocketName = CurrentAction.HeldPropSocketName;
+	USkeletalMeshComponent* AttachmentMesh = ResolveHeldPropAttachmentMesh(
+		CurrentAction.HeldPropSocketName,
+		ResolvedSocketName);
+	if (!OwnerActor || !AttachmentMesh)
+	{
+		CompleteCurrentAction(false, FString::Printf(
+			TEXT("No skeletal mesh contains held prop socket/bone: %s"),
+			*CurrentAction.HeldPropSocketName.ToString()));
+		return;
+	}
+
+	RemoveActiveHeldProp();
+	ActiveHeldPropComponent = NewObject<UStaticMeshComponent>(OwnerActor, NAME_None, RF_Transient);
+	if (!ActiveHeldPropComponent)
+	{
+		CompleteCurrentAction(false, TEXT("Failed to create held prop component"));
+		return;
+	}
+
+	OwnerActor->AddInstanceComponent(ActiveHeldPropComponent);
+	ActiveHeldPropComponent->SetMobility(EComponentMobility::Movable);
+	ActiveHeldPropComponent->SetStaticMesh(CurrentAction.HeldPropMesh);
+	ActiveHeldPropComponent->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	ActiveHeldPropComponent->SetGenerateOverlapEvents(false);
+	ActiveHeldPropComponent->SetCanEverAffectNavigation(false);
+	ActiveHeldPropComponent->RegisterComponent();
+
+	if (!ActiveHeldPropComponent->AttachToComponent(
+		AttachmentMesh,
+		FAttachmentTransformRules::KeepRelativeTransform,
+		ResolvedSocketName))
+	{
+		RemoveActiveHeldProp();
+		CompleteCurrentAction(false, TEXT("Failed to attach held prop to NPC mesh"));
+		return;
+	}
+
+	ActiveHeldPropComponent->SetRelativeTransform(CurrentAction.HeldPropRelativeTransform);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[ActionQueue] held prop attached. Mesh=%s Socket=%s Location=%s Rotation=%s Scale=%s"),
+		*CurrentAction.HeldPropMesh->GetName(),
+		*ResolvedSocketName.ToString(),
+		*CurrentAction.HeldPropRelativeTransform.GetLocation().ToCompactString(),
+		*CurrentAction.HeldPropRelativeTransform.Rotator().ToCompactString(),
+		*CurrentAction.HeldPropRelativeTransform.GetScale3D().ToCompactString());
+	CompleteCurrentAction(true, TEXT(""));
+}
+
+void UNPCActionQueueComponent::ExecuteFoodCarryAction()
+{
+	UNPCFoodCarryComponent* ResolvedFoodCarryComponent = ResolveFoodCarryComponent();
+	if (!ResolvedFoodCarryComponent)
+	{
+		CompleteCurrentAction(false, TEXT("NPCFoodCarryComponent not found for tableware action"));
+		return;
+	}
+
+	if (CurrentAction.ActionType == ENPCQueuedActionType::PickUpPlacedFood)
+	{
+		AActor* TableActor = FindServiceTableActorByID(CurrentAction.Target);
+		if (!TableActor)
+		{
+			CompleteCurrentAction(false, FString::Printf(
+				TEXT("Table actor not found while collecting tableware: %s"),
+				*CurrentAction.Target));
+			return;
+		}
+
+		const bool bPickedUp = ResolvedFoodCarryComponent->PickUpPlacedFoodFromTable(TableActor);
+		CompleteCurrentAction(
+			bPickedUp,
+			bPickedUp ? TEXT("") : TEXT("Failed to collect tableware from table"));
+		return;
+	}
+
+	if (CurrentAction.ActionType == ENPCQueuedActionType::PlaceCarriedFoodAtCounter)
+	{
+		const bool bPlaced = ResolvedFoodCarryComponent->PlaceCarriedFoodAtCounter();
+		CompleteCurrentAction(
+			bPlaced,
+			bPlaced ? TEXT("") : TEXT("Failed to place tableware at counter"));
+		return;
+	}
+
+	CompleteCurrentAction(false, TEXT("Queued action is not a food carry action"));
+}
+
 void UNPCActionQueueComponent::ExecuteFacePlayerAction()
 {
 	AActor* PlayerActor = FindPlayerActor();
@@ -1512,6 +2135,7 @@ void UNPCActionQueueComponent::CompleteCurrentAction(bool bSuccess, const FStrin
 
 	if (!bSuccess)
 	{
+		bCurrentQueueHadFailure = true;
 		const FString Message = FailureReason.IsEmpty() ? TEXT("NPC queued action failed") : FailureReason;
 		PrintDebugMessage(Message, FColor::Red);
 	}
@@ -1524,6 +2148,7 @@ void UNPCActionQueueComponent::CompleteCurrentAction(bool bSuccess, const FStrin
 
 	if (!bSuccess && bStopQueueOnActionFailure)
 	{
+		RemoveActiveHeldProp();
 		ActionQueue.Reset();
 		CurrentAction = FNPCQueuedAction();
 		bWaitingForMove = false;
@@ -1531,6 +2156,8 @@ void UNPCActionQueueComponent::CompleteCurrentAction(bool bSuccess, const FStrin
 		ClearPendingOrderState();
 		ClearOrderFulfillmentTimers();
 		PrintDebugMessage(TEXT("NPC action queue stopped after failed action"), FColor::Red);
+		bCurrentQueueHadFailure = false;
+		OnActionQueueFinished.Broadcast(false);
 		return;
 	}
 
@@ -1670,10 +2297,11 @@ void UNPCActionQueueComponent::LogActionQueueMoveRequest(const TCHAR* FunctionNa
 	UE_LOG(
 		LogTemp,
 		Warning,
-		TEXT("[ActionQueue][MOVE_REQUEST] %s Target=%s FarewellBow=%d MovementPause=%d ActionQueuePaused=%d IsGuiding=%d GuideTarget=%s"),
+		TEXT("[ActionQueue][MOVE_REQUEST] %s Target=%s FarewellBow=%d BowLock=%d MovementPause=%d ActionQueuePaused=%d IsGuiding=%d GuideTarget=%s"),
 		FunctionName ? FunctionName : TEXT("unknown"),
 		*Target,
 		bFarewellBowInProgress ? 1 : 0,
+		bBowMovementLockActive ? 1 : 0,
 		bMovePaused ? 1 : 0,
 		bActionQueuePausedForFarewellBow ? 1 : 0,
 		bGuideInProgress ? 1 : 0,
@@ -1688,7 +2316,11 @@ void UNPCActionQueueComponent::ClearOrderFulfillmentTimers()
 		World->GetTimerManager().ClearTimer(BillPresentationPauseTimerHandle);
 		World->GetTimerManager().ClearTimer(ClosingBowPauseTimerHandle);
 		World->GetTimerManager().ClearTimer(ReturnToCounterAfterClosingTimerHandle);
-		World->GetTimerManager().ClearTimer(BowMovementReleaseSafetyTimerHandle);
+		if (!bBowMovementLockActive)
+		{
+			World->GetTimerManager().ClearTimer(BowMinimumDurationTimerHandle);
+			World->GetTimerManager().ClearTimer(BowSafetyDelayTimerHandle);
+		}
 		if (!bFarewellBowInProgress)
 		{
 			World->GetTimerManager().ClearTimer(FarewellBowTimerHandle);
@@ -1867,14 +2499,20 @@ bool UNPCActionQueueComponent::IsBlockingServiceGesture(const FString& GestureNa
 void UNPCActionQueueComponent::BeginBlockingGesture(FName GestureName, float FallbackTimeout)
 {
 	const FString GestureNameString = GestureName.ToString().TrimStartAndEnd();
-	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Blocking gesture started: %s. Waiting for completion."), *GestureNameString);
-	if (GestureName == FName(TEXT("bow")) || GestureName == FName(TEXT("farewell_bow")))
-	{
-		if (AActor* Owner = GetOwner())
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[ActionQueue][BOW_LOCATION] bow start location=%s"), *Owner->GetActorLocation().ToString());
-		}
-	}
+	const bool bIsBowGesture = IsBowGestureName(GestureNameString);
+	UAnimMontage* MontageBeforeRequest = nullptr;
+	float MontagePositionBeforeRequest = 0.0f;
+	float IgnoredRemainingSeconds = 0.0f;
+	FString IgnoredAnimationName;
+	TryGetActiveGestureAnimationState(
+		MontageBeforeRequest,
+		MontagePositionBeforeRequest,
+		IgnoredRemainingSeconds,
+		IgnoredAnimationName);
+	BlockingGestureMontageBeforeRequest = MontageBeforeRequest;
+	BlockingGestureMontagePositionBeforeRequest = MontagePositionBeforeRequest;
+	PendingGestureAnimationTimingProbe = GestureName;
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Blocking gesture started: %s"), *GestureNameString);
 
 	if (bBlockingGestureInProgress && !bBlockingGestureFinishHandled)
 	{
@@ -1890,15 +2528,22 @@ void UNPCActionQueueComponent::BeginBlockingGesture(FName GestureName, float Fal
 	CurrentBlockingGestureName = GestureNameString;
 	bBlockingGestureFinishHandled = false;
 
-	CacheOwnerComponents();
-	if (MoveComponent)
+	if (bIsBowGesture)
 	{
-		MoveComponent->StopCurrentMovement();
-		MoveComponent->SetMovementPausedByServiceGesture(true);
+		StartBowMovementLock(GestureName);
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] NPCMoveToTableComponent not found for blocking gesture movement pause."));
+		CacheOwnerComponents();
+		if (MoveComponent)
+		{
+			MoveComponent->StopCurrentMovement();
+			MoveComponent->SetMovementPausedByServiceGesture(true);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] NPCMoveToTableComponent not found for blocking gesture movement pause."));
+		}
 	}
 
 	UWorld* World = GetWorld();
@@ -1916,6 +2561,13 @@ void UNPCActionQueueComponent::BeginBlockingGesture(FName GestureName, float Fal
 
 	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Gesture requested: %s"), *GestureNameString);
 	OnQueueGestureRequested.Broadcast(GestureName);
+
+	if (World)
+	{
+		FTimerDelegate ProbeDelegate;
+		ProbeDelegate.BindUObject(this, &UNPCActionQueueComponent::UpdateBlockingGestureTimingFromStartedAnimation, GestureName);
+		World->GetTimerManager().SetTimerForNextTick(ProbeDelegate);
+	}
 }
 
 float UNPCActionQueueComponent::GetBlockingGestureFallbackTimeout(const FString& GestureName) const
@@ -1976,22 +2628,15 @@ void UNPCActionQueueComponent::CompleteBlockingGesture(const FString& GestureNam
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(BlockingServiceGesturePauseTimerHandle);
-		World->GetTimerManager().ClearTimer(BowMovementReleaseSafetyTimerHandle);
 	}
 
 	const FString FinishedGestureName = CurrentBlockingGestureName;
 	bBlockingGestureInProgress = false;
 	CurrentBlockingGestureName = TEXT("");
-	const bool bFinishedFarewellBow =
-		FinishedGestureName.Equals(TEXT("bow"), ESearchCase::IgnoreCase)
-		|| FinishedGestureName.Equals(TEXT("farewell_bow"), ESearchCase::IgnoreCase);
-	const bool bDelayFarewellBowRelease = bFarewellBowInProgress && bFinishedFarewellBow;
-
-	CacheOwnerComponents();
-	if (MoveComponent && !bDelayFarewellBowRelease)
-	{
-		MoveComponent->SetMovementPausedByServiceGesture(false);
-	}
+	PendingGestureAnimationTimingProbe = NAME_None;
+	BlockingGestureMontageBeforeRequest = nullptr;
+	BlockingGestureMontagePositionBeforeRequest = 0.0f;
+	const bool bFinishedBow = IsBowGestureName(FinishedGestureName);
 
 	UE_LOG(
 		LogTemp,
@@ -1999,6 +2644,19 @@ void UNPCActionQueueComponent::CompleteBlockingGesture(const FString& GestureNam
 		TEXT("[ActionQueue] Blocking gesture finished: %s%s"),
 		*FinishedGestureName,
 		bForced ? TEXT(" (forced)") : TEXT(""));
+
+	if (bFinishedBow)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Bow finished by notify. Waiting safety delay before movement release."));
+		MarkBowFinishNotifyReceived(FName(*FinishedGestureName));
+		return;
+	}
+
+	CacheOwnerComponents();
+	if (MoveComponent)
+	{
+		MoveComponent->SetMovementPausedByServiceGesture(false);
+	}
 
 	const bool bFinishedServeGesture =
 		FinishedGestureName.Equals(TEXT("serve_food"), ESearchCase::IgnoreCase)
@@ -2056,41 +2714,37 @@ void UNPCActionQueueComponent::CompleteBlockingGesture(const FString& GestureNam
 			false);
 		return;
 	}
-
-	if (bDelayFarewellBowRelease)
-	{
-		const float SafetyDelay = FMath::Max(BowMovementReleaseSafetyDelay, 0.0f);
-		UE_LOG(
-			LogTemp,
-			Warning,
-			TEXT("[ActionQueue] Bow finished by %s. Releasing movement after safety delay=%.1f"),
-			bForced ? TEXT("timeout") : TEXT("notify"),
-			SafetyDelay);
-
-		UWorld* World = GetWorld();
-		if (!World || SafetyDelay <= KINDA_SMALL_NUMBER)
-		{
-			HandleBowMovementReleaseSafetyDelayFinished();
-			return;
-		}
-
-		World->GetTimerManager().ClearTimer(BowMovementReleaseSafetyTimerHandle);
-		World->GetTimerManager().SetTimer(
-			BowMovementReleaseSafetyTimerHandle,
-			this,
-			&UNPCActionQueueComponent::HandleBowMovementReleaseSafetyDelayFinished,
-			SafetyDelay,
-			false);
-	}
 }
 
-bool UNPCActionQueueComponent::BlockMovementIfBlockingGestureInProgress(const TCHAR* FunctionName) const
+bool UNPCActionQueueComponent::BlockMovementIfBlockingGestureInProgress(const TCHAR* FunctionName, const FString& Target, bool bTargetIsCounter)
 {
+	const FString TrimmedTarget = Target.TrimStartAndEnd();
+	const FString LogTarget = TrimmedTarget.IsEmpty()
+		? FString(FunctionName ? FunctionName : TEXT("unknown"))
+		: TrimmedTarget;
+	const bool bCounterTarget = bTargetIsCounter || IsCounterTarget(TrimmedTarget);
+
+	if (bBowMovementLockActive)
+	{
+		if (bCounterTarget)
+		{
+			bPendingReturnToCounterAfterBow = true;
+		}
+
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Movement request deferred during bow lock. Target=%s"), *LogTarget);
+		return true;
+	}
+
 	if (bFarewellBowInProgress
 		|| CurrentBlockingGestureName.Equals(TEXT("bow"), ESearchCase::IgnoreCase)
 		|| CurrentBlockingGestureName.Equals(TEXT("farewell_bow"), ESearchCase::IgnoreCase))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Movement request blocked while bow is still active."));
+		if (bCounterTarget)
+		{
+			bPendingReturnToCounterAfterBow = true;
+		}
+
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Movement request deferred during bow lock. Target=%s"), *LogTarget);
 		return true;
 	}
 
@@ -2119,22 +2773,29 @@ void UNPCActionQueueComponent::HandleBlockingGestureTimeout()
 	if (TimedOutGestureName.Equals(TEXT("bow"), ESearchCase::IgnoreCase)
 		|| TimedOutGestureName.Equals(TEXT("farewell_bow"), ESearchCase::IgnoreCase))
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Blocking gesture timeout: bow. This means BP bow completion notify is late or missing."));
+		ForceReleaseBowMovementLockByTimeout();
+		return;
 	}
-	else
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Blocking gesture timeout: %s. Forcing completion."), *TimedOutGestureName);
-	}
+
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Blocking gesture timeout: %s. Forcing completion."), *TimedOutGestureName);
 	CompleteBlockingGesture(TimedOutGestureName, true);
 }
 
-bool UNPCActionQueueComponent::BlockReturnToCounterIfFarewellBowInProgress() const
+bool UNPCActionQueueComponent::BlockReturnToCounterIfFarewellBowInProgress()
 {
+	if (bBowMovementLockActive)
+	{
+		bPendingReturnToCounterAfterBow = true;
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Movement request deferred during bow lock. Target=counter"));
+		return true;
+	}
+
 	if (!bFarewellBowInProgress)
 	{
 		return false;
 	}
 
+	bPendingReturnToCounterAfterBow = true;
 	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Return/move to counter blocked because farewell bow is in progress."));
 	return true;
 }
@@ -2156,6 +2817,370 @@ bool UNPCActionQueueComponent::IsCounterMoveAction(const FNPCQueuedAction& Actio
 		&& IsCounterTarget(Action.Target);
 }
 
+bool UNPCActionQueueComponent::DoesQueuedActionListContainCounterMove() const
+{
+	return ActionQueue.ContainsByPredicate([this](const FNPCQueuedAction& Action)
+	{
+		return IsCounterMoveAction(Action);
+	});
+}
+
+bool UNPCActionQueueComponent::IsBowGestureName(const FString& GestureName) const
+{
+	const FString NormalizedGestureName = GestureName.TrimStartAndEnd();
+	return NormalizedGestureName.Equals(TEXT("bow"), ESearchCase::IgnoreCase)
+		|| NormalizedGestureName.Equals(TEXT("farewell_bow"), ESearchCase::IgnoreCase);
+}
+
+void UNPCActionQueueComponent::StartBowMovementLock(FName GestureName)
+{
+	const FString GestureNameString = GestureName.ToString().TrimStartAndEnd();
+	bBowMovementLockActive = true;
+	bBowFinishNotifyReceived = false;
+	bBowMinimumDurationElapsed = false;
+	bBowSafetyDelayElapsed = false;
+	bPendingReturnToCounterAfterBow = false;
+
+	CacheOwnerComponents();
+	if (MoveComponent)
+	{
+		MoveComponent->CancelActiveMovementForServiceGesture();
+		MoveComponent->SetMovementPausedByServiceGesture(true);
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] NPCMoveToTableComponent not found for bow movement lock."));
+	}
+
+	const float MinimumDuration = FMath::Max(BowMinimumLockDurationSeconds, 0.0f);
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Bow movement hard lock enabled."));
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[ActionQueue] Bow movement lock started. Gesture=%s MinDuration=%.2f"),
+		*GestureNameString,
+		MinimumDuration);
+
+	UWorld* World = GetWorld();
+	if (World)
+	{
+		World->GetTimerManager().ClearTimer(BowMinimumDurationTimerHandle);
+		World->GetTimerManager().ClearTimer(BowSafetyDelayTimerHandle);
+	}
+
+	if (!World || MinimumDuration <= KINDA_SMALL_NUMBER)
+	{
+		MarkBowMinimumDurationElapsed();
+		return;
+	}
+
+	World->GetTimerManager().SetTimer(
+		BowMinimumDurationTimerHandle,
+		this,
+		&UNPCActionQueueComponent::MarkBowMinimumDurationElapsed,
+		MinimumDuration,
+		false);
+}
+
+void UNPCActionQueueComponent::MarkBowFinishNotifyReceived(FName GestureName)
+{
+	const FString GestureNameString = GestureName.ToString().TrimStartAndEnd();
+	if (!IsBowGestureName(GestureNameString))
+	{
+		return;
+	}
+
+	if (!bBowMovementLockActive)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Bow finish notify received without active bow lock. Gesture=%s"), *GestureNameString);
+		return;
+	}
+
+	if (!bBowFinishNotifyReceived)
+	{
+		bBowFinishNotifyReceived = true;
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Bow finish notify received. Waiting min duration and safety delay."));
+	}
+
+	const float SafetyDelay = FMath::Max(BowMovementReleaseSafetyDelay, 0.0f);
+	UWorld* World = GetWorld();
+	if (!World || SafetyDelay <= KINDA_SMALL_NUMBER)
+	{
+		MarkBowSafetyDelayElapsed();
+		return;
+	}
+
+	World->GetTimerManager().ClearTimer(BowSafetyDelayTimerHandle);
+	World->GetTimerManager().SetTimer(
+		BowSafetyDelayTimerHandle,
+		this,
+		&UNPCActionQueueComponent::MarkBowSafetyDelayElapsed,
+		SafetyDelay,
+		false);
+
+	TryReleaseBowMovementLock();
+}
+
+void UNPCActionQueueComponent::MarkBowMinimumDurationElapsed()
+{
+	if (!bBowMovementLockActive)
+	{
+		return;
+	}
+
+	bBowMinimumDurationElapsed = true;
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Bow minimum duration elapsed."));
+	TryReleaseBowMovementLock();
+}
+
+void UNPCActionQueueComponent::MarkBowSafetyDelayElapsed()
+{
+	if (!bBowMovementLockActive)
+	{
+		return;
+	}
+
+	bBowSafetyDelayElapsed = true;
+	TryReleaseBowMovementLock();
+}
+
+void UNPCActionQueueComponent::TryReleaseBowMovementLock()
+{
+	if (!bBowMovementLockActive)
+	{
+		return;
+	}
+
+	if (!bBowFinishNotifyReceived || !bBowMinimumDurationElapsed || !bBowSafetyDelayElapsed)
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[ActionQueue] Bow lock not ready. Notify=%d Min=%d Safety=%d"),
+			bBowFinishNotifyReceived ? 1 : 0,
+			bBowMinimumDurationElapsed ? 1 : 0,
+			bBowSafetyDelayElapsed ? 1 : 0);
+		return;
+	}
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(BowMinimumDurationTimerHandle);
+		World->GetTimerManager().ClearTimer(BowSafetyDelayTimerHandle);
+		World->GetTimerManager().ClearTimer(BlockingServiceGesturePauseTimerHandle);
+	}
+
+	const bool bShouldReturnToCounter = bPendingReturnToCounterAfterBow || (bFarewellBowInProgress && bReturnToCounterAfterServing);
+	bPendingReturnToCounterAfterBow = false;
+	bBowMovementLockActive = false;
+	bBowFinishNotifyReceived = false;
+	bBowMinimumDurationElapsed = false;
+	bBowSafetyDelayElapsed = false;
+
+	ReleaseFarewellBowMovementLock();
+
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[ActionQueue] Bow movement lock released. ReturningToCounter=%s"),
+		bShouldReturnToCounter ? TEXT("true") : TEXT("false"));
+
+	if (!bShouldReturnToCounter)
+	{
+		ClearPendingOrderState();
+		return;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Bow hard lock released. Scheduling return to counter."));
+	ScheduleReturnToCounterAfterClosingDelay();
+}
+
+void UNPCActionQueueComponent::ForceReleaseBowMovementLockByTimeout()
+{
+	const FString TimedOutGestureName = CurrentBlockingGestureName;
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Bow timeout forced. BP notify is missing or too late."));
+
+	bBlockingGestureFinishHandled = true;
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(BlockingServiceGesturePauseTimerHandle);
+	}
+
+	bBlockingGestureInProgress = false;
+	CurrentBlockingGestureName = TEXT("");
+
+	if (!bBowMovementLockActive && IsBowGestureName(TimedOutGestureName))
+	{
+		StartBowMovementLock(FName(*TimedOutGestureName));
+	}
+
+	MarkBowFinishNotifyReceived(FName(*TimedOutGestureName));
+}
+
+void UNPCActionQueueComponent::UpdateBlockingGestureTimingFromStartedAnimation(FName GestureName)
+{
+	if (!bBlockingGestureInProgress
+		|| PendingGestureAnimationTimingProbe != GestureName
+		|| !CurrentBlockingGestureName.Equals(GestureName.ToString(), ESearchCase::IgnoreCase))
+	{
+		return;
+	}
+	PendingGestureAnimationTimingProbe = NAME_None;
+
+	UAnimMontage* ActiveMontage = nullptr;
+	float MontagePosition = 0.0f;
+	float RemainingSeconds = 0.0f;
+	FString AnimationName;
+	if (!TryGetActiveGestureAnimationState(ActiveMontage, MontagePosition, RemainingSeconds, AnimationName))
+	{
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[ActionQueue] Gesture animation probe found no active montage; using fallback. Gesture=%s"),
+			*GestureName.ToString());
+		return;
+	}
+
+	const UAnimMontage* MontageBeforeRequest = BlockingGestureMontageBeforeRequest.Get();
+	const bool bNewMontage = ActiveMontage != MontageBeforeRequest;
+	const bool bExistingMontageRestarted = ActiveMontage == MontageBeforeRequest
+		&& MontagePosition + 0.05f < BlockingGestureMontagePositionBeforeRequest;
+	if (!bNewMontage && !bExistingMontageRestarted)
+	{
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[ActionQueue] Ignored pre-existing montage for gesture timing. Gesture=%s Animation=%s"),
+			*GestureName.ToString(),
+			*AnimationName);
+		return;
+	}
+
+	if (IsBowGestureName(GestureName.ToString()))
+	{
+		const FString NormalizedAnimationName = AnimationName.ToLower();
+		if (!NormalizedAnimationName.Contains(TEXT("bow"))
+			&& !NormalizedAnimationName.Contains(TEXT("greet")))
+		{
+			UE_LOG(
+				LogTemp,
+				Warning,
+				TEXT("[ActionQueue] Ignored unrelated montage for bow timing. Animation=%s"),
+				*AnimationName);
+			return;
+		}
+	}
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+
+	FTimerManager& TimerManager = World->GetTimerManager();
+	const float CompletionDelay = RemainingSeconds + 0.1f;
+	TimerManager.ClearTimer(BlockingServiceGesturePauseTimerHandle);
+	TimerManager.SetTimer(
+		BlockingServiceGesturePauseTimerHandle,
+		this,
+		&UNPCActionQueueComponent::HandleBlockingGestureTimeout,
+		CompletionDelay,
+		false);
+
+	if (IsBowGestureName(GestureName.ToString()) && bBowMovementLockActive)
+	{
+		const float CurrentLockRemaining = TimerManager.IsTimerActive(BowMinimumDurationTimerHandle)
+			? TimerManager.GetTimerRemaining(BowMinimumDurationTimerHandle)
+			: 0.0f;
+		if (RemainingSeconds > CurrentLockRemaining + 0.05f)
+		{
+			bBowMinimumDurationElapsed = false;
+			TimerManager.ClearTimer(BowMinimumDurationTimerHandle);
+			TimerManager.SetTimer(
+				BowMinimumDurationTimerHandle,
+				this,
+				&UNPCActionQueueComponent::MarkBowMinimumDurationElapsed,
+				RemainingSeconds,
+				false);
+		}
+	}
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[ActionQueue] Gesture timing matched newly started animation. Gesture=%s Animation=%s Remaining=%.2f"),
+		*GestureName.ToString(),
+		*AnimationName,
+		RemainingSeconds);
+}
+
+bool UNPCActionQueueComponent::TryGetActiveGestureAnimationState(
+	UAnimMontage*& OutMontage,
+	float& OutPosition,
+	float& OutRemainingSeconds,
+	FString& OutAnimationName) const
+{
+	OutMontage = nullptr;
+	OutPosition = 0.0f;
+	OutRemainingSeconds = 0.0f;
+	OutAnimationName = TEXT("");
+
+	AActor* Owner = GetOwner();
+	if (!Owner)
+	{
+		return false;
+	}
+
+	USkeletalMeshComponent* MeshComponent = nullptr;
+	if (const ACharacter* CharacterOwner = Cast<ACharacter>(Owner))
+	{
+		MeshComponent = CharacterOwner->GetMesh();
+	}
+
+	if (!MeshComponent)
+	{
+		MeshComponent = Owner->FindComponentByClass<USkeletalMeshComponent>();
+	}
+
+	if (!MeshComponent)
+	{
+		return false;
+	}
+
+	UAnimInstance* AnimInstance = MeshComponent->GetAnimInstance();
+	if (!AnimInstance)
+	{
+		return false;
+	}
+
+	UAnimMontage* ActiveMontage = AnimInstance->GetCurrentActiveMontage();
+	if (!ActiveMontage)
+	{
+		return false;
+	}
+
+	const float PlayLength = ActiveMontage->GetPlayLength();
+	if (PlayLength <= KINDA_SMALL_NUMBER)
+	{
+		return false;
+	}
+
+	const float Position = FMath::Clamp(AnimInstance->Montage_GetPosition(ActiveMontage), 0.0f, PlayLength);
+	const float PlayRate = FMath::Abs(AnimInstance->Montage_GetPlayRate(ActiveMontage));
+	const float EffectivePlayRate = PlayRate > KINDA_SMALL_NUMBER ? PlayRate : 1.0f;
+	const float RemainingSeconds = (PlayLength - Position) / EffectivePlayRate;
+	if (RemainingSeconds <= KINDA_SMALL_NUMBER)
+	{
+		return false;
+	}
+
+	OutRemainingSeconds = RemainingSeconds;
+	OutMontage = ActiveMontage;
+	OutPosition = Position;
+	OutAnimationName = ActiveMontage->GetName();
+	return true;
+}
+
 void UNPCActionQueueComponent::EnableFarewellBowLock()
 {
 	bFarewellBowInProgress = true;
@@ -2172,7 +3197,11 @@ void UNPCActionQueueComponent::EnableFarewellBowLock()
 		World->GetTimerManager().ClearTimer(WaitTimerHandle);
 		World->GetTimerManager().ClearTimer(ReturnToCounterAfterClosingTimerHandle);
 		World->GetTimerManager().ClearTimer(BlockingServiceGesturePauseTimerHandle);
-		World->GetTimerManager().ClearTimer(BowMovementReleaseSafetyTimerHandle);
+		if (!bBowMovementLockActive)
+		{
+			World->GetTimerManager().ClearTimer(BowMinimumDurationTimerHandle);
+			World->GetTimerManager().ClearTimer(BowSafetyDelayTimerHandle);
+		}
 	}
 }
 
@@ -2184,7 +3213,8 @@ void UNPCActionQueueComponent::ReleaseFarewellBowMovementLock()
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(BlockingServiceGesturePauseTimerHandle);
-		World->GetTimerManager().ClearTimer(BowMovementReleaseSafetyTimerHandle);
+		World->GetTimerManager().ClearTimer(BowMinimumDurationTimerHandle);
+		World->GetTimerManager().ClearTimer(BowSafetyDelayTimerHandle);
 	}
 
 	CacheOwnerComponents();
@@ -2198,7 +3228,7 @@ void UNPCActionQueueComponent::ReturnToCounterAfterServingIfNeeded()
 {
 	LogActionQueueMoveRequest(TEXT("ReturnToCounterAfterServingIfNeeded"), TEXT("counter"));
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("ReturnToCounterAfterServingIfNeeded")))
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("ReturnToCounterAfterServingIfNeeded"), TEXT("counter"), true))
 	{
 		return;
 	}
@@ -2214,6 +3244,11 @@ void UNPCActionQueueComponent::ReturnToCounterAfterServingIfNeeded()
 		return;
 	}
 
+	ScheduleReturnToCounterAfterClosingDelay();
+}
+
+void UNPCActionQueueComponent::ScheduleReturnToCounterAfterClosingDelay()
+{
 	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Waiting before returning to counter after closing"));
 
 	UWorld* World = GetWorld();
@@ -2224,6 +3259,7 @@ void UNPCActionQueueComponent::ReturnToCounterAfterServingIfNeeded()
 		return;
 	}
 
+	World->GetTimerManager().ClearTimer(ReturnToCounterAfterClosingTimerHandle);
 	World->GetTimerManager().SetTimer(
 		ReturnToCounterAfterClosingTimerHandle,
 		this,
@@ -2236,7 +3272,7 @@ void UNPCActionQueueComponent::HandleReturnToCounterAfterClosingDelayFinished()
 {
 	LogActionQueueMoveRequest(TEXT("HandleReturnToCounterAfterClosingDelayFinished"), TEXT("counter"));
 
-	if (BlockMovementIfBlockingGestureInProgress(TEXT("HandleReturnToCounterAfterClosingDelayFinished")))
+	if (BlockMovementIfBlockingGestureInProgress(TEXT("HandleReturnToCounterAfterClosingDelayFinished"), TEXT("counter"), true))
 	{
 		return;
 	}
@@ -2255,9 +3291,12 @@ void UNPCActionQueueComponent::HandleReturnToCounterAfterClosingDelayFinished()
 void UNPCActionQueueComponent::HandleFarewellBowFinished()
 {
 	LogActionQueueMoveRequest(TEXT("HandleFarewellBowFinished"), TEXT("counter"));
-	if (AActor* Owner = GetOwner())
+
+	if (bBowMovementLockActive)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue][BOW_LOCATION] bow end location=%s"), *Owner->GetActorLocation().ToString());
+		bPendingReturnToCounterAfterBow = true;
+		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Movement request deferred during bow lock. Target=counter"));
+		return;
 	}
 
 	ReleaseFarewellBowMovementLock();
@@ -2269,16 +3308,8 @@ void UNPCActionQueueComponent::HandleFarewellBowFinished()
 		return;
 	}
 
-	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Farewell bow lock released. Returning to counter."));
-	ClearActionQueue();
-	EnqueueMoveToSceneTag(TEXT("counter"));
-	StartActionQueue();
-}
-
-void UNPCActionQueueComponent::HandleBowMovementReleaseSafetyDelayFinished()
-{
-	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Bow safety delay finished. Returning to counter."));
-	HandleFarewellBowFinished();
+	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Farewell bow lock released. Scheduling return to counter."));
+	ScheduleReturnToCounterAfterClosingDelay();
 }
 
 void UNPCActionQueueComponent::ClearPostSeatingMenuGuidanceTimers()
@@ -2318,9 +3349,11 @@ void UNPCActionQueueComponent::HandleNPCMoveCompleted(FName MoveReason, FString 
 
 	if (bCompletedPendingOrderReturn)
 	{
+		const FString ServedItem = PendingOrderItem.TrimStartAndEnd();
 		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Order served at table: %s"), *CompletedTargetID);
 		bPendingOrderFulfillment = false;
 		PendingOrderReturnTableID = TEXT("");
+		OnOrderServed.Broadcast(CompletedTargetID, ServedItem);
 		StartOrderServingCompletionFlow();
 	}
 }
@@ -2367,6 +3400,117 @@ void UNPCActionQueueComponent::HandleWaitTimerFinished()
 
 	PickUpFoodForPendingOrder();
 	CompleteCurrentAction(true, TEXT(""));
+}
+
+void UNPCActionQueueComponent::HandleQueuedAnimationTimerFinished()
+{
+	if (!bIsRunningQueue || CurrentAction.ActionType != ENPCQueuedActionType::Animation)
+	{
+		return;
+	}
+
+	bQueuedAnimationInProgress = false;
+	bQueuedAnimationPaused = false;
+	ActiveQueuedAnimationMontage = nullptr;
+	ActiveQueuedAnimationInstance = nullptr;
+	CompleteCurrentAction(true, TEXT(""));
+}
+
+void UNPCActionQueueComponent::StopQueuedAnimation(float BlendOutSeconds)
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(QueuedAnimationTimerHandle);
+	}
+
+	if (ActiveQueuedAnimationMontage)
+	{
+		if (ActiveQueuedAnimationInstance)
+		{
+			ActiveQueuedAnimationInstance->Montage_Stop(
+				FMath::Max(BlendOutSeconds, 0.0f),
+				ActiveQueuedAnimationMontage);
+		}
+	}
+
+	bQueuedAnimationInProgress = false;
+	bQueuedAnimationPaused = false;
+	ActiveQueuedAnimationMontage = nullptr;
+	ActiveQueuedAnimationInstance = nullptr;
+}
+
+USkeletalMeshComponent* UNPCActionQueueComponent::ResolveHeldPropAttachmentMesh(
+	FName SocketName,
+	FName& OutResolvedSocketName) const
+{
+	OutResolvedSocketName = SocketName;
+	AActor* OwnerActor = GetOwner();
+	if (!OwnerActor)
+	{
+		return nullptr;
+	}
+
+	TArray<FName> CandidateSocketNames;
+	CandidateSocketNames.Add(SocketName);
+	const FString RequestedSocket = SocketName.ToString();
+	if (RequestedSocket.Equals(TEXT("RightHand"), ESearchCase::IgnoreCase)
+		|| RequestedSocket.Equals(TEXT("hand_r"), ESearchCase::IgnoreCase))
+	{
+		CandidateSocketNames.AddUnique(FName(TEXT("hand_R")));
+		CandidateSocketNames.AddUnique(FName(TEXT("RightHand")));
+		CandidateSocketNames.AddUnique(FName(TEXT("hand_r")));
+		CandidateSocketNames.AddUnique(FName(TEXT("mixamorig:RightHand")));
+	}
+	else if (RequestedSocket.Equals(TEXT("LeftHand"), ESearchCase::IgnoreCase)
+		|| RequestedSocket.Equals(TEXT("hand_l"), ESearchCase::IgnoreCase))
+	{
+		CandidateSocketNames.AddUnique(FName(TEXT("hand_L")));
+		CandidateSocketNames.AddUnique(FName(TEXT("LeftHand")));
+		CandidateSocketNames.AddUnique(FName(TEXT("hand_l")));
+		CandidateSocketNames.AddUnique(FName(TEXT("mixamorig:LeftHand")));
+	}
+
+	TArray<USkeletalMeshComponent*> MeshComponents;
+	OwnerActor->GetComponents<USkeletalMeshComponent>(MeshComponents);
+	for (FName CandidateSocketName : CandidateSocketNames)
+	{
+		for (USkeletalMeshComponent* CandidateMesh : MeshComponents)
+		{
+			if (CandidateMesh
+				&& CandidateMesh->GetSkeletalMeshAsset()
+				&& CandidateMesh->DoesSocketExist(CandidateSocketName))
+			{
+				if (CandidateSocketName != SocketName)
+				{
+					UE_LOG(
+						LogTemp,
+						Log,
+						TEXT("[ActionQueue] resolved held prop socket alias. Requested=%s Resolved=%s"),
+						*SocketName.ToString(),
+						*CandidateSocketName.ToString());
+				}
+				OutResolvedSocketName = CandidateSocketName;
+				return CandidateMesh;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+void UNPCActionQueueComponent::RemoveActiveHeldProp()
+{
+	if (!ActiveHeldPropComponent)
+	{
+		return;
+	}
+
+	const FString RemovedMeshName = ActiveHeldPropComponent->GetStaticMesh()
+		? ActiveHeldPropComponent->GetStaticMesh()->GetName()
+		: TEXT("none");
+	ActiveHeldPropComponent->DestroyComponent();
+	ActiveHeldPropComponent = nullptr;
+	UE_LOG(LogTemp, Log, TEXT("[ActionQueue] held prop removed. Mesh=%s"), *RemovedMeshName);
 }
 
 void UNPCActionQueueComponent::HandlePostServePauseTimerFinished()
@@ -2441,6 +3585,10 @@ void UNPCActionQueueComponent::HandleClosingBowPauseTimerFinished()
 	}
 
 	BroadcastQueueGesture(FName(TEXT("bow")));
+	if (bReturnToCounterAfterServing)
+	{
+		bPendingReturnToCounterAfterBow = true;
+	}
 	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Farewell bow started. Waiting for completion before returning to counter."));
 	BroadcastServiceSpeech(BillFarewellLine);
 }

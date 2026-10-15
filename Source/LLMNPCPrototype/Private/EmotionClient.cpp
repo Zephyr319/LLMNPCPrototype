@@ -1,5 +1,10 @@
 #include "EmotionClient.h"
 
+#include "Async/Async.h"
+#include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformProcess.h"
+#include "HAL/PlatformTime.h"
+
 #include "HttpModule.h"
 #include "Interfaces/IHttpRequest.h"
 #include "Interfaces/IHttpResponse.h"
@@ -9,10 +14,19 @@
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
 
-#include "Async/Async.h"
-#include "HAL/PlatformFilemanager.h"
-#include "HAL/PlatformProcess.h"
-#include "HAL/PlatformTime.h"
+FOnPlayerVoiceEmotionNative UEmotionClient::OnAnyPlayerVoiceEmotion;
+FString UEmotionClient::LatestPlayerVoiceEmotion = TEXT("unknown");
+double UEmotionClient::LatestPlayerVoiceEmotionTimeSeconds = -1.0;
+
+FString UEmotionClient::GetLatestPlayerVoiceEmotion(float MaximumAgeSeconds)
+{
+	if (LatestPlayerVoiceEmotionTimeSeconds < 0.0
+		|| FPlatformTime::Seconds() - LatestPlayerVoiceEmotionTimeSeconds > FMath::Max(MaximumAgeSeconds, 0.0f))
+	{
+		return TEXT("unknown");
+	}
+	return LatestPlayerVoiceEmotion;
+}
 
 void UEmotionClient::AppendStringToBody(TArray<uint8>& Body, const FString& Text)
 {
@@ -247,6 +261,9 @@ void UEmotionClient::OnEmotionResponseReceivedWithId(
     }
 
     UE_LOG(LogTemp, Warning, TEXT("Emotion result. RequestId=%d, Emotion=%s"), RequestId, *Emotion);
+	LatestPlayerVoiceEmotion = Emotion.TrimStartAndEnd().IsEmpty() ? TEXT("unknown") : Emotion.TrimStartAndEnd();
+	LatestPlayerVoiceEmotionTimeSeconds = FPlatformTime::Seconds();
+	OnAnyPlayerVoiceEmotion.Broadcast(LatestPlayerVoiceEmotion);
 
     // Old event, kept for compatibility.
     OnEmotionResultReceived.Broadcast(Emotion);
