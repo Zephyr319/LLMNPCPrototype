@@ -2,6 +2,8 @@
 
 #include "NPCProactiveMenuHelpComponent.h"
 
+#include "NPCPersonaProfile.h"
+
 #include "LLMClient.h"
 #include "NPCActionQueueComponent.h"
 
@@ -12,13 +14,13 @@ UNPCProactiveMenuHelpComponent::UNPCProactiveMenuHelpComponent()
 	bUseStrategyMode = true;
 	bProactiveHelpOffered = false;
 	HesitationThreshold = 0.5f;
-	NPCName = TEXT("アリス");
-	NPCRole = TEXT("heroic game-loving cafe maid");
+	NPCName = LLMNPCPersona::NameJapanese();
+	NPCRole = LLMNPCPersona::CompactDescriptionEnglish();
 	PlayerEmotion = TEXT("unknown");
 	UserConfusion = TEXT("unknown");
 	UserBehaviorHint = TEXT("hesitating near the menu");
 	HesitationScore = 0.0f;
-	FixedProactiveHelpLine = TEXT("先生、メニュー選びも大切なクエストです。アリスのおすすめはカレーライスです！");
+	FixedProactiveHelpLine = TEXT("メニューで迷っていらっしゃいますか？ よろしければ、私のおすすめもご案内しますよ。");
 	LLMClientRef = nullptr;
 }
 

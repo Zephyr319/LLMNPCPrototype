@@ -2,6 +2,8 @@
 
 #include "NPCMemoryComponent.h"
 
+#include "NPCPersonaProfile.h"
+
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
 #include "HAL/PlatformFileManager.h"
@@ -17,7 +19,7 @@ UNPCMemoryComponent::UNPCMemoryComponent()
 	MaxMemoryEntries = 64;
 	bLogMemoryEvents = true;
 	bPersistMemories = true;
-	MemoryFileName = TEXT("alice_memories.json");
+	MemoryFileName = LLMNPCPersona::MemoryFileName();
 	MemoryFilePath = TEXT("");
 	RecallHalfLifeHours = 24.0f;
 	NoCueBaselineRelevance = 0.35f;

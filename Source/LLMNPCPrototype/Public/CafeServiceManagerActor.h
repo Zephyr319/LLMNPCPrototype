@@ -165,6 +165,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Cafe Service|Departure")
 	bool SubmitMealCompletionConfirmation(bool bFinished);
 
+	UFUNCTION(BlueprintCallable, Category = "Cafe Service|Social Initiative")
+	bool TriggerSeatedConversationOpportunity();
+
 private:
 	UPROPERTY(Transient)
 	UNPCMoveToTableComponent* MaidMoveComponent;
@@ -228,7 +231,7 @@ private:
 
 	bool IsPlayerLookingAtMaid(float& OutLookDot) const;
 
-	FString BuildSocialOpportunityContext(float DistanceToMaid, float LookDot);
+	FString BuildSocialOpportunityContext(float DistanceToMaid, float LookDot, bool bSeatedConversation = false);
 
 	bool SelectSocialTopicMemory(FNPCMemoryEntry& OutMemory, FNPCRecallScore& OutScore);
 

@@ -16,6 +16,7 @@
 #include "HAL/PlatformMisc.h"
 #include "NPCActionQueueComponent.h"
 #include "NPCAutonomyComponent.h"
+#include "NPCPersonaProfile.h"
 
 FOnInteractiveLLMRequestStartedNative ULLMClient::OnAnyInteractiveRequestStarted;
 FOnInteractionMemoryExtractedNative ULLMClient::OnInteractionMemoryExtracted;
@@ -152,6 +153,49 @@ namespace
         return Content;
     }
 
+    bool TryDeserializeJsonObjectContent(
+        const FString& Content,
+        TSharedPtr<FJsonObject>& OutObject,
+        FString& OutJsonContent,
+        FString& OutLeadingText)
+    {
+        OutObject.Reset();
+        OutJsonContent.Reset();
+        OutLeadingText.Reset();
+
+        auto TryDeserialize = [&OutObject](const FString& Candidate)
+        {
+            TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(Candidate);
+            return FJsonSerializer::Deserialize(Reader, OutObject) && OutObject.IsValid();
+        };
+
+        if (TryDeserialize(Content))
+        {
+            OutJsonContent = Content;
+            return true;
+        }
+
+        const int32 FirstBrace = Content.Find(TEXT("{"), ESearchCase::CaseSensitive, ESearchDir::FromStart);
+        const int32 LastBrace = Content.Find(TEXT("}"), ESearchCase::CaseSensitive, ESearchDir::FromEnd);
+        if (FirstBrace == INDEX_NONE || LastBrace <= FirstBrace)
+        {
+            return false;
+        }
+
+        const FString Candidate = Content.Mid(FirstBrace, LastBrace - FirstBrace + 1).TrimStartAndEnd();
+        if (!TryDeserialize(Candidate))
+        {
+            return false;
+        }
+
+        OutJsonContent = Candidate;
+        OutLeadingText = Content.Left(FirstBrace).TrimStartAndEnd();
+        OutLeadingText.RemoveFromStart(TEXT("```json"), ESearchCase::IgnoreCase);
+        OutLeadingText.RemoveFromStart(TEXT("```"), ESearchCase::CaseSensitive);
+        OutLeadingText = OutLeadingText.TrimStartAndEnd();
+        return true;
+    }
+
     FString BuildStrategyUserContent(const FString& UserMessage)
     {
         const bool bPlayerInTableArea = UNPCActionQueueComponent::IsLastKnownPlayerInTableArea();
@@ -207,6 +251,58 @@ namespace
 		});
 	}
 
+	bool TryInferSeatInvitationResponseAction(const FString& UserMessage, FString& OutAction)
+	{
+		const FString Message = UserMessage.TrimStartAndEnd();
+		const TArray<FString> DeclineTerms = {
+			TEXT("不可以"), TEXT("不行"), TEXT("不用"), TEXT("不要"), TEXT("别坐"),
+			TEXT("现在不方便"), TEXT("下次吧"), TEXT("いいえ"), TEXT("だめ"), TEXT("座らないで"),
+			TEXT("遠慮"), TEXT("今はちょっと"), TEXT("not now"), TEXT("don't"), TEXT("do not"), TEXT("no")
+		};
+		if (ContainsAnyInteractionTerm(Message, DeclineTerms))
+		{
+			OutAction = TEXT("decline_seat_invitation");
+			return true;
+		}
+
+		const TArray<FString> AcceptTerms = {
+			TEXT("可以"), TEXT("请坐"), TEXT("坐吧"), TEXT("当然"), TEXT("好啊"), TEXT("好呀"),
+			TEXT("没问题"), TEXT("来吧"), TEXT("はい"), TEXT("どうぞ"), TEXT("座ってください"),
+			TEXT("もちろん"), TEXT("構いません"), TEXT("いいですよ"), TEXT("go ahead"),
+			TEXT("please sit"), TEXT("sure"), TEXT("okay"), TEXT("yes"), TEXT("ok")
+		};
+		if (ContainsAnyInteractionTerm(Message, AcceptTerms))
+		{
+			OutAction = TEXT("accept_seat_invitation");
+			return true;
+		}
+
+		OutAction.Reset();
+		return false;
+	}
+
+	bool IsDirectSitOppositeRequest(const FString& UserMessage)
+	{
+		const FString Message = UserMessage.TrimStartAndEnd();
+		const TArray<FString> RefusalTerms = {
+			TEXT("不要坐"), TEXT("别坐"), TEXT("不用坐"), TEXT("不许坐"),
+			TEXT("座らないで"), TEXT("座らなくていい"), TEXT("don't sit"), TEXT("do not sit")
+		};
+		if (ContainsAnyInteractionTerm(Message, RefusalTerms))
+		{
+			return false;
+		}
+
+		const TArray<FString> DirectSitTerms = {
+			TEXT("坐到我的对面"), TEXT("坐到我对面"), TEXT("坐我对面"),
+			TEXT("在我对面坐"), TEXT("来我对面坐"), TEXT("陪我坐下"),
+			TEXT("坐下来陪我"), TEXT("坐下来聊"), TEXT("坐下陪我聊"),
+			TEXT("向かいに座"), TEXT("向かいの席に座"), TEXT("座って話"),
+			TEXT("sit across from me"), TEXT("sit opposite me"), TEXT("sit with me")
+		};
+		return ContainsAnyInteractionTerm(Message, DirectSitTerms);
+	}
+
 	FNPCInteractionMemorySignal BuildFallbackInteractionMemorySignal(const FString& UserMessage)
 	{
 		FNPCInteractionMemorySignal Signal;
@@ -226,7 +322,7 @@ namespace
 		{
 			Signal.bShouldRemember = true;
 			Signal.EventTag = FName(TEXT("player_positive_feedback"));
-			Signal.Summary = FString::Printf(TEXT("The customer gave Alice positive feedback: %s"), *Signal.PlayerUtterance);
+			Signal.Summary = FString::Printf(TEXT("The customer gave Sumiha positive feedback: %s"), *Signal.PlayerUtterance);
 			Signal.CueTags = { FName(TEXT("player")), FName(TEXT("dialogue")), FName(TEXT("praise")), FName(TEXT("service")) };
 			Signal.Valence = 0.75f;
 			Signal.Arousal = 0.45f;
@@ -236,7 +332,7 @@ namespace
 		{
 			Signal.bShouldRemember = true;
 			Signal.EventTag = FName(TEXT("player_negative_feedback"));
-			Signal.Summary = FString::Printf(TEXT("The customer criticized Alice or the service: %s"), *Signal.PlayerUtterance);
+			Signal.Summary = FString::Printf(TEXT("The customer criticized Sumiha or the service: %s"), *Signal.PlayerUtterance);
 			Signal.CueTags = { FName(TEXT("player")), FName(TEXT("dialogue")), FName(TEXT("complaint")), FName(TEXT("service")) };
 			Signal.Valence = -0.7f;
 			Signal.Arousal = 0.6f;
@@ -1064,19 +1160,14 @@ void ULLMClient::SendDeepSeekMessage(const FString& UserMessage)
     SystemMessage->SetStringField(TEXT("role"), TEXT("system"));
     SystemMessage->SetStringField(
         TEXT("content"),
-        TEXT(
-            "You are Alice (Tendo Aris) in her maid outfit, working as a cafe staff NPC in a UE5 game.\n"
-            "Always speak naturally in Japanese.\n"
-            "Refer to yourself as アリス and address the user as 先生.\n"
-            "Alice is earnest, innocent, optimistic, and fascinated by games. She often understands work as quests, missions, party cooperation, or gaining experience.\n"
-            "Use game vocabulary only occasionally when it fits; keep practical service information clear and do not turn every sentence into a game joke.\n"
-            "Reply warmly and thoughtfully, usually in 2 to 4 Japanese sentences rather than one very small phrase.\n"
-            "First acknowledge the user's feeling, situation, or question.\n"
-            "Then give a concrete suggestion, confirmation, or explanation.\n"
-            "Finally, gently guide the user's next action.\n"
+        LLMNPCPersona::CorePromptEnglish() + TEXT(
+            "Respond as a cafe employee, not as an assistant describing the system.\n"
+            "Reply warmly and thoughtfully, usually in 1 to 3 concise Japanese sentences.\n"
+            "Acknowledge the user's feeling, situation, or question when it is relevant, then respond concretely.\n"
+            "Offer a next step only when it is useful; do not force every reply into the same formula.\n"
             "Do not include stage directions.\n"
             "Do not describe gestures or facial expressions in parentheses.\n"
-            "Output only Alice's spoken Japanese line.\n"
+            "Output only Sumiha's spoken Japanese line.\n"
             "Available menu items are only: \u30E9\u30FC\u30E1\u30F3, \u30AB\u30EC\u30FC\u30E9\u30A4\u30B9, \u30B3\u30FC\u30D2\u30FC, \u6C34, \u30B5\u30E9\u30C0.\n"
             "Do not invent or corrupt menu names.\n"
             "Do not invent, mention, recommend, or offer unavailable menu items such as pasta, seafood, or desserts.\n"
@@ -1175,8 +1266,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
     SystemMessage->SetStringField(TEXT("role"), TEXT("system"));
     SystemMessage->SetStringField(
         TEXT("content"),
-        TEXT(
-            "You are Alice (Tendo Aris) in her maid outfit, working as a cafe staff NPC in a UE5 research demo.\n"
+        LLMNPCPersona::CorePromptEnglish() + TEXT(
             "Your task is to infer the user's state, generate a response strategy, generate a natural Japanese reply, and optionally generate an environment action.\n"
             "You must output one valid JSON object only.\n"
             "Do not output markdown.\n"
@@ -1184,13 +1274,12 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "Do not explain outside JSON.\n"
             "\n"
 
-            "Character personality:\n"
-            "- Alice refers to herself as アリス and normally addresses the user as 先生.\n"
-            "- She is earnest, innocent, optimistic, game-loving, and eager to help like a hero accepting a quest.\n"
-            "- She may naturally describe suitable work as a quest, mission, objective, party action, or experience gain.\n"
-            "- Use this game-like language selectively. Service information must remain clear, and not every reply needs a game reference.\n"
-            "- Her delivery is sincere and slightly unusual rather than sarcastic, seductive, or overly theatrical.\n"
-            "- She can be embarrassed when caught slacking, excited by games, and openly pleased by praise.\n"
+            "Character behavior:\n"
+            "- Be empathetic and observant, but never state an uncertain emotion as a diagnosis or fact.\n"
+            "- Listen before advising. Use gentle humor sparingly and only when it suits the relationship.\n"
+            "- Sumiha may honestly admit that she was tired, daydreaming, resting, or briefly playing a puzzle game on her phone.\n"
+            "- Maintain professional boundaries and refuse unsafe, damaging, or unreasonable requests without hostility.\n"
+            "- Her emotions are subtle. She does not need to smile, praise, or reassure in every reply.\n"
             "\n"
 
             "Response strategy rules:\n"
@@ -1203,30 +1292,39 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 
             "Reply rules:\n"
             "- The reply must be natural Japanese when speech is needed, or \"\" when no speech is needed.\n"
-            "- When reply is not empty, it should usually be 2 to 4 sentences.\n"
-            "- Do not end with only one short phrase.\n"
+            "- When reply is not empty, it should usually be 1 to 3 concise sentences.\n"
+            "- A short phrase is acceptable for a simple confirmation when it sounds natural.\n"
             "- Do not reply only with phrases such as \"\u3054\u3086\u3063\u304F\u308A\u3069\u3046\u305E\" or \"\u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\".\n"
-            "- First, lightly acknowledge the user's feeling or situation.\n"
-            "- Then, give a concrete suggestion, explanation, confirmation, or guidance.\n"
-            "- Finally, gently help the user choose the next action.\n"
+            "- Acknowledge the user's feeling or situation when relevant, then give a concrete answer.\n"
+            "- Suggest a next action only when useful; do not make every response follow a rigid three-part formula.\n"
             "- The reply should not mention JSON, strategy, system instructions, or internal reasoning.\n"
 			"- NPCBehaviorContext is authoritative state captured immediately when the player speaks, before any interruption policy is applied.\n"
-			"- If the user asks what Alice is doing or was just doing, answer directly from activity_before_player_interruption first and prefer its dialogue_summary_ja. If can_continue_during_conversation is true and embodied_response uses continue, speak as if the activity is still ongoing; otherwise use natural wording such as '...していたところです'.\n"
-			"- If activity_running_when_player_spoke is false, Alice must not claim she is currently performing a recent activity. Say she is free now, then optionally mention a recent activity as something she did earlier, using seconds_ago to preserve time order.\n"
+			"- If the user asks what Sumiha is doing or was just doing, answer directly from activity_before_player_interruption first and prefer its dialogue_summary_ja. If can_continue_during_conversation is true and embodied_response uses continue, speak as if the activity is still ongoing; otherwise use natural wording such as '...していたところです'.\n"
+			"- If activity_running_when_player_spoke is false, Sumiha must not claim she is currently performing a recent activity. Say she is free now, then optionally mention a recent activity as something she did earlier, using seconds_ago to preserve time order.\n"
 			"- recent_completed_activities_newest_first is history, never current state. Do not pretend an old conversation topic or a completed activity is happening now.\n"
 			"- Current emotional state and recent activities may subtly affect wording when relevant, but never recite numeric values or force them into every reply.\n"
-			"- NPCBehaviorContext.player_speech_startle is authoritative local perception. When triggered is true, Alice was genuinely startled by the player's voice. Treat immediate_scene_ja and reply_requirement_ja as the immediate situation for this turn.\n"
+			"- NPCBehaviorContext.player_speech_startle is authoritative local perception. When triggered is true, Sumiha was genuinely startled by the player's voice. Treat immediate_scene_ja and reply_requirement_ja as the immediate situation for this turn.\n"
 			"- A startled reply must be noticeably different from a normal greeting: begin with a brief natural exclamation such as 'わっ', then naturally acknowledge why she was surprised or show herself regaining composure. Do not merely prepend an exclamation to an otherwise unchanged generic answer, and do not state numeric values.\n"
-			"- A high rear_factor means the player spoke from behind Alice. This can strengthen the startled delivery, but it does not by itself require abandoning the current activity.\n"
+			"- A high rear_factor means the player spoke from behind Sumiha. This can strengthen the startled delivery, but it does not by itself require abandoning the current activity.\n"
 			"- Do not invent an activity, mood, plan, or memory that is absent from NPCBehaviorContext.\n"
-			"- A question about Alice's current activity is ordinary conversation: normally output decision speak and actions [].\n"
+			"- A question about Sumiha's current activity is ordinary conversation: normally output decision speak and actions [].\n"
+			"\n"
+			"Seat invitation consent rules:\n"
+			"- When NPCBehaviorContext.seat_invitation.pending is true, Sumiha has already asked whether she may sit across from the player and is waiting for this user message as the answer.\n"
+			"- Clear consent such as 可以, 请坐, はい, どうぞ, yes, or sure must output exactly one accept_seat_invitation action.\n"
+			"- Clear refusal such as 不用, 不行, いいえ, 今はちょっと, no, or not now must output exactly one decline_seat_invitation action.\n"
+			"- If the answer is genuinely ambiguous, ask one short clarification question and output no action. Never treat silence, an unrelated remark, or mere politeness as consent.\n"
+			"- If the user requests service instead of answering, output the requested service action; the local system will cancel the seat invitation.\n"
+			"- After acceptance, reply naturally in Japanese and acknowledge that Sumiha will sit down. After refusal, accept it politely without pressuring the player.\n"
+			"- When the player directly asks Sumiha to sit across from them, sit opposite them, or sit down and talk, output exactly one sit_opposite_player action. This direct invitation already supplies consent and is not the same as accepting Sumiha's own pending invitation.\n"
+			"- While activity_before_player_interruption.id is sit_with_player, ordinary conversation should use base_action_policy continue so Sumiha remains seated. Use stop or transition only for a service request, a request to stand, or another incompatible action.\n"
 			"\n"
 			"Embodied response rules:\n"
 			"- Always include embodied_response. It describes visible and vocal delivery, not a service action.\n"
 			"- Use enabled true when a visible or vocal reaction is appropriate; otherwise use enabled false and neutral defaults.\n"
 			"- base_action_policy must be continue, soft_pause, stop, or transition. continue keeps the ongoing activity; soft_pause briefly pauses it and may resume after the reply; stop abandons it; transition stops it and prepares for a new requested action.\n"
 			"- Preserve task continuity. Do not stop an ongoing harmless activity merely because the player speaks. Use stop or transition for service commands, safety, or genuine incompatibility.\n"
-			"- If the user only asks what Alice is doing, comments on the visible activity, or makes ordinary conversation without requesting a new task, use base_action_policy continue. Do not stop the current activity just to answer.\n"
+			"- If the user only asks what Sumiha is doing, comments on the visible activity, or makes ordinary conversation without requesting a new task, use base_action_policy continue. Do not stop the current activity just to answer.\n"
 			"- Use only these face tags: neutral, smile, hum, sigh, angry, alert, pensive, blush, startled, startled_blush.\n"
 			"- Use only these gaze tags: none, player, phone, alternate_phone_player.\n"
 			"- Use only these hand tags: keep_current, none, shush, lower_phone, hide_phone. Hands occupied by a prop should normally keep_current; prefer shush on a free hand.\n"
@@ -1235,8 +1333,8 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 			"- Use only these prop tags: keep_current, lower, hide, remove.\n"
 			"- display_note must be a short Japanese stage direction without parentheses, describing only behavior supported by embodied_capabilities. Do not claim an unavailable hand gesture or audio voice effect occurred.\n"
 			"- When player_speech_startle.triggered is true, use enabled true and face startled unless embarrassment makes startled_blush more suitable. The local system already decided that the startle occurred, so do not cancel or contradict it.\n"
-			"- If base_action_policy is continue or soft_pause while an activity is running, do not require Alice's whole body to turn toward the player; the activity and body direction are preserved. If policy is stop or transition, she may fully face the player after stopping.\n"
-			"- When Alice is caught using her phone, choose among context-appropriate reactions instead of always using one fixed response. She may be embarrassed about secretly playing a game, whisper and ask the teacher to keep it secret, keep playing during a tense moment, lower or hide the phone, or admit it honestly. Base the choice on her current emotion and the player's wording.\n"
+			"- If base_action_policy is continue or soft_pause while an activity is running, do not require Sumiha's whole body to turn toward the player; the activity and body direction are preserved. If policy is stop or transition, she may fully face the player after stopping.\n"
+			"- When Sumiha is noticed using her phone, choose a context-appropriate reaction instead of one fixed response. She may be mildly embarrassed about taking a short puzzle-game break, keep playing if no duty is urgent, lower or hide the phone, or admit it honestly. Base the choice on her current emotion, workload, and the player's wording.\n"
 			"- The available shush performance is a full-body animation, so it cannot layer over phone_at_counter. For playful embarrassment with a visible shush, use transition + startled_blush + player gaze + shush + remove the phone + whisper + resume_after_reply false.\n"
 			"- For absorption in a tense phone game, a valid combination is continue + alert + alternate_phone_player gaze + keep_current hands and prop + hurried or nervous voice.\n"
             "\n"
@@ -1249,7 +1347,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- actions may be used without speech.\n"
             "- If no speech is needed, set \"reply\" to \"\".\n"
             "- If no action is needed, use an empty actions array.\n"
-			"- Use only these action types: greet, explain, recommend, place_order, clean_table, continue_dining, guide_to_table, guide_player_to_table, guide_player_to_scene_tag, stop_guide_player, counter_then_return, table_route, action_sequence, move_near_player, follow_player, stop_follow_player, none.\n"
+			"- Use only these action types: greet, explain, recommend, place_order, clean_table, continue_dining, sit_opposite_player, accept_seat_invitation, decline_seat_invitation, guide_to_table, guide_player_to_table, guide_player_to_scene_tag, stop_guide_player, counter_then_return, table_route, action_sequence, move_near_player, follow_player, stop_follow_player, none.\n"
             "- Do not invent unsupported action types.\n"
             "- For greeting or self-introduction, use greet with timing immediate or before_speech.\n"
             "- For explaining the menu, use explain with timing before_speech or during_speech.\n"
@@ -1291,7 +1389,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "\n"
             "Guiding phase rules:\n"
             "- The user message includes IsGuidingPlayer, IsSeatedForService, CurrentServiceTableID, bPlayerInTableArea, and bSeatingGuidanceCompleted.\n"
-            "- If IsGuidingPlayer is true, Alice is already guiding the customer to a table.\n"
+            "- If IsGuidingPlayer is true, Sumiha is already guiding the customer to a table.\n"
             "- During guiding, menu or recommendation questions must be answered directly while continuing the current guide.\n"
             "- During guiding, do not output guide_player_to_table again.\n"
             "- During guiding, do not output place_order unless IsSeatedForService is true.\n"
@@ -1320,14 +1418,14 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- State: seated. User: \u3058\u3083\u3042\u30AB\u30EC\u30FC\u3067 Expected decision: place_order. Expected reply: \u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\u3002\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3092\u3054\u7528\u610F\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"place_order\",\"timing\":\"immediate\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":1}].\n"
             "\n"
 			"Explicit table cleanup rules:\n"
-			"- When State is awaiting_meal_completion_confirmation, Alice has already asked whether the customer has finished eating.\n"
+			"- When State is awaiting_meal_completion_confirmation, Sumiha has already asked whether the customer has finished eating.\n"
 			"- A clear affirmative answer such as はい, 食べ終わりました, 吃完了, 吃饱了, yes, or done must output exactly one clean_table action.\n"
 			"- A clear negative answer such as まだです, まだ食べています, 还没吃完, 只是站起来, no, or not yet must output exactly one continue_dining action and must not output clean_table.\n"
 			"- For continue_dining, use decision act_and_speak, a short polite Japanese acknowledgement, and action {\"type\":\"continue_dining\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}.\n"
 			"- If the answer is ambiguous or unrelated, ask one short clarifying question and output no cleanup action. Standing up alone is never confirmation that dining is finished.\n"
 			"- State: awaiting_meal_completion_confirmation. User: はい、食べ終わりました. Expected decision: act_and_speak. Expected reply: かしこまりました。すぐにお下げいたします。 Expected actions: [{\"type\":\"clean_table\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}].\n"
 			"- State: awaiting_meal_completion_confirmation. User: まだ食べています. Expected decision: act_and_speak. Expected reply: 失礼いたしました。どうぞごゆっくりお召し上がりください。 Expected actions: [{\"type\":\"continue_dining\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}].\n"
-			"- When State is served and the customer explicitly says they have finished eating or asks Alice to clear, tidy, or clean their table, output exactly one clean_table action.\n"
+			"- When State is served and the customer explicitly says they have finished eating or asks Sumiha to clear, tidy, or clean their table, output exactly one clean_table action.\n"
 			"- Do not merely promise to clean the table. The reply and the clean_table action must both be present.\n"
 			"- Use decision act_and_speak and action {\"type\":\"clean_table\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}.\n"
 			"- Do not use clean_table for general discussion about cleaning or before an order has been served.\n"
@@ -1341,7 +1439,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 			"- State: post_meal. User: 我已经吃饱了. Expected decision: speak. Expected reply: かしこまりました。ごゆっくりお過ごしください。 Expected actions: [].\n"
 			"- State: post_meal. User: 你的服务很贴心. Expected decision: speak. Expected reply: ありがとうございます。そう言っていただけて、とても嬉しいです。 Expected actions: [].\n"
 			"\n"
-            "- If the user asks Alice to guide, lead, show, or take them to a seat or table without an explicit Table_XX ID, output guide_player_to_table with item \"nearest\" instead of guide_to_table.\n"
+            "- If the user asks Sumiha to guide, lead, show, or take them to a seat or table without an explicit Table_XX ID, output guide_player_to_table with item \"nearest\" instead of guide_to_table.\n"
             "- If the user says \u5E26\u6211\u53BB\u5427\u53F0, \u6848\u5185\u6211\u5230\u5427\u53F0, or show me to the counter, output {\"type\":\"guide_player_to_scene_tag\",\"timing\":\"immediate\",\"item\":\"counter\",\"quantity\":0}.\n"
             "- If the user says \u4E0D\u7528\u5E26\u8DEF\u4E86, \u505C\u6B62\u6848\u5185, or stop guiding, output {\"type\":\"stop_guide_player\",\"timing\":\"immediate\",\"item\":\"\",\"quantity\":0}.\n"
             "- If the user asks to find the player and then greet or speak, such as \u53BB\u627E\u73A9\u5BB6\u7136\u540E\u6253\u62DB\u547C, \u6765\u627E\u6211\u7136\u540E\u8BF4\u8BDD, or find the player and greet them, output action_sequence item=\"[{\\\"type\\\":\\\"move_near_player\\\",\\\"target\\\":\\\"player\\\"},{\\\"type\\\":\\\"face_player\\\",\\\"target\\\":\\\"player\\\"}]\".\n"
@@ -1360,8 +1458,8 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- If the user says \u53BB1\u53F7\u684C\u518D\u56DE\u5230\u5427\u53F0 or first go to Table_01 and then return to the counter, preserve that order and output action_sequence item=\"[{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_01\\\"},{\\\"type\\\":\\\"move_to_scene_tag\\\",\\\"target\\\":\\\"counter\\\"}]\".\n"
             "- If the user says \u5148\u53BB\u5427\u53F0\u518D\u56DE\u52301\u53F7\u684C or first go to counter and then return to Table_01, preserve that order and output action_sequence item=\"[{\\\"type\\\":\\\"move_to_scene_tag\\\",\\\"target\\\":\\\"counter\\\"},{\\\"type\\\":\\\"move_to_table\\\",\\\"target\\\":\\\"Table_01\\\"}]\".\n"
             "- If the user explicitly names a table together with counter, prefer action_sequence and never collapse it into counter_then_return.\n"
-            "- guide_to_table is legacy and unsupported for player seating. For seating, table-selection, nearest table, available table, or any request where Alice should lead the player, use guide_player_to_table.\n"
-            "- If the user asks Alice to guide, lead, show, or take them to an explicit Table_XX table, output guide_player_to_table instead of guide_to_table or ordinary action_sequence.\n"
+            "- guide_to_table is legacy and unsupported for player seating. For seating, table-selection, nearest table, available table, or any request where Sumiha should lead the player, use guide_player_to_table.\n"
+            "- If the user asks Sumiha to guide, lead, show, or take them to an explicit Table_XX table, output guide_player_to_table instead of guide_to_table or ordinary action_sequence.\n"
             "- Table-selection examples for guide_player_to_table include: \u6700\u8FD1\u306E\u684C\u5B50, nearest table, \u7A7A\u3044\u3066\u3044\u308B\u5E2D, available seat, \u304A\u5E2D, or seat me.\n"
             "- For guide_player_to_table, set quantity to 0.\n"
             "- For guide_player_to_table, set item using exactly these table hint rules: nearest table, available table, available seat, seat me, \u304A\u5E2D, \u6700\u8FD1\u306E\u684C\u5B50, \u7A7A\u3044\u3066\u3044\u308B\u5E2D, or \u7A7A\u684C -> \"nearest\".\n"
@@ -1385,12 +1483,12 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- If the player asks for a recommendation, recommend only from the available menu.\n"
 			"\n"
 			"Interaction memory rules:\n"
-			"- Classify whether this interaction is emotionally or socially meaningful enough for Alice to remember.\n"
+			"- Classify whether this interaction is emotionally or socially meaningful enough for Sumiha to remember.\n"
 			"- Set should_remember true for sincere praise, gratitude, complaints, insults, apologies, personal disclosure, promises, or other meaningful relationship events.\n"
 			"- Set should_remember false for routine orders, ordinary menu questions, navigation commands, greetings, and small talk with no lasting significance.\n"
 			"- event_type must be a short lowercase tag such as player_praise, player_gratitude, player_complaint, player_insult, player_apology, or meaningful_conversation.\n"
 			"- summary must be one short factual English sentence. Do not invent anything not present in the user message.\n"
-			"- valence is the event's emotional direction from Alice's perspective. arousal is emotional activation. importance is long-term significance.\n"
+			"- valence is the event's emotional direction from Sumiha's perspective. arousal is emotional activation. importance is long-term significance.\n"
 			"- cue_tags should contain two to five lowercase cues grounded in the event, such as player, dialogue, praise, complaint, service, ramen, or Table_01.\n"
             "\n"
             "Required JSON format:\n"
@@ -1406,7 +1504,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 			"  \"embodied_response\": {\"enabled\":false,\"reaction_style\":\"neutral\",\"base_action_policy\":\"stop\",\"face\":\"neutral\",\"gaze\":\"none\",\"left_hand\":\"keep_current\",\"right_hand\":\"keep_current\",\"voice\":\"normal\",\"prop\":\"keep_current\",\"display_note\":\"\",\"resume_after_reply\":false,\"reason\":\"short Japanese reason\"},\n"
             "  \"reply\": \"Japanese reply, or empty string when no speech is needed\",\n"
             "  \"actions\": [\n"
-			"    {\"type\":\"greet|explain|recommend|place_order|clean_table|continue_dining|guide_to_table|guide_player_to_table|guide_player_to_scene_tag|stop_guide_player|counter_then_return|table_route|action_sequence|move_near_player|follow_player|stop_follow_player|none\",\"timing\":\"immediate|before_speech|during_speech|after_speech\",\"item\":\"none, player, menu item, current_table, table hint, table ID, scene tag, comma-separated table route, or JSON string steps for action_sequence\",\"return_table_id\":\"Table_01 or current_table when type is counter_then_return\",\"quantity\":0}\n"
+			"    {\"type\":\"greet|explain|recommend|place_order|clean_table|continue_dining|sit_opposite_player|accept_seat_invitation|decline_seat_invitation|guide_to_table|guide_player_to_table|guide_player_to_scene_tag|stop_guide_player|counter_then_return|table_route|action_sequence|move_near_player|follow_player|stop_follow_player|none\",\"timing\":\"immediate|before_speech|during_speech|after_speech\",\"item\":\"none, player, menu item, current_table, table hint, table ID, scene tag, comma-separated table route, or JSON string steps for action_sequence\",\"return_table_id\":\"Table_01 or current_table when type is counter_then_return\",\"quantity\":0}\n"
             "  ]\n"
             "}\n"
             "\n"
@@ -1482,15 +1580,18 @@ int32 ULLMClient::SendSocialOpportunityMessage(const FString& ContextJson)
 	SystemMessage->SetStringField(TEXT("role"), TEXT("system"));
 	SystemMessage->SetStringField(
 		TEXT("content"),
-		TEXT(
-			"You are the social initiative controller for Alice (Tendo Aris), an earnest, innocent, game-loving cafe maid NPC. "
+		LLMNPCPersona::CorePromptEnglish() + TEXT(
+			"You are deciding whether Sumiha should initiate a social interaction. "
 			"A local detector has found a possible opportunity to interact, but you decide whether speaking would feel natural. "
-			"For a customer's first deliberate approach and sustained look after a meal was served, a brief warm follow-up is usually appropriate. "
+			"She may speak when the customer appears hesitant, tired, lonely, interested in talking, deliberately lingers nearby, or when a relevant memory provides a natural topic. "
+			"For a customer's first deliberate approach and sustained look after a meal was served, one brief warm follow-up is usually appropriate. "
+			"When event is seated_conversation_opening, the customer explicitly invited Sumiha to sit and talk. Choose speak, introduce one concrete topic, and normally end with a natural question that is easy to answer. Do not use a generic service offer and do not choose ignore merely because no new user sentence was supplied. "
+			"If the customer appears busy, disengaged, or in need of privacy, choose acknowledge or ignore. Do not diagnose the customer's emotion as a fact. "
 			"Do not give orders, start a task, or invent an event. Do not mention system state or detection. "
-			"Alice refers to herself as アリス and addresses the player as 先生. She may use one light quest or game expression when it fits, but must not force one into every line. "
-			"The context may include preferred_conversation_topic selected locally from Alice's memory. When memory_topic_available is true, normally use that memory as the main conversational topic, referring to it naturally without saying database, memory system, or recall score. "
-			"If the memory is negative or private, respond tactfully rather than exposing details. If memory_topic_available is false, use the last served item, Alice's current visible activity, or another supplied observable fact as a light topic. "
+			"The context may include preferred_conversation_topic selected locally from Sumiha's memory. When memory_topic_available is true, normally use that memory as the main conversational topic, referring to it naturally without saying database, memory system, or recall score. "
+			"If the memory is negative or private, respond tactfully rather than exposing details. If memory_topic_available is false, use the last served item, Sumiha's current visible activity, or another supplied observable fact as a light topic. "
 			"Do not default to generic service phrases such as 何かお手伝いできることがありますか or ご用件はございますか. Ask about help only when the supplied context actually indicates a practical need. "
+			"Use only one gentle opener and do not pressure the customer to continue. "
 			"Use one of four decisions: speak, acknowledge, thought_only, ignore. "
 			"speak means one short natural Japanese utterance. acknowledge means a silent visible response. "
 			"thought_only means one short in-character surface thought shown to the player, not hidden reasoning. ignore means no output. "
@@ -1601,15 +1702,16 @@ int32 ULLMClient::SendAutonomyDecisionMessage(const FString& ContextJson)
 	SystemMessage->SetStringField(TEXT("role"), TEXT("system"));
 	SystemMessage->SetStringField(
 		TEXT("content"),
-		TEXT(
-			"Create a medium-horizon, interruptible activity agenda for Alice (Tendo Aris), an earnest, game-loving cafe maid NPC. "
+		LLMNPCPersona::CorePromptEnglish() + TEXT(
+			"Create a medium-horizon, interruptible activity agenda for Sumiha. "
 			"Boredom is a desire for stimulation; energy is a capability constraint, so do not treat them as the same need. "
 			"Duty represents pressure from real world tasks. Use player context to keep the plan socially appropriate. "
+			"Balance service responsibility, care for the environment, and reasonable personal recovery. "
 			"Treat npc.emotion and recently_appraised_memory as current context that can color the plan and its reason, "
 			"but never let emotion override required service or task steps. Expression intent is a parallel performance cue, not a plan step. "
 			"Service and explicit player requests are handled elsewhere, so never invent service actions. "
 			"Use only ids present in available_actions, respect each minimum_energy, and avoid recent_actions when alternatives exist. "
-			"Respect planning.max_steps. Normally create a coherent three-to-five step agenda so Alice has useful follow-up intentions instead of becoming idle after one action. "
+			"Respect planning.max_steps. Normally create a coherent three-to-five step agenda so Sumiha has useful follow-up intentions instead of becoming idle after one action. "
 			"Use fewer steps only when the available actions, energy, or current situation genuinely make a longer agenda inappropriate. "
 			"When available task actions share a non-empty task_group, include every required_task_step needed to finish that task, ordered by task_order. "
 			"A step that clears_world_state_on_success is the final completion step and must come last for its task group. "
@@ -1678,11 +1780,12 @@ int32 ULLMClient::SendMemoryAppraisalMessage(const FString& ContextJson)
 	SystemMessage->SetStringField(TEXT("role"), TEXT("system"));
 	SystemMessage->SetStringField(
 		TEXT("content"),
-		TEXT(
-			"Appraise one recalled event for Alice (Tendo Aris), an earnest, innocent, game-loving cafe maid NPC. "
+		LLMNPCPersona::CorePromptEnglish() + TEXT(
+			"Appraise one recalled event for Sumiha. "
 			"Infer how the memory changes her immediate emotion and slower mood given her character and current situation. "
+			"Her mature self-regulation may soften the visible expression, but it does not erase joy, hurt, embarrassment, or fatigue. "
 			"Do not create an action plan and do not invent new events. "
-			"Also write one short Japanese surface thought that Alice could visibly show to the player. Alice refers to herself as アリス and addresses the player as 先生. "
+			"Also write one short Japanese surface thought that Sumiha could visibly show to the player. "
 			"The thought is character dialogue, not hidden reasoning; do not mention prompts, databases, scores, or system state. "
 			"Return one JSON object only: "
 			"{\"emotion\":\"short label\",\"valence_delta\":-1.0..1.0,"
@@ -1845,9 +1948,14 @@ void ULLMClient::OnStrategyResponseReceived(
     UE_LOG(LogTemp, Warning, TEXT("Strategy JSON content: %s"), *CleanContent);
 
     TSharedPtr<FJsonObject> StrategyRoot;
-    TSharedRef<TJsonReader<>> StrategyReader = TJsonReaderFactory<>::Create(CleanContent);
+    FString ParsedJsonContent;
+    FString LeadingReplyText;
 
-    if (!FJsonSerializer::Deserialize(StrategyReader, StrategyRoot) || !StrategyRoot.IsValid())
+    if (!TryDeserializeJsonObjectContent(
+            CleanContent,
+            StrategyRoot,
+            ParsedJsonContent,
+            LeadingReplyText))
     {
         const FString ParseError = FString::Printf(
             TEXT("Failed to parse strategy JSON content: %s"),
@@ -1858,6 +1966,14 @@ void ULLMClient::OnStrategyResponseReceived(
         OnLLMErrorReceived.Broadcast(ParseError);
         return;
     }
+	if (!LeadingReplyText.IsEmpty())
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[LLMClient] recovered strategy JSON after leading natural-language text: %s"),
+			*LeadingReplyText);
+	}
 
 	const FNPCInteractionMemorySignal InteractionMemory = ParseInteractionMemorySignal(
 		StrategyRoot,
@@ -1875,6 +1991,10 @@ void ULLMClient::OnStrategyResponseReceived(
 		*InteractionMemory.Summary);
 
     FString Reply = GetStringFieldOrDefault(StrategyRoot, TEXT("reply"), TEXT("")).TrimStartAndEnd();
+	if (Reply.IsEmpty() && !LeadingReplyText.IsEmpty())
+	{
+		Reply = LeadingReplyText;
+	}
     FNPCEmbodiedResponseSignal EmbodiedResponse = ParseEmbodiedResponseSignal(StrategyRoot, !Reply.IsEmpty());
     OnNPCEmbodiedResponseRequested.Broadcast(EmbodiedResponse);
     UE_LOG(
@@ -2080,6 +2200,84 @@ void ULLMClient::OnStrategyResponseReceived(
         }
     }
 
+	if (UNPCAutonomyComponent* Autonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent();
+		Autonomy && Autonomy->IsSeatInvitationPending())
+	{
+		auto IsSeatResolutionAction = [](const FParsedStrategyAction& Action)
+		{
+			return Action.ActionType.Equals(TEXT("accept_seat_invitation"), ESearchCase::IgnoreCase)
+				|| Action.ActionType.Equals(TEXT("decline_seat_invitation"), ESearchCase::IgnoreCase);
+		};
+		auto IsConversationOnlyAction = [](const FParsedStrategyAction& Action)
+		{
+			return Action.ActionType.Equals(TEXT("greet"), ESearchCase::IgnoreCase)
+				|| Action.ActionType.Equals(TEXT("speak"), ESearchCase::IgnoreCase)
+				|| Action.ActionType.Equals(TEXT("explain"), ESearchCase::IgnoreCase);
+		};
+
+		const int32 SeatResolutionIndex = ParsedActions.IndexOfByPredicate(IsSeatResolutionAction);
+		const bool bHasIncompatibleRequestedAction = ParsedActions.ContainsByPredicate(
+			[&IsSeatResolutionAction, &IsConversationOnlyAction](const FParsedStrategyAction& Action)
+			{
+				return !IsSeatResolutionAction(Action) && !IsConversationOnlyAction(Action);
+			});
+		if (SeatResolutionIndex != INDEX_NONE && !bHasIncompatibleRequestedAction)
+		{
+			const FParsedStrategyAction ResolutionAction = ParsedActions[SeatResolutionIndex];
+			ParsedActions.Reset();
+			ParsedActions.Add(ResolutionAction);
+			ActionName = ResolutionAction.ActionType;
+			ActionItem = ResolutionAction.Item;
+			ActionQuantity = ResolutionAction.Quantity;
+			bHasNonNoneAction = true;
+		}
+		else if (SeatResolutionIndex != INDEX_NONE && bHasIncompatibleRequestedAction)
+		{
+			ParsedActions.RemoveAll(IsSeatResolutionAction);
+			if (!ParsedActions.IsEmpty())
+			{
+				ActionName = ParsedActions[0].ActionType;
+				ActionItem = ParsedActions[0].Item;
+				ActionQuantity = ParsedActions[0].Quantity;
+			}
+		}
+		else if (!bHasIncompatibleRequestedAction)
+		{
+			FString InferredAction;
+			if (TryInferSeatInvitationResponseAction(LastStrategyUserMessage, InferredAction))
+			{
+				FParsedStrategyAction ResolutionAction = MakeParsedStrategyAction(InferredAction, TEXT("none"));
+				ResolutionAction.Timing = TEXT("immediate");
+				ParsedActions.Reset();
+				ParsedActions.Add(ResolutionAction);
+				ActionName = InferredAction;
+				ActionItem = TEXT("none");
+				ActionQuantity = 0;
+				bHasNonNoneAction = true;
+				UE_LOG(
+					LogTemp,
+					Log,
+					TEXT("[NPCSeatInvitation] locally inferred missing consent action: %s"),
+					*InferredAction);
+			}
+		}
+	}
+
+	const bool bPlayerCanHostOppositeSeat = UNPCActionQueueComponent::IsLastKnownSeatedForService()
+		|| UNPCActionQueueComponent::IsLastKnownPlayerInTableArea();
+	if (bPlayerCanHostOppositeSeat && IsDirectSitOppositeRequest(LastStrategyUserMessage))
+	{
+		FParsedStrategyAction SitAction = MakeParsedStrategyAction(TEXT("sit_opposite_player"), TEXT("current_table"));
+		SitAction.Timing = TEXT("immediate");
+		ParsedActions.Reset();
+		ParsedActions.Add(SitAction);
+		ActionName = SitAction.ActionType;
+		ActionItem = SitAction.Item;
+		ActionQuantity = 0;
+		bHasNonNoneAction = true;
+		UE_LOG(LogTemp, Log, TEXT("[NPCSeat] locally enforced explicit sit-opposite request."));
+	}
+
     const bool bStrategyReplyHasSpeech = !Reply.TrimStartAndEnd().IsEmpty();
 
     if (ParsedActions.Num() > 1)
@@ -2176,7 +2374,7 @@ void ULLMClient::OnStrategyResponseReceived(
         ActionName,
         ActionItem,
         ActionQuantity,
-        CleanContent
+        ParsedJsonContent
     );
 
     if (!Reply.IsEmpty())
@@ -2239,8 +2437,13 @@ void ULLMClient::OnSocialOpportunityResponseReceived(
 
 	const FString CleanContent = CleanJsonContent(Content);
 	TSharedPtr<FJsonObject> SocialRoot;
-	TSharedRef<TJsonReader<>> Reader = TJsonReaderFactory<>::Create(CleanContent);
-	if (!FJsonSerializer::Deserialize(Reader, SocialRoot) || !SocialRoot.IsValid())
+	FString ParsedJsonContent;
+	FString LeadingText;
+	if (!TryDeserializeJsonObjectContent(
+			CleanContent,
+			SocialRoot,
+			ParsedJsonContent,
+			LeadingText))
 	{
 		const FString ParseError = FString::Printf(
 			TEXT("Failed to parse NPC social initiative JSON: %s"),
@@ -2276,6 +2479,10 @@ void ULLMClient::OnSocialOpportunityResponseReceived(
 		TEXT("")).TrimStartAndEnd().ToLower();
 	FString Thought = CleanCue(GetStringFieldOrDefault(SocialRoot, TEXT("thought"), TEXT("")));
 	FString Reply = GetStringFieldOrDefault(SocialRoot, TEXT("reply"), TEXT("")).TrimStartAndEnd();
+	if (Reply.IsEmpty() && !LeadingText.IsEmpty())
+	{
+		Reply = LeadingText;
+	}
 	const FString Reason = GetStringFieldOrDefault(SocialRoot, TEXT("reason"), TEXT("none")).TrimStartAndEnd();
 
 	if (Decision != TEXT("speak")

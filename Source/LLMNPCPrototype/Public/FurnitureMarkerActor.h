@@ -67,6 +67,15 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture Marker")
 	int32 Priority;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture Marker|NPC Seat")
+	bool bAllowNPCSit;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture Marker|NPC Seat")
+	FVector NPCSitLocationOffset;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Furniture Marker|NPC Seat")
+	FRotator NPCSitRotationOffset;
+
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Furniture Marker")
 	FTransform GetSitTransform() const;
 
@@ -77,6 +86,21 @@ public:
 	FTransform GetNPCStandTransform() const;
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Furniture Marker")
+	FTransform GetNPCSitTransform() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Furniture Marker|Occupancy")
+	bool IsSeatAvailableFor(AActor* Actor) const;
+
+	UFUNCTION(BlueprintCallable, Category = "Furniture Marker|Occupancy")
+	bool TryReserveSeat(AActor* Actor);
+
+	UFUNCTION(BlueprintCallable, Category = "Furniture Marker|Occupancy")
+	void ReleaseSeat(AActor* Actor);
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Furniture Marker|Occupancy")
+	bool IsReservedBy(AActor* Actor) const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Furniture Marker")
 	bool IsActorInInteractionRange(AActor* Actor) const;
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Furniture Marker")
@@ -85,4 +109,8 @@ public:
 	virtual bool CanInteract_Implementation(AActor* Interactor) const override;
 	virtual FText GetInteractionText_Implementation(AActor* Interactor) const override;
 	virtual bool Interact_Implementation(AActor* Interactor) override;
+
+private:
+	UPROPERTY(Transient)
+	TObjectPtr<AActor> SeatOccupant;
 };

@@ -66,6 +66,10 @@ AFurnitureMarkerActor::AFurnitureMarkerActor()
 	bIsOccupied = false;
 	bCanSit = true;
 	Priority = 0;
+	bAllowNPCSit = true;
+	NPCSitLocationOffset = FVector::ZeroVector;
+	NPCSitRotationOffset = FRotator::ZeroRotator;
+	SeatOccupant = nullptr;
 }
 
 FTransform AFurnitureMarkerActor::GetSitTransform() const
@@ -83,6 +87,61 @@ FTransform AFurnitureMarkerActor::GetNPCStandTransform() const
 	return NPCStandPoint ? NPCStandPoint->GetComponentTransform() : GetActorTransform();
 }
 
+FTransform AFurnitureMarkerActor::GetNPCSitTransform() const
+{
+	FTransform Result = GetSitTransform();
+	Result.AddToTranslation(Result.TransformVectorNoScale(NPCSitLocationOffset));
+	Result.ConcatenateRotation(NPCSitRotationOffset.Quaternion());
+	Result.NormalizeRotation();
+	return Result;
+}
+
+bool AFurnitureMarkerActor::IsSeatAvailableFor(AActor* Actor) const
+{
+	if (!bCanSit || !Actor)
+	{
+		return false;
+	}
+
+	if (SeatOccupant)
+	{
+		return SeatOccupant == Actor;
+	}
+
+	return !bIsOccupied;
+}
+
+bool AFurnitureMarkerActor::TryReserveSeat(AActor* Actor)
+{
+	if (!IsSeatAvailableFor(Actor))
+	{
+		return false;
+	}
+
+	SeatOccupant = Actor;
+	bIsOccupied = true;
+	UE_LOG(LogTemp, Log, TEXT("[Seat] reserved. Seat=%s Occupant=%s"), *FurnitureID, *Actor->GetName());
+	return true;
+}
+
+void AFurnitureMarkerActor::ReleaseSeat(AActor* Actor)
+{
+	if (SeatOccupant && Actor && SeatOccupant != Actor)
+	{
+		return;
+	}
+
+	const FString OccupantName = SeatOccupant ? SeatOccupant->GetName() : TEXT("legacy_or_unknown");
+	SeatOccupant = nullptr;
+	bIsOccupied = false;
+	UE_LOG(LogTemp, Log, TEXT("[Seat] released. Seat=%s Occupant=%s"), *FurnitureID, *OccupantName);
+}
+
+bool AFurnitureMarkerActor::IsReservedBy(AActor* Actor) const
+{
+	return Actor && SeatOccupant == Actor;
+}
+
 bool AFurnitureMarkerActor::IsActorInInteractionRange(AActor* Actor) const
 {
 	return Actor && InteractionBox && InteractionBox->IsOverlappingActor(Actor);
@@ -95,17 +154,7 @@ bool AFurnitureMarkerActor::IsActorInSeatRange(AActor* Actor) const
 
 bool AFurnitureMarkerActor::CanInteract_Implementation(AActor* Interactor) const
 {
-	if (!bCanSit)
-	{
-		return false;
-	}
-
-	if (bIsOccupied)
-	{
-		return false;
-	}
-
-	return true;
+	return IsSeatAvailableFor(Interactor);
 }
 
 FText AFurnitureMarkerActor::GetInteractionText_Implementation(AActor* Interactor) const

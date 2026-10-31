@@ -94,6 +94,10 @@ public:
 private:
 	TSubclassOf<AActor> ResolveFoodActorClass(const FString& ItemName) const;
 	USkeletalMeshComponent* ResolveOwnerMesh() const;
+	bool ResolveCarryAttachment(
+		USkeletalMeshComponent* MeshComponent,
+		USceneComponent*& OutAttachComponent,
+		FName& OutAttachSocketName) const;
 	USceneComponent* FindFoodCarryPoint() const;
 	bool ResolveTablePlacementTransform(AActor* TableActor, FTransform& OutTransform) const;
 	void SetFoodCollisionEnabled(AActor* FoodActor, ECollisionEnabled::Type CollisionType) const;

@@ -57,17 +57,22 @@ bool UPlayerSeatComponent::TrySitAtFurniture(AFurnitureMarkerActor* Seat)
 		return true;
 	}
 
-	if (Seat->bIsOccupied)
+	AActor* Owner = GetOwner();
+	if (!Owner || !Seat->IsSeatAvailableFor(Owner))
 	{
 		return false;
 	}
 
 	if (CurrentSeat)
 	{
-		CurrentSeat->bIsOccupied = false;
+		CurrentSeat->ReleaseSeat(Owner);
 	}
 
-	AActor* Owner = GetOwner();
+	if (!Seat->TryReserveSeat(Owner))
+	{
+		return false;
+	}
+
 	if (Owner)
 	{
 		if (!bIsSeated)
@@ -103,7 +108,6 @@ bool UPlayerSeatComponent::TrySitAtFurniture(AFurnitureMarkerActor* Seat)
 	CurrentSeat = Seat;
 	CurrentSeatID = Seat->FurnitureID;
 	CurrentTableID = Seat->RelatedTableID;
-	Seat->bIsOccupied = true;
 	OnPlayerSeated.Broadcast(CurrentSeatID, CurrentTableID);
 	return true;
 }
@@ -121,7 +125,7 @@ bool UPlayerSeatComponent::LeaveSeat()
 
 	if (LeavingSeat)
 	{
-		LeavingSeat->bIsOccupied = false;
+		LeavingSeat->ReleaseSeat(GetOwner());
 	}
 
 	bIsSeated = false;

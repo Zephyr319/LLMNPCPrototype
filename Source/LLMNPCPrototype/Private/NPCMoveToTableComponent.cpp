@@ -172,20 +172,20 @@ UNPCMoveToTableComponent::UNPCMoveToTableComponent()
 	GuideStartPlayerDistanceThreshold = 320.0f;
 	GuideStartApproachPlayerDistance = 160.0f;
 	GuidePausedLineVariants = {
-		TEXT("先生、大丈夫ですか？アリスはこちらです。"),
-		TEXT("先生との距離が開きました。ここで待機します。"),
-		TEXT("先生、アリスについてきてください。"),
-		TEXT("アリスはここで先生を待ちます。")
+		TEXT("お客様、大丈夫ですか？ こちらでお待ちしています。"),
+		TEXT("少し距離が開いたようですので、ここでお待ちします。"),
+		TEXT("お客様、どうぞこちらへ。"),
+		TEXT("ここでお待ちしていますね。")
 	};
 	GuideResumedLineVariants = {
 		TEXT("合流完了です。それでは案内を再開します！"),
-		TEXT("先生、クエストの続きを始めます。"),
-		TEXT("こちらです。ゆっくり進みましょう、先生。")
+		TEXT("それでは、ご案内を続けますね。"),
+		TEXT("こちらです。どうぞごゆっくりお進みください。")
 	};
 	GuideArrivedLineVariants = {
-		TEXT("目的地に到着しました。こちらの席へどうぞ、先生。"),
-		TEXT("案内クエスト完了です。こちらが先生の席です。"),
-		TEXT("先生、どうぞこちらに座ってください。")
+		TEXT("到着しました。こちらのお席へどうぞ。"),
+		TEXT("こちらがお客様のお席です。ごゆっくりお過ごしください。"),
+		TEXT("どうぞこちらにお掛けください。")
 	};
 	LastFollowPlayerLocation = FVector::ZeroVector;
 	LastFollowGoalLocation = FVector::ZeroVector;
@@ -1103,6 +1103,38 @@ bool UNPCMoveToTableComponent::MoveToFurnitureByID(const FString& FurnitureID)
 	}
 
 	FailMoveToTable(FString::Printf(TEXT("Furniture not found: %s"), *FurnitureID));
+	return false;
+}
+
+bool UNPCMoveToTableComponent::MoveToSeatByID(const FString& FurnitureID)
+{
+	CancelFollowingForExplicitCommand();
+
+	CurrentMoveReason = TEXT("Seat");
+	CurrentMoveTargetID = FurnitureID;
+
+	UWorld* World = GetWorld();
+	if (!World)
+	{
+		FailMoveToTable(TEXT("NPC movement world missing"));
+		return false;
+	}
+
+	for (TActorIterator<AFurnitureMarkerActor> It(World); It; ++It)
+	{
+		AFurnitureMarkerActor* FurnitureMarker = *It;
+		if (!FurnitureMarker
+			|| !FurnitureMarker->FurnitureID.Equals(FurnitureID, ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+
+		return StartMovingToFurnitureLocation(
+			FurnitureMarker,
+			FurnitureMarker->GetNPCStandTransform().GetLocation());
+	}
+
+	FailMoveToTable(FString::Printf(TEXT("Seat not found: %s"), *FurnitureID));
 	return false;
 }
 

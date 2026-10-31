@@ -2,3 +2,10 @@
 *.umap filter=lfs diff=lfs merge=lfs -text
 *.fbx filter=lfs diff=lfs merge=lfs -text
 *.mb filter=lfs diff=lfs merge=lfs -text
+
+# GitHub LFS quota is currently exhausted. Keep this migration's small assets
+# in regular Git so the source and required Unreal content remain reproducible.
+Content/Characters/OriginalCafeMaid/** -filter -diff -merge
+Content/Blueprints/BP_LLM_NPC_VRM.uasset -filter -diff -merge
+Content/Blueprints/Cafe/DA_NPCAutonomyActionSet.uasset -filter -diff -merge
+Content/__ExternalActors__/RestaurantDemo/Maps/Map_RestaurantDemo/0/J3/7HJJNIGCWADQIBFA9EI6ZX.uasset -filter -diff -merge

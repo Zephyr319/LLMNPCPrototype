@@ -14,6 +14,7 @@
 #include "EngineUtils.h"
 #include "FurnitureMarkerActor.h"
 #include "EmotionClient.h"
+#include "HAL/IConsoleManager.h"
 #include "LLMClient.h"
 #include "NPCActionQueueComponent.h"
 #include "NPCFaceTargetComponent.h"
@@ -21,6 +22,7 @@
 #include "NPCAutonomyActionSet.h"
 #include "NPCEmotionComponent.h"
 #include "NPCMemoryComponent.h"
+#include "NPCPersonaProfile.h"
 #include "NPCResearchLoggerComponent.h"
 #include "PlayerSeatComponent.h"
 #include "Kismet/GameplayStatics.h"
@@ -50,6 +52,84 @@ namespace
 		FJsonSerializer::Serialize(Object, Writer);
 		return Json;
 	}
+
+	void RunNPCSitTestCommand(const TArray<FString>& Args, UWorld*)
+	{
+		UNPCAutonomyComponent* Autonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent();
+		if (!Autonomy)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[NPCSeatTest] autonomy component not found."));
+			return;
+		}
+
+		const FString SeatID = Args.IsEmpty() ? TEXT("sofa01") : Args[0];
+		Autonomy->ForceSeatActivityForValidation(SeatID);
+	}
+
+	void RunNPCSitWithPlayerTestCommand(const TArray<FString>&, UWorld*)
+	{
+		if (UNPCAutonomyComponent* Autonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent())
+		{
+			Autonomy->ForceSitOppositePlayerForValidation();
+		}
+	}
+
+	void RunNPCOfferSitWithPlayerTestCommand(const TArray<FString>&, UWorld*)
+	{
+		if (UNPCAutonomyComponent* Autonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent())
+		{
+			Autonomy->ForceSeatInvitationForValidation();
+		}
+	}
+
+	void RunNPCAcceptSeatInvitationTestCommand(const TArray<FString>&, UWorld*)
+	{
+		if (UNPCAutonomyComponent* Autonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent())
+		{
+			Autonomy->ResolveSeatInvitation(true);
+		}
+	}
+
+	void RunNPCDeclineSeatInvitationTestCommand(const TArray<FString>&, UWorld*)
+	{
+		if (UNPCAutonomyComponent* Autonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent())
+		{
+			Autonomy->ResolveSeatInvitation(false);
+		}
+	}
+
+	void RunNPCStandTestCommand(const TArray<FString>&, UWorld*)
+	{
+		if (UNPCAutonomyComponent* Autonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent())
+		{
+			Autonomy->InterruptAutonomy(TEXT("manual_seat_exit"));
+		}
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GForceNPCSitCommand(
+		TEXT("npc.Sit"),
+		TEXT("Force the NPC to sit at a furniture marker. Usage: npc.Sit sofa01"),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&RunNPCSitTestCommand));
+	FAutoConsoleCommandWithWorldAndArgs GForceNPCSitWithPlayerCommand(
+		TEXT("npc.SitWithPlayer"),
+		TEXT("Force the NPC to sit in an available seat across from the seated player."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&RunNPCSitWithPlayerTestCommand));
+	FAutoConsoleCommandWithWorldAndArgs GForceNPCOfferSitWithPlayerCommand(
+		TEXT("npc.OfferSitWithPlayer"),
+		TEXT("Force the NPC to approach the player's table and ask permission before sitting."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&RunNPCOfferSitWithPlayerTestCommand));
+	FAutoConsoleCommandWithWorldAndArgs GForceNPCAcceptSeatInvitationCommand(
+		TEXT("npc.AcceptSeatInvitation"),
+		TEXT("Accept a pending NPC seat invitation for validation."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&RunNPCAcceptSeatInvitationTestCommand));
+	FAutoConsoleCommandWithWorldAndArgs GForceNPCDeclineSeatInvitationCommand(
+		TEXT("npc.DeclineSeatInvitation"),
+		TEXT("Decline a pending NPC seat invitation for validation."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&RunNPCDeclineSeatInvitationTestCommand));
+	FAutoConsoleCommandWithWorldAndArgs GForceNPCStandCommand(
+		TEXT("npc.Stand"),
+		TEXT("Interrupt the current seat activity and make the NPC leave the seat."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&RunNPCStandTestCommand));
 }
 
 UNPCAutonomyComponent::UNPCAutonomyComponent()
@@ -89,28 +169,44 @@ UNPCAutonomyComponent::UNPCAutonomyComponent()
 	AmbientOpportunitiesPerMinute = 3.0f;
 	MinimumSecondsBetweenAmbientActivities = 10.0f;
 	MaximumQuietIdleSecondsBeforeAmbient = 40.0f;
+	SofaRestEnergyThreshold = 35.0f;
+	SeatedIdleLoopCount = 3;
+	SocialSeatedIdleLoopCount = 8;
+	bRequireServedStateForNaturalSocialSit = true;
+	SeatInvitationTimeoutSeconds = 25.0f;
+	SeatInvitationDeclineCooldownSeconds = 120.0f;
+	SeatInvitationText = TEXT("少しゆっくりお話ししたいのですが、向かいの席に座ってもいいですか？");
+	SitDownAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_KA_Sit_Start_OCM.Anim_KA_Sit_Start_OCM")));
+	SeatedIdleAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_KA_Sit_LookingAround_OCM.Anim_KA_Sit_LookingAround_OCM")));
+	SeatedConversationAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_Female_Sit_Talk_OCM.Anim_Female_Sit_Talk_OCM")));
+	StandUpAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_KA_Sit_End_OCM.Anim_KA_Sit_End_OCM")));
+	SeatedConversationOpeningDelaySeconds = 2.5f;
 	AutonomyModelName = TEXT("gpt-4o-mini");
 	bEnableMemoryEmotionCycle = true;
 	bEnableSpontaneousRecall = true;
-	BaseSpontaneousRecallOpportunitiesPerMinute = 4.5f;
-	MinimumSecondsBetweenRecallAppraisals = 90.0f;
+	BaseSpontaneousRecallOpportunitiesPerMinute = 8.0f;
+	MinimumSecondsBetweenRecallAppraisals = 30.0f;
 	PostPlanRecallBoostDurationSeconds = 45.0f;
 	PostPlanRecallOpportunityMultiplier = 2.5f;
-	bSeedPositiveMemoryForValidation = false;
-	bForceFirstValidationRecall = false;
-	bWaitForPlayerEncounterBeforeValidation = false;
+	bSeedPositiveMemoryForValidation = true;
+	bForceFirstValidationRecall = true;
+	bWaitForPlayerEncounterBeforeValidation = true;
 	bPlayVisibleMemoryReaction = true;
 	bEnableConcurrentExpressionOverlay = true;
 	bAllowBlockingStrongMemoryReactions = true;
 	PositiveMemoryReactionAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
-		TEXT("/Game/KawaiiAnimations/Animations/Anim_KA_Idle08_ComeUpWithAnIdea.Anim_KA_Idle08_ComeUpWithAnIdea")));
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_KA_Idle08_ComeUpWithAnIdea_OCM.Anim_KA_Idle08_ComeUpWithAnIdea_OCM")));
 	NegativeMemoryReactionAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
-		TEXT("/Game/art/actions/Anim_Angry_Midars.Anim_Angry_Midars")));
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_Angry_OCM.Anim_Angry_OCM")));
 	HighArousalNegativeMemoryReactionAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
-		TEXT("/Game/art/actions/Anim_Standing_Arguing_Midars.Anim_Standing_Arguing_Midars")));
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_Standing_Arguing_OCM.Anim_Standing_Arguing_OCM")));
 	HighArousalNegativeReactionThreshold = 0.6f;
 	NeutralMemoryReactionAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
-		TEXT("/Game/art/actions/Anim_Searching_Files_High_Midars.Anim_Searching_Files_High_Midars")));
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_Searching_Files_High_OCM.Anim_Searching_Files_High_OCM")));
 	ExpressionMorphStrength = 1.0f;
 	ExpressionMorphDurationSeconds = 6.0f;
 	ConcurrentExpressionLeadDurationSeconds = 30.0f;
@@ -131,9 +227,9 @@ UNPCAutonomyComponent::UNPCAutonomyComponent()
 	InteractiveFacingFallbackSeconds = 10.0f;
 	bEnableInternalEmbodiedGestureAnimations = true;
 	StartledReactionAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
-		TEXT("/Game/art/actions/Anim_Surprised_Midars.Anim_Surprised_Midars")));
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_Surprised_OCM.Anim_Surprised_OCM")));
 	ShushGestureAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
-		TEXT("/Game/art/actions/Anim_Telling_A_Secret_Midars.Anim_Telling_A_Secret_Midars")));
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_Telling_A_Secret_OCM.Anim_Telling_A_Secret_OCM")));
 	bEnablePlayerSpeechStartle = true;
 	PlayerSpeechStartleBaseChance = 0.05f;
 	PlayerSpeechStartleFocusWeight = 0.5f;
@@ -146,10 +242,7 @@ UNPCAutonomyComponent::UNPCAutonomyComponent()
 	PlayerSpeechStartleFullUnexpectednessSeconds = 15.0f;
 	PlayerSpeechStartleExpressionSeconds = 2.5f;
 	bForceNextPlayerSpeechStartle = false;
-	CharacterDescription = TEXT(
-		"Alice (Tendo Aris) is an earnest, innocent, game-loving android girl working as a cafe maid. "
-		"She refers to herself as アリス and addresses the player as 先生. She treats work as quests, values heroism and teamwork, "
-		"remembers meaningful interactions, and expresses emotions openly without neglecting required service duties.");
+	CharacterDescription = LLMNPCPersona::CompactDescriptionEnglish();
 	ActionSet = TSoftObjectPtr<UNPCAutonomyActionSet>(
 		FSoftObjectPath(TEXT("/Game/Blueprints/Cafe/DA_NPCAutonomyActionSet.DA_NPCAutonomyActionSet")));
 	CurrentActivityID = TEXT("");
@@ -171,7 +264,12 @@ UNPCAutonomyComponent::UNPCAutonomyComponent()
 	bInteractiveFacingPlayer = false;
 	bStartlePreparedForCurrentInteraction = false;
 	bPendingPlayerSpeechStartle = false;
+	bSeatInvitationApproachInProgress = false;
+	bSeatInvitationPending = false;
+	bSeatInvitationAcceptedForStart = false;
+	SeatedConversationOpeningAttempts = 0;
 	PendingInteractiveActivityID = TEXT("");
+	PendingSeatInvitationSeatID = TEXT("");
 	bBlinkFollowUpPending = false;
 	TotalAutonomyPromptTokens = 0;
 	TotalAutonomyCompletionTokens = 0;
@@ -359,6 +457,8 @@ void UNPCAutonomyComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 		World->GetTimerManager().ClearTimer(BlinkFinishTimerHandle);
 		World->GetTimerManager().ClearTimer(EmbodiedResponseResumeTimerHandle);
 		World->GetTimerManager().ClearTimer(InteractiveFacingFallbackTimerHandle);
+		World->GetTimerManager().ClearTimer(SeatInvitationTimeoutTimerHandle);
+		World->GetTimerManager().ClearTimer(SeatedConversationOpeningTimerHandle);
 	}
 	StopInteractiveFacingPlayer();
 
@@ -441,6 +541,23 @@ void UNPCAutonomyComponent::EvaluateAutonomyNow()
 		CurrentExpressionIntent = EmotionState.ExpressionIntent;
 	}
 	UpdateFastValidationDebugMessage();
+
+	const bool bSocialSeatFlowActive = bSeatInvitationApproachInProgress
+		|| bSeatInvitationPending
+		|| (bActivityRunning
+			&& CurrentActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase));
+	if (bSocialSeatFlowActive && FindAvailableSeatOppositePlayerID().IsEmpty())
+	{
+		if (bActivityRunning)
+		{
+			InterruptAutonomy(TEXT("player_left_social_seat"));
+		}
+		else
+		{
+			CancelSeatInvitation(TEXT("player_left_before_consent"), true, true);
+		}
+		return;
+	}
 
 	if (CurrentTime < NextDecisionEarliestWorldTime || !CanRunAutonomy())
 	{
@@ -536,14 +653,226 @@ void UNPCAutonomyComponent::ActivateMultiStepPlanValidationScenario()
 		*MultiStepPlanValidationWorldTag.ToString());
 }
 
+bool UNPCAutonomyComponent::ForceSeatActivityForValidation(const FString& FurnitureID)
+{
+	ResolveReferences();
+	const FString RequestedSeatID = FurnitureID.TrimStartAndEnd().IsEmpty()
+		? TEXT("sofa01")
+		: FurnitureID.TrimStartAndEnd();
+	const FNPCAutonomyActivityDefinition* Activity = FindActivityDefinition(TEXT("rest_on_sofa"));
+	if (!Activity || !ServiceManager || !IsServiceStateAutonomyAllowed(ServiceManager->CurrentState))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCSeatTest] unavailable in current service state."));
+		return false;
+	}
+
+	if (bActivityRunning)
+	{
+		InterruptAutonomy(TEXT("seat_validation_override"));
+	}
+	if (!CanRunAutonomy())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCSeatTest] NPC is busy; seat test was not started."));
+		return false;
+	}
+
+	ForcedSeatID = RequestedSeatID;
+	const bool bStarted = StartActivity(*Activity, TEXT("manual_seat_validation"), true);
+	ForcedSeatID.Reset();
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[NPCSeatTest] request. Seat=%s Started=%s"),
+		*RequestedSeatID,
+		bStarted ? TEXT("true") : TEXT("false"));
+	return bStarted;
+}
+
+bool UNPCAutonomyComponent::ForceSitOppositePlayerForValidation()
+{
+	return RequestSitOppositePlayer();
+}
+
+bool UNPCAutonomyComponent::RequestSitOppositePlayer()
+{
+	ResolveReferences();
+	if (bSeatInvitationPending)
+	{
+		return ResolveSeatInvitation(true);
+	}
+	if (bSeatInvitationApproachInProgress)
+	{
+		CancelSeatInvitation(TEXT("player_direct_sit_request"), false, false);
+	}
+	if (bActivityRunning
+		&& CurrentActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
+
+	const FNPCAutonomyActivityDefinition* Activity = FindActivityDefinition(TEXT("sit_with_player"));
+	if (!Activity || !ServiceManager || !IsServiceStateAutonomyAllowed(ServiceManager->CurrentState))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCSeat] explicit sit request unavailable in the current service state."));
+		return false;
+	}
+	if (bActivityRunning)
+	{
+		InterruptAutonomy(TEXT("player_requested_social_seat"));
+	}
+	const FString SeatID = FindAvailableSeatOppositePlayerID();
+	if (SeatID.IsEmpty() || !CanRunAutonomy())
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[NPCSeat] explicit sit request failed. Seat=%s CanRun=%s"),
+			SeatID.IsEmpty() ? TEXT("none") : *SeatID,
+			CanRunAutonomy() ? TEXT("true") : TEXT("false"));
+		return false;
+	}
+
+	ForcedSeatID = SeatID;
+	bSeatInvitationAcceptedForStart = true;
+	const bool bStarted = StartActivity(*Activity, TEXT("player_requested_social_seat"), false);
+	bSeatInvitationAcceptedForStart = false;
+	ForcedSeatID.Reset();
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSeat] explicit sit-opposite request. Seat=%s Started=%s"),
+		*SeatID,
+		bStarted ? TEXT("true") : TEXT("false"));
+	return bStarted;
+}
+
+bool UNPCAutonomyComponent::ForceSeatInvitationForValidation()
+{
+	ResolveReferences();
+	const FNPCAutonomyActivityDefinition* Activity = FindActivityDefinition(TEXT("sit_with_player"));
+	const FString SeatID = FindAvailableSeatOppositePlayerID();
+	if (!Activity
+		|| SeatID.IsEmpty()
+		|| !ServiceManager
+		|| !IsServiceStateAutonomyAllowed(ServiceManager->CurrentState))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCSeatInvitation] validation request unavailable."));
+		return false;
+	}
+
+	if (bActivityRunning || bSeatInvitationApproachInProgress || bSeatInvitationPending)
+	{
+		InterruptAutonomy(TEXT("seat_invitation_validation_override"));
+	}
+	if (!CanRunAutonomy())
+	{
+		return false;
+	}
+
+	ForcedSeatID = SeatID;
+	const bool bStarted = StartActivity(*Activity, TEXT("manual_seat_invitation_validation"), false);
+	ForcedSeatID.Reset();
+	return bStarted;
+}
+
+bool UNPCAutonomyComponent::ResolveSeatInvitation(bool bAccepted)
+{
+	if (!bSeatInvitationPending)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCSeatInvitation] no pending invitation to resolve."));
+		return false;
+	}
+
+	const FString SeatID = PendingSeatInvitationSeatID;
+	if (!bAccepted)
+	{
+		CancelSeatInvitation(TEXT("player_declined"), true, true);
+		return true;
+	}
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SeatInvitationTimeoutTimerHandle);
+	}
+	bSeatInvitationPending = false;
+
+	const FNPCAutonomyActivityDefinition* Activity = FindActivityDefinition(TEXT("sit_with_player"));
+	if (!Activity || SeatID.IsEmpty() || FindAvailableSeatOppositePlayerID().IsEmpty())
+	{
+		CancelSeatInvitation(TEXT("accepted_but_seat_unavailable"), true, true);
+		return false;
+	}
+
+	ForcedSeatID = SeatID;
+	bSeatInvitationAcceptedForStart = true;
+	const bool bStarted = StartActivity(*Activity, TEXT("player_accepted_seat_invitation"), false);
+	bSeatInvitationAcceptedForStart = false;
+	ForcedSeatID.Reset();
+	if (!bStarted)
+	{
+		CancelSeatInvitation(TEXT("accepted_but_start_failed"), true, true);
+		return false;
+	}
+	PendingSeatInvitationSeatID.Reset();
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("seat_id"), SeatID);
+	RecordResearchEvent(TEXT("seat_invitation_accepted"), Payload);
+	UE_LOG(LogTemp, Log, TEXT("[NPCSeatInvitation] accepted. Seat=%s"), *SeatID);
+	return true;
+}
+
+bool UNPCAutonomyComponent::IsSeatInvitationPending() const
+{
+	return bSeatInvitationPending;
+}
+
+void UNPCAutonomyComponent::NotifyNPCEnteredSeat(const FString& SeatID)
+{
+	if (!bActivityRunning
+		|| !CurrentActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase))
+	{
+		return;
+	}
+
+	SeatedConversationOpeningAttempts = 0;
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SeatedConversationOpeningTimerHandle);
+		World->GetTimerManager().SetTimer(
+			SeatedConversationOpeningTimerHandle,
+			this,
+			&UNPCAutonomyComponent::BeginSeatedConversationOpening,
+			FMath::Max(SeatedConversationOpeningDelaySeconds, 0.1f),
+			false);
+	}
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("seat_id"), SeatID);
+	Payload->SetNumberField(TEXT("opening_delay_seconds"), SeatedConversationOpeningDelaySeconds);
+	RecordResearchEvent(TEXT("social_seat_entered"), Payload);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSeat] seated conversation opening scheduled. Seat=%s Delay=%.1fs"),
+		*SeatID,
+		SeatedConversationOpeningDelaySeconds);
+}
+
 void UNPCAutonomyComponent::InterruptAutonomy(const FString& Reason)
 {
+	if (bSeatInvitationApproachInProgress || bSeatInvitationPending)
+	{
+		CancelSeatInvitation(Reason, false, false);
+	}
 	StopInteractiveFacingPlayer();
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(MultiStepValidationInterruptTimerHandle);
 		World->GetTimerManager().ClearTimer(PlanThoughtDisplayTimerHandle);
 		World->GetTimerManager().ClearTimer(EmbodiedResponseResumeTimerHandle);
+		World->GetTimerManager().ClearTimer(SeatInvitationTimeoutTimerHandle);
+		World->GetTimerManager().ClearTimer(SeatedConversationOpeningTimerHandle);
 	}
 	bAwaitingEmbodiedResponse = false;
 	bResumePausedActivityAfterReply = false;
@@ -780,6 +1109,20 @@ FString UNPCAutonomyComponent::BuildInteractiveDialogueContext()
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetBoolField(TEXT("activity_running_when_player_spoke"), bActivityRunning);
 	Root->SetStringField(TEXT("npc_location"), LastKnownNPCZone);
+	if (bSeatInvitationPending)
+	{
+		TSharedRef<FJsonObject> InvitationObject = MakeShared<FJsonObject>();
+		InvitationObject->SetBoolField(TEXT("pending"), true);
+		InvitationObject->SetStringField(TEXT("offered_seat_id"), PendingSeatInvitationSeatID);
+		InvitationObject->SetBoolField(TEXT("explicit_consent_required"), true);
+		InvitationObject->SetStringField(
+			TEXT("situation_ja"),
+			TEXT("澄羽はお客様に、向かいの席に座ってもいいか尋ね、返事を待っている。"));
+		InvitationObject->SetStringField(
+			TEXT("resolution_rule_ja"),
+			TEXT("明確な同意のときだけ着席し、拒否または別の用件なら着席しない。曖昧な返事なら一度だけ確認する。"));
+		Root->SetObjectField(TEXT("seat_invitation"), InvitationObject);
+	}
 	TSharedRef<FJsonObject> EmbodiedCapabilities = MakeShared<FJsonObject>();
 	EmbodiedCapabilities->SetBoolField(TEXT("facial_expression"), true);
 	EmbodiedCapabilities->SetBoolField(TEXT("face_player"), true);
@@ -805,10 +1148,10 @@ FString UNPCAutonomyComponent::BuildInteractiveDialogueContext()
 	if (bPendingPlayerSpeechStartle)
 	{
 		const FString ImmediateScene = PlayerDirection == TEXT("behind")
-			? TEXT("先生がアリスの背後から突然声をかけたため、アリスは実際にびっくりした。")
+			? TEXT("お客様が澄羽の背後から突然声をかけたため、澄羽は実際にびっくりした。")
 			: PlayerDirection == TEXT("side")
-			? TEXT("先生がアリスの横から突然声をかけたため、アリスは実際にびっくりした。")
-			: TEXT("集中していたアリスに先生が突然声をかけたため、アリスは実際にびっくりした。");
+			? TEXT("お客様が澄羽の横から突然声をかけたため、澄羽は実際にびっくりした。")
+			: TEXT("集中していた澄羽にお客様が突然声をかけたため、澄羽は実際にびっくりした。");
 		StartleContext->SetStringField(TEXT("immediate_scene_ja"), ImmediateScene);
 		StartleContext->SetStringField(
 			TEXT("reply_requirement_ja"),
@@ -844,6 +1187,14 @@ FString UNPCAutonomyComponent::BuildInteractiveDialogueContext()
 		else if (ActivityID.Equals(TEXT("review_shift_notes"), ESearchCase::IgnoreCase))
 		{
 			DialogueSummaryJapanese = TEXT("カウンターで端末を使って業務メモを確認している");
+		}
+		else if (ActivityID.Equals(TEXT("rest_on_sofa"), ESearchCase::IgnoreCase))
+		{
+			DialogueSummaryJapanese = TEXT("疲れたため、ソファに座って少し休んでいる");
+		}
+		else if (ActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase))
+		{
+			DialogueSummaryJapanese = TEXT("お客様の向かいの席に座って、落ち着いて話そうとしている");
 		}
 		if (!DialogueSummaryJapanese.IsEmpty())
 		{
@@ -891,6 +1242,12 @@ FString UNPCAutonomyComponent::BuildInteractiveDialogueContext()
 			BodyResources->SetStringField(TEXT("left_hand"), TEXT("occupied"));
 			BodyResources->SetStringField(TEXT("right_hand"), TEXT("occupied_by_watering_can"));
 			BodyResources->SetStringField(TEXT("prop"), TEXT("watering_can"));
+		}
+		else if (CurrentActivityID.Equals(TEXT("rest_on_sofa"), ESearchCase::IgnoreCase)
+			|| CurrentActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase))
+		{
+			BodyResources->SetStringField(TEXT("locomotion"), TEXT("seated"));
+			BodyResources->SetStringField(TEXT("upper_body"), TEXT("available_for_seated_expression"));
 		}
 		Root->SetObjectField(TEXT("body_resource_state"), BodyResources);
 	}
@@ -1118,6 +1475,39 @@ void UNPCAutonomyComponent::BuildRuntimeActivityLibrary()
 		Activity->EnergyDelta = 5.0f;
 		Activity->CooldownSeconds = 90.0f;
 	}
+	if (!FindRuntimeActivity(TEXT("rest_on_sofa")))
+	{
+		FNPCAutonomyActivityDefinition Activity;
+		Activity.ActivityID = TEXT("rest_on_sofa");
+		Activity.DisplayName = FText::FromString(TEXT("Rest on Sofa"));
+		Activity.LLMDescription = TEXT(
+			"Sit on an available sofa for a short recovery only when energy is especially low and no service task is urgent.");
+		Activity.Category = ENPCAutonomyActivityCategory::Leisure;
+		Activity.AmbientDrive = ENPCAutonomyAmbientDrive::EnergyRecovery;
+		Activity.AmbientBaseWeight = 12.0f;
+		Activity.AnimationFallbackSeconds = 15.0f;
+		Activity.CooldownSeconds = 90.0f;
+		Activity.StimulationGain = 2.0f;
+		Activity.EnergyDelta = 15.0f;
+		Activity.bEnabled = true;
+		RuntimeActivities.Add(MoveTemp(Activity));
+	}
+	if (!FindRuntimeActivity(TEXT("sit_with_player")))
+	{
+		FNPCAutonomyActivityDefinition Activity;
+		Activity.ActivityID = TEXT("sit_with_player");
+		Activity.DisplayName = FText::FromString(TEXT("Sit with Player"));
+		Activity.LLMDescription = TEXT(
+			"Propose sitting in the available seat across from the seated player when a calm, longer conversation is socially appropriate. The local consent gate asks permission before Sumiha sits.");
+		Activity.Category = ENPCAutonomyActivityCategory::Preference;
+		Activity.AmbientDrive = ENPCAutonomyAmbientDrive::Neutral;
+		Activity.AnimationFallbackSeconds = 15.0f;
+		Activity.CooldownSeconds = 120.0f;
+		Activity.StimulationGain = 6.0f;
+		Activity.EnergyDelta = 1.0f;
+		Activity.bEnabled = true;
+		RuntimeActivities.Add(MoveTemp(Activity));
+	}
 
 	auto AddPlaceholder = [this, &FindRuntimeActivity](
 		const FString& ActivityID,
@@ -1156,7 +1546,7 @@ void UNPCAutonomyComponent::BuildRuntimeActivityLibrary()
 		TEXT("Hum at Counter (Placeholder)"),
 		TEXT("Hum softly at the counter while remaining available for service."),
 		ENPCAutonomyActivityCategory::Leisure,
-		TEXT("/Game/art/虚拟女仆/Anim_KA_Idle08_ComeUpWithAnIdea.Anim_KA_Idle08_ComeUpWithAnIdea"),
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_KA_Idle08_ComeUpWithAnIdea_OCM.Anim_KA_Idle08_ComeUpWithAnIdea_OCM"),
 		3.0f,
 		-1.0f,
 		50.0f);
@@ -1165,7 +1555,7 @@ void UNPCAutonomyComponent::BuildRuntimeActivityLibrary()
 		TEXT("Straighten Uniform (Placeholder)"),
 		TEXT("Briefly straighten her uniform during a quiet moment."),
 		ENPCAutonomyActivityCategory::Leisure,
-		TEXT("/Game/art/虚拟女仆/Anim_KA_Idle03_LookAtHands.Anim_KA_Idle03_LookAtHands"),
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_KA_Idle03_LookAtHands_OCM.Anim_KA_Idle03_LookAtHands_OCM"),
 		2.0f,
 		-0.5f,
 		45.0f);
@@ -1174,7 +1564,7 @@ void UNPCAutonomyComponent::BuildRuntimeActivityLibrary()
 		TEXT("Compose Self at Counter (Placeholder)"),
 		TEXT("Pause at the counter, look down briefly, and take a breath to settle a negative feeling."),
 		ENPCAutonomyActivityCategory::Expression,
-		TEXT("/Game/art/虚拟女仆/Anim_KA_Idle04_LookAtFeet.Anim_KA_Idle04_LookAtFeet"),
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_KA_Idle04_LookAtFeet_OCM.Anim_KA_Idle04_LookAtFeet_OCM"),
 		1.0f,
 		1.0f,
 		55.0f);
@@ -1183,7 +1573,7 @@ void UNPCAutonomyComponent::BuildRuntimeActivityLibrary()
 		TEXT("Inspect Cafe (Placeholder)"),
 		TEXT("Deliberately inspect the cafe and check whether the room looks orderly."),
 		ENPCAutonomyActivityCategory::Preference,
-		TEXT("/Game/art/虚拟女仆/Anim_KA_Idle02_LookLeftAndRight.Anim_KA_Idle02_LookLeftAndRight"),
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_KA_Idle02_LookLeftAndRight_OCM.Anim_KA_Idle02_LookLeftAndRight_OCM"),
 		2.0f,
 		-1.0f,
 		60.0f);
@@ -1192,7 +1582,7 @@ void UNPCAutonomyComponent::BuildRuntimeActivityLibrary()
 		TEXT("Organize Counter (Placeholder)"),
 		TEXT("Organize the counter as a self-initiated housekeeping preference."),
 		ENPCAutonomyActivityCategory::Preference,
-		TEXT("/Game/art/虚拟女仆/Anim_KA_Idle12_LeaningForward.Anim_KA_Idle12_LeaningForward"),
+		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_KA_Idle12_LeaningForward_OCM.Anim_KA_Idle12_LeaningForward_OCM"),
 		3.0f,
 		-2.0f,
 		75.0f);
@@ -1203,7 +1593,7 @@ void UNPCAutonomyComponent::BuildRuntimeActivityLibrary()
 			TEXT("Check Supplies (Placeholder)"),
 			TEXT("Check the supplies kept at the counter and mentally note their condition."),
 			ENPCAutonomyActivityCategory::Preference,
-			TEXT("/Game/art/虚拟女仆/Anim_KA_Idle03_LookAtHands.Anim_KA_Idle03_LookAtHands"),
+			TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_KA_Idle03_LookAtHands_OCM.Anim_KA_Idle03_LookAtHands_OCM"),
 			2.0f,
 			-1.0f,
 			65.0f);
@@ -1255,6 +1645,8 @@ void UNPCAutonomyComponent::UpdateInternalState(float DeltaSeconds)
 	const bool bAutonomyContext = ServiceManager && IsServiceStateAutonomyAllowed(ServiceManager->CurrentState);
 	const bool bQuietIdle = bAutonomyContext
 		&& !bActivityRunning
+		&& !bSeatInvitationApproachInProgress
+		&& !bSeatInvitationPending
 		&& ActionQueueComponent
 		&& !ActionQueueComponent->IsBusyForAutonomy();
 	const float MotiveTimeScale = bFastValidationMode
@@ -1543,6 +1935,8 @@ bool UNPCAutonomyComponent::CanRunAutonomy() const
 		|| bDecisionPending
 		|| bAppraisalPending
 		|| bActivityRunning
+		|| bSeatInvitationApproachInProgress
+		|| bSeatInvitationPending
 		|| !ServiceManager
 		|| !MaidNPCActor
 		|| !ActionQueueComponent
@@ -1606,6 +2000,47 @@ bool UNPCAutonomyComponent::IsActivityAvailable(const FNPCAutonomyActivityDefini
 	{
 		return false;
 	}
+	if (ActivityID.Equals(TEXT("rest_on_sofa"), ESearchCase::IgnoreCase))
+	{
+		if (!ForcedSeatID.IsEmpty())
+		{
+			bool bForcedSeatAvailable = false;
+			if (UWorld* World = GetWorld())
+			{
+				for (TActorIterator<AFurnitureMarkerActor> It(World); It; ++It)
+				{
+					const AFurnitureMarkerActor* Seat = *It;
+					if (Seat
+						&& Seat->FurnitureID.Equals(ForcedSeatID, ESearchCase::IgnoreCase)
+						&& Seat->bAllowNPCSit
+						&& Seat->IsSeatAvailableFor(MaidNPCActor))
+					{
+						bForcedSeatAvailable = true;
+						break;
+					}
+				}
+			}
+			if (!bForcedSeatAvailable)
+			{
+				return false;
+			}
+		}
+		else if (ResourceState.Energy > SofaRestEnergyThreshold || FindAvailableRestSeatID().IsEmpty())
+		{
+			return false;
+		}
+	}
+	else if (ActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase))
+	{
+		const bool bManualSeatOverride = !ForcedSeatID.IsEmpty();
+		if ((!bManualSeatOverride
+				&& bRequireServedStateForNaturalSocialSit
+				&& (!ServiceManager || ServiceManager->CurrentState != ECafeServiceState::Served))
+			|| FindAvailableSeatOppositePlayerID().IsEmpty())
+		{
+			return false;
+		}
+	}
 
 	if (!Activity.RequiredWorldStateTag.IsNone() && !GetWorldStateTag(Activity.RequiredWorldStateTag))
 	{
@@ -1617,7 +2052,7 @@ bool UNPCAutonomyComponent::IsActivityAvailable(const FNPCAutonomyActivityDefini
 		return false;
 	}
 
-	const UWorld* World = GetWorld();
+	UWorld* World = GetWorld();
 	const double CurrentTime = World ? World->GetTimeSeconds() : 0.0;
 	if (const double* CooldownUntil = ActivityCooldownUntil.Find(ActivityID))
 	{
@@ -1625,6 +2060,88 @@ bool UNPCAutonomyComponent::IsActivityAvailable(const FNPCAutonomyActivityDefini
 	}
 
 	return true;
+}
+
+FString UNPCAutonomyComponent::FindAvailableRestSeatID() const
+{
+	UWorld* World = GetWorld();
+	if (!World || !MaidNPCActor)
+	{
+		return TEXT("");
+	}
+
+	const AFurnitureMarkerActor* BestSeat = nullptr;
+	float BestDistanceSq = TNumericLimits<float>::Max();
+	for (TActorIterator<AFurnitureMarkerActor> It(World); It; ++It)
+	{
+		const AFurnitureMarkerActor* Seat = *It;
+		if (!Seat
+			|| !Seat->bAllowNPCSit
+			|| !Seat->IsSeatAvailableFor(MaidNPCActor)
+			|| (!Seat->FurnitureType.Equals(TEXT("sofa"), ESearchCase::IgnoreCase)
+				&& !ContainsTagIgnoreCase(Seat->FurnitureTags, TEXT("npc_rest"))))
+		{
+			continue;
+		}
+
+		const float DistanceSq = FVector::DistSquared(
+			MaidNPCActor->GetActorLocation(),
+			Seat->GetNPCStandTransform().GetLocation());
+		if (!BestSeat
+			|| Seat->Priority > BestSeat->Priority
+			|| (Seat->Priority == BestSeat->Priority && DistanceSq < BestDistanceSq))
+		{
+			BestSeat = Seat;
+			BestDistanceSq = DistanceSq;
+		}
+	}
+
+	return BestSeat ? BestSeat->FurnitureID : TEXT("");
+}
+
+FString UNPCAutonomyComponent::FindAvailableSeatOppositePlayerID() const
+{
+	UWorld* World = GetWorld();
+	AActor* PlayerActor = World ? UGameplayStatics::GetPlayerPawn(World, 0) : nullptr;
+	const UPlayerSeatComponent* PlayerSeatComponent = PlayerActor
+		? PlayerActor->FindComponentByClass<UPlayerSeatComponent>()
+		: nullptr;
+	if (!World
+		|| !MaidNPCActor
+		|| !PlayerSeatComponent
+		|| !PlayerSeatComponent->bIsSeated
+		|| PlayerSeatComponent->CurrentTableID.TrimStartAndEnd().IsEmpty())
+	{
+		return TEXT("");
+	}
+
+	const AFurnitureMarkerActor* BestSeat = nullptr;
+	float BestDistanceSq = TNumericLimits<float>::Max();
+	for (TActorIterator<AFurnitureMarkerActor> It(World); It; ++It)
+	{
+		const AFurnitureMarkerActor* Seat = *It;
+		if (!Seat
+			|| !Seat->bAllowNPCSit
+			|| Seat->FurnitureID.Equals(PlayerSeatComponent->CurrentSeatID, ESearchCase::IgnoreCase)
+			|| !Seat->RelatedTableID.Equals(PlayerSeatComponent->CurrentTableID, ESearchCase::IgnoreCase)
+			|| !Seat->IsSeatAvailableFor(MaidNPCActor))
+		{
+			continue;
+		}
+
+		const float DistanceSq = FVector::DistSquared(
+			MaidNPCActor->GetActorLocation(),
+			Seat->GetNPCStandTransform().GetLocation());
+		if (!BestSeat
+			|| Seat->Priority > BestSeat->Priority
+			|| (Seat->Priority == BestSeat->Priority && DistanceSq < BestDistanceSq))
+		{
+			BestSeat = Seat;
+			BestDistanceSq = DistanceSq;
+		}
+	}
+
+	return BestSeat ? BestSeat->FurnitureID : TEXT("");
 }
 
 bool UNPCAutonomyComponent::HasSceneTargetTag(const FString& TargetTag) const
@@ -1749,25 +2266,79 @@ void UNPCAutonomyComponent::SeedPositiveValidationMemory()
 		return;
 	}
 
-	const bool bAlreadySeeded = MemoryComponent->Memories.ContainsByPredicate([](const FNPCMemoryEntry& Memory)
+	int32 SeededCount = 0;
+	const auto SeedIfMissing = [this, &SeededCount](
+		FName EventTag,
+		const TCHAR* Summary,
+		FName LocationTag,
+		const TArray<FName>& CueTags,
+		float Valence,
+		float Arousal,
+		float Importance)
 	{
-		return Memory.EventTag == FName(TEXT("validation_customer_praise"));
-	});
-	if (bAlreadySeeded)
-	{
-		return;
-	}
+		const bool bAlreadySeeded = MemoryComponent->Memories.ContainsByPredicate([EventTag](const FNPCMemoryEntry& Memory)
+		{
+			return Memory.EventTag == EventTag;
+		});
+		if (bAlreadySeeded)
+		{
+			return;
+		}
 
-	MemoryComponent->RecordMemoryEvent(
-		FName(TEXT("validation_customer_praise")),
-		TEXT("A customer sincerely praised Alice for being thoughtful and making the cafe feel welcoming."),
+		MemoryComponent->RecordMemoryEvent(
+			EventTag,
+			Summary,
+			LocationTag,
+			CueTags,
+			Valence,
+			Arousal,
+			Importance,
+			false);
+		++SeededCount;
+	};
+
+	SeedIfMissing(
+		FName(TEXT("demo_customer_praise")),
+		TEXT("A customer who had been having a difficult day told Sumiha that her calm attention made them feel safe and welcome."),
 		FName(TEXT("dining_area")),
-		{ FName(TEXT("player")), FName(TEXT("customer")), FName(TEXT("praise")), FName(TEXT("service")) },
-		0.85f,
+		TArray<FName>{ FName(TEXT("player")), FName(TEXT("customer")), FName(TEXT("served")) },
+		0.90f,
 		0.55f,
-		0.85f,
-		false);
-	UE_LOG(LogTemp, Log, TEXT("[MemoryEmotionTest] seeded positive validation memory."));
+		0.92f);
+
+	SeedIfMissing(
+		FName(TEXT("demo_rainy_evening_conversation")),
+		TEXT("On a quiet rainy evening, a regular customer stayed at the counter and thanked Sumiha for listening without rushing them."),
+		FName(TEXT("counter")),
+		TArray<FName>{ FName(TEXT("counter")), FName(TEXT("idle")) },
+		0.72f,
+		0.28f,
+		0.82f);
+
+	SeedIfMissing(
+		FName(TEXT("demo_service_mistake")),
+		TEXT("Sumiha once hurried and delivered an order to the wrong table; the customer's disappointed expression made her resolve to slow down and check carefully."),
+		FName(TEXT("dining_area")),
+		TArray<FName>{ FName(TEXT("player")), FName(TEXT("waitingfororder")) },
+		-0.75f,
+		0.72f,
+		0.90f);
+
+	SeedIfMissing(
+		FName(TEXT("demo_revived_flower")),
+		TEXT("A wilted flower recovered after several days of Sumiha's care, and seeing its new bud made her quietly proud."),
+		FName(TEXT("plant_area")),
+		TArray<FName>{ FName(TEXT("flower_needs_water")), FName(TEXT("idle")) },
+		0.68f,
+		0.40f,
+		0.78f);
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[MemoryEmotionTest] demo memories ready. Added=%d Total=%d"),
+		SeededCount,
+		MemoryComponent->Memories.Num());
 }
 
 TArray<FName> UNPCAutonomyComponent::BuildRecallCueTags() const
@@ -1837,7 +2408,8 @@ bool UNPCAutonomyComponent::TryBeginSpontaneousRecall(float DeltaSeconds)
 	if (!bEnableSpontaneousRecall
 		|| DeltaSeconds <= 0.0f
 		|| !MemoryComponent
-		|| MemoryComponent->Memories.IsEmpty())
+		|| MemoryComponent->Memories.IsEmpty()
+		|| (bWaitForPlayerEncounterBeforeValidation && !bHasEncounteredPlayer))
 	{
 		return false;
 	}
@@ -2198,7 +2770,8 @@ bool UNPCAutonomyComponent::TryBeginMemoryAppraisal(const FString& PlanningTrigg
 		|| !MemoryComponent
 		|| !EmotionComponent
 		|| !AutonomyLLMClient
-		|| MemoryComponent->Memories.IsEmpty())
+		|| MemoryComponent->Memories.IsEmpty()
+		|| (bWaitForPlayerEncounterBeforeValidation && !bHasEncounteredPlayer))
 	{
 		return false;
 	}
@@ -2577,17 +3150,21 @@ void UNPCAutonomyComponent::ApplyExpressionMorphs(
 	{
 		PresetWeights.Add(FName(TEXT("Joy")), 0.9f);
 		PresetWeights.Add(FName(TEXT("笑眉毛")), 0.2f);
+		PresetWeights.Add(FName(TEXT("Fcl_ALL_Joy")), 0.9f);
 	}
 	else if (NormalizedIntent == TEXT("hum"))
 	{
 		PresetWeights.Add(FName(TEXT("Fun")), 0.75f);
 		PresetWeights.Add(FName(TEXT("Joy")), 0.25f);
 		PresetWeights.Add(FName(TEXT("笑眉毛")), 0.2f);
+		PresetWeights.Add(FName(TEXT("Fcl_ALL_Fun")), 0.75f);
+		PresetWeights.Add(FName(TEXT("Fcl_ALL_Joy")), 0.25f);
 	}
 	else if (NormalizedIntent == TEXT("sigh"))
 	{
 		PresetWeights.Add(FName(TEXT("Sorrow")), 0.85f);
 		PresetWeights.Add(FName(TEXT("倒八字眉毛")), 0.2f);
+		PresetWeights.Add(FName(TEXT("Fcl_ALL_Sorrow")), 0.85f);
 	}
 	else if (NormalizedIntent == TEXT("pensive"))
 	{
@@ -2597,33 +3174,42 @@ void UNPCAutonomyComponent::ApplyExpressionMorphs(
 		PresetWeights.Add(FName(TEXT("look_right")), 0.45f);
 		PresetWeights.Add(FName(TEXT("困惑闭嘴")), 0.7f);
 		PresetWeights.Add(FName(TEXT("困惑闭眼R")), 0.22f);
+		PresetWeights.Add(FName(TEXT("Fcl_MTH_Close")), 0.25f);
+		PresetWeights.Add(FName(TEXT("Fcl_EYE_Joy_R")), 0.12f);
+		PresetWeights.Add(FName(TEXT("Fcl_BRW_Sorrow")), 0.1f);
 	}
 	else if (NormalizedIntent == TEXT("angry"))
 	{
 		PresetWeights.Add(FName(TEXT("Angry")), 0.85f);
 		PresetWeights.Add(FName(TEXT("怒眉毛")), 0.25f);
+		PresetWeights.Add(FName(TEXT("Fcl_ALL_Angry")), 0.85f);
 	}
 	else if (NormalizedIntent == TEXT("alert"))
 	{
 		PresetWeights.Add(FName(TEXT("look_up")), 0.45f);
 		PresetWeights.Add(FName(TEXT("怒眉毛")), 0.12f);
+		PresetWeights.Add(FName(TEXT("Fcl_ALL_Surprised")), 0.25f);
 	}
 	else if (NormalizedIntent == TEXT("startled"))
 	{
 		PresetWeights.Add(FName(TEXT("look_up")), 0.85f);
 		PresetWeights.Add(FName(TEXT("困惑闭嘴")), 0.8f);
+		PresetWeights.Add(FName(TEXT("Fcl_ALL_Surprised")), 0.9f);
 	}
 	else if (NormalizedIntent == TEXT("blush"))
 	{
 		PresetWeights.Add(FName(TEXT("脸红")), 0.85f);
 		PresetWeights.Add(FName(TEXT("Joy")), 0.18f);
 		PresetWeights.Add(FName(TEXT("look_down")), 0.22f);
+		PresetWeights.Add(FName(TEXT("Fcl_ALL_Joy")), 0.18f);
 	}
 	else if (NormalizedIntent == TEXT("startled_blush"))
 	{
 		PresetWeights.Add(FName(TEXT("脸红")), 0.9f);
 		PresetWeights.Add(FName(TEXT("look_up")), 0.55f);
 		PresetWeights.Add(FName(TEXT("困惑闭嘴")), 0.3f);
+		PresetWeights.Add(FName(TEXT("Fcl_ALL_Surprised")), 0.75f);
+		PresetWeights.Add(FName(TEXT("Fcl_ALL_Joy")), 0.12f);
 	}
 	else
 	{
@@ -2907,6 +3493,7 @@ void UNPCAutonomyComponent::InitializeAutomaticBlinking()
 			if (LowerName == TEXT("blink")
 				|| LowerName == TEXT("eyeclose")
 				|| LowerName == TEXT("eye_close")
+				|| LowerName == TEXT("fcl_eye_close")
 				|| LowerName == TEXT("闭眼lr"))
 			{
 				UnifiedBlinkMorph = MorphName;
@@ -3649,6 +4236,15 @@ bool UNPCAutonomyComponent::StartActivity(
 	}
 
 	const FString ActivityID = Activity.ActivityID.TrimStartAndEnd();
+	if (ActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase)
+		&& !bSeatInvitationAcceptedForStart)
+	{
+		const FString SeatID = !ForcedSeatID.IsEmpty()
+			? ForcedSeatID
+			: FindAvailableSeatOppositePlayerID();
+		return !SeatID.IsEmpty() && BeginSeatInvitation(Activity, SeatID, Reason);
+	}
+
 	CurrentActivityID = ActivityID;
 	LastDecisionReason = Reason;
 	bActivityRunning = true;
@@ -3763,6 +4359,37 @@ bool UNPCAutonomyComponent::StartActivity(
 		return true;
 	}
 
+	if (ActivityID.Equals(TEXT("rest_on_sofa"), ESearchCase::IgnoreCase)
+		|| ActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase))
+	{
+		const FString SeatID = !ForcedSeatID.IsEmpty()
+			? ForcedSeatID
+			: ActivityID.Equals(TEXT("rest_on_sofa"), ESearchCase::IgnoreCase)
+				? FindAvailableRestSeatID()
+				: FindAvailableSeatOppositePlayerID();
+		if (SeatID.IsEmpty() || !StartSeatActivitySequence(Activity, SeatID))
+		{
+			FinishActivity(true);
+			return false;
+		}
+
+		RuntimePhase = ENPCAutonomyRuntimePhase::BuiltInQueue;
+		ActionQueueComponent->StartActionQueue();
+		if (!ActionQueueComponent->bIsRunningQueue)
+		{
+			FinishActivity(true);
+			return false;
+		}
+
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[Autonomy] seat activity started. Activity=%s Seat=%s"),
+			*ActivityID,
+			*SeatID);
+		return true;
+	}
+
 	const bool bCollectTableware = ActivityID.Equals(TEXT("collect_tableware"), ESearchCase::IgnoreCase);
 	const UNPCFoodCarryComponent* FoodCarryComponent = MaidNPCActor
 		? MaidNPCActor->FindComponentByClass<UNPCFoodCarryComponent>()
@@ -3843,6 +4470,254 @@ bool UNPCAutonomyComponent::StartActivity(
 
 	UE_LOG(LogTemp, Log, TEXT("[Autonomy] activity started. Activity=%s"), *ActivityID);
 	return true;
+}
+
+bool UNPCAutonomyComponent::StartSeatActivitySequence(
+	const FNPCAutonomyActivityDefinition& Activity,
+	const FString& SeatID)
+{
+	if (!ActionQueueComponent || SeatID.TrimStartAndEnd().IsEmpty())
+	{
+		return false;
+	}
+
+	UAnimSequenceBase* SitDown = SitDownAnimation.LoadSynchronous();
+	UAnimSequenceBase* SeatedIdle = SeatedIdleAnimation.LoadSynchronous();
+	UAnimSequenceBase* SeatedConversation = SeatedConversationAnimation.LoadSynchronous();
+	UAnimSequenceBase* StandUp = StandUpAnimation.LoadSynchronous();
+	if (!SitDown || !SeatedIdle || !StandUp
+		|| !IsAnimationCompatibleWithMaid(SitDown)
+		|| !IsAnimationCompatibleWithMaid(SeatedIdle)
+		|| !IsAnimationCompatibleWithMaid(StandUp))
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[NPCSeat] seat animations are missing or incompatible. Sit=%s Idle=%s Stand=%s"),
+			SitDown ? *SitDown->GetName() : TEXT("none"),
+			SeatedIdle ? *SeatedIdle->GetName() : TEXT("none"),
+			StandUp ? *StandUp->GetName() : TEXT("none"));
+		return false;
+	}
+
+	ActiveActivityAnimation = SeatedIdle;
+	ActionQueueComponent->EnqueueMoveToSeatID(SeatID.TrimStartAndEnd());
+	ActionQueueComponent->EnqueueEnterSeat();
+	ActionQueueComponent->EnqueueAnimation(SitDown, FName(TEXT("DefaultSlot")), 1.0f, 3.0f);
+	if (Activity.ActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase)
+		&& IsAnimationCompatibleWithMaid(SeatedConversation))
+	{
+		ActionQueueComponent->EnqueueAnimation(
+			SeatedConversation,
+			FName(TEXT("DefaultSlot")),
+			1.0f,
+			5.0f);
+	}
+	const int32 IdleLoopCount = Activity.ActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase)
+		? SocialSeatedIdleLoopCount
+		: SeatedIdleLoopCount;
+	ActionQueueComponent->EnqueueLoopedAnimation(
+		SeatedIdle,
+		FMath::Max(IdleLoopCount, 1),
+		FName(TEXT("DefaultSlot")),
+		1.0f,
+		FMath::Max(Activity.AnimationFallbackSeconds, 3.0f));
+	ActionQueueComponent->EnqueueAnimation(StandUp, FName(TEXT("DefaultSlot")), 1.0f, 3.0f);
+	ActionQueueComponent->EnqueueExitSeat();
+	return true;
+}
+
+bool UNPCAutonomyComponent::BeginSeatInvitation(
+	const FNPCAutonomyActivityDefinition& Activity,
+	const FString& SeatID,
+	const FString& Reason)
+{
+	if (!ActionQueueComponent || SeatID.TrimStartAndEnd().IsEmpty())
+	{
+		return false;
+	}
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SeatInvitationTimeoutTimerHandle);
+	}
+	bSeatInvitationApproachInProgress = true;
+	bSeatInvitationPending = false;
+	PendingSeatInvitationSeatID = SeatID.TrimStartAndEnd();
+	LastDecisionReason = Reason;
+	NextDecisionEarliestWorldTime = TNumericLimits<double>::Max();
+
+	ActionQueueComponent->ClearActionQueue();
+	ActionQueueComponent->EnqueueMoveToSeatID(PendingSeatInvitationSeatID);
+	ActionQueueComponent->EnqueueFacePlayer();
+	ActionQueueComponent->StartActionQueue();
+	if (!ActionQueueComponent->bIsRunningQueue)
+	{
+		bSeatInvitationApproachInProgress = false;
+		PendingSeatInvitationSeatID.Reset();
+		ScheduleNextDecision(DecisionErrorRetrySeconds);
+		return false;
+	}
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("activity"), Activity.ActivityID.TrimStartAndEnd());
+	Payload->SetStringField(TEXT("seat_id"), PendingSeatInvitationSeatID);
+	Payload->SetStringField(TEXT("reason"), Reason);
+	RecordResearchEvent(TEXT("seat_invitation_approach_started"), Payload);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSeatInvitation] approaching before asking. Seat=%s Reason=%s"),
+		*PendingSeatInvitationSeatID,
+		*Reason);
+	return true;
+}
+
+void UNPCAutonomyComponent::PresentSeatInvitation()
+{
+	bSeatInvitationApproachInProgress = false;
+	if (PendingSeatInvitationSeatID.IsEmpty() || FindAvailableSeatOppositePlayerID().IsEmpty())
+	{
+		CancelSeatInvitation(TEXT("player_or_seat_unavailable_before_question"), true, true);
+		return;
+	}
+
+	bSeatInvitationPending = true;
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().SetTimer(
+			SeatInvitationTimeoutTimerHandle,
+			this,
+			&UNPCAutonomyComponent::HandleSeatInvitationTimeout,
+			FMath::Max(SeatInvitationTimeoutSeconds, 5.0f),
+			false);
+	}
+
+	ApplyExpressionMorphs(TEXT("smile"), false, 4.0f);
+	const FString InvitationText = SeatInvitationText.TrimStartAndEnd().IsEmpty()
+		? TEXT("少しゆっくりお話ししたいのですが、向かいの席に座ってもいいですか？")
+		: SeatInvitationText.TrimStartAndEnd();
+	if (ULLMClient* InteractiveClient = ULLMClient::GetMostRecentInteractiveClient())
+	{
+		InteractiveClient->SpeakDirectText(InvitationText);
+	}
+	else if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 8.0f, FColor::Cyan, InvitationText);
+	}
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("seat_id"), PendingSeatInvitationSeatID);
+	Payload->SetNumberField(TEXT("timeout_seconds"), SeatInvitationTimeoutSeconds);
+	RecordResearchEvent(TEXT("seat_invitation_presented"), Payload);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSeatInvitation] waiting for explicit consent. Seat=%s Timeout=%.1fs"),
+		*PendingSeatInvitationSeatID,
+		SeatInvitationTimeoutSeconds);
+}
+
+void UNPCAutonomyComponent::HandleSeatInvitationTimeout()
+{
+	if (!bSeatInvitationPending)
+	{
+		return;
+	}
+	CancelSeatInvitation(TEXT("player_response_timeout"), true, true);
+}
+
+void UNPCAutonomyComponent::BeginSeatedConversationOpening()
+{
+	if (!bActivityRunning
+		|| !CurrentActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase)
+		|| !ServiceManager)
+	{
+		return;
+	}
+
+	++SeatedConversationOpeningAttempts;
+	const bool bRequested = ServiceManager->TriggerSeatedConversationOpportunity();
+	if (!bRequested && SeatedConversationOpeningAttempts < 8)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().SetTimer(
+				SeatedConversationOpeningTimerHandle,
+				this,
+				&UNPCAutonomyComponent::BeginSeatedConversationOpening,
+				1.5f,
+				false);
+		}
+	}
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetBoolField(TEXT("request_started"), bRequested);
+	Payload->SetNumberField(TEXT("attempt"), SeatedConversationOpeningAttempts);
+	RecordResearchEvent(TEXT("seated_conversation_opening_requested"), Payload);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSeat] seated conversation opening request started=%s Attempt=%d"),
+		bRequested ? TEXT("true") : TEXT("false"),
+		SeatedConversationOpeningAttempts);
+}
+
+void UNPCAutonomyComponent::CancelSeatInvitation(
+	const FString& Reason,
+	bool bClearPlan,
+	bool bReturnToCounter)
+{
+	const FString CancelledSeatID = PendingSeatInvitationSeatID;
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SeatInvitationTimeoutTimerHandle);
+		if (Reason.Equals(TEXT("player_declined"), ESearchCase::IgnoreCase)
+			|| Reason.Equals(TEXT("player_response_timeout"), ESearchCase::IgnoreCase))
+		{
+			ActivityCooldownUntil.Add(
+				TEXT("sit_with_player"),
+				World->GetTimeSeconds() + FMath::Max(SeatInvitationDeclineCooldownSeconds, 0.0f));
+		}
+	}
+
+	bSeatInvitationApproachInProgress = false;
+	bSeatInvitationPending = false;
+	bSeatInvitationAcceptedForStart = false;
+	PendingSeatInvitationSeatID.Reset();
+	if (ActionQueueComponent)
+	{
+		ActionQueueComponent->StopActionQueue();
+	}
+	if (bClearPlan)
+	{
+		ClearActivePlan(FString::Printf(TEXT("seat_invitation_cancelled:%s"), *Reason));
+	}
+	if (bReturnToCounter)
+	{
+		ReturnToCounterAfterSeatInvitation();
+	}
+	ScheduleNextDecision(DelayAfterPlayerInteractionSeconds);
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("seat_id"), CancelledSeatID);
+	Payload->SetStringField(TEXT("reason"), Reason);
+	RecordResearchEvent(TEXT("seat_invitation_cancelled"), Payload);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSeatInvitation] cancelled. Seat=%s Reason=%s"),
+		*CancelledSeatID,
+		*Reason);
+}
+
+void UNPCAutonomyComponent::ReturnToCounterAfterSeatInvitation()
+{
+	if (!ActionQueueComponent || !HasSceneTargetTag(TEXT("counter")))
+	{
+		return;
+	}
+	ActionQueueComponent->EnqueueMoveToSceneTag(TEXT("counter"));
+	ActionQueueComponent->StartActionQueue();
 }
 
 void UNPCAutonomyComponent::BeginBlueprintActivityExecution(const FNPCAutonomyActivityDefinition& Activity)
@@ -3985,6 +4860,7 @@ void UNPCAutonomyComponent::FinishActivity(bool bInterrupted)
 	if (UWorld* World = GetWorld())
 	{
 		World->GetTimerManager().ClearTimer(BlueprintActivityTimeoutTimerHandle);
+		World->GetTimerManager().ClearTimer(SeatedConversationOpeningTimerHandle);
 		LastActivityEndWorldTime = World->GetTimeSeconds();
 	}
 	bActivityRunning = false;
@@ -4098,6 +4974,14 @@ float UNPCAutonomyComponent::CalculateCurrentActivityFocus() const
 	{
 		return 0.55f;
 	}
+	if (ActivityID == TEXT("rest_on_sofa"))
+	{
+		return 0.2f;
+	}
+	if (ActivityID == TEXT("sit_with_player"))
+	{
+		return 0.35f;
+	}
 
 	const FNPCAutonomyActivityDefinition* Activity = FindActivityDefinition(ActivityID);
 	if (!Activity)
@@ -4123,6 +5007,15 @@ float UNPCAutonomyComponent::CalculateExpectedConversationLevel() const
 	if (!ServiceManager)
 	{
 		return 0.0f;
+	}
+	if (bSeatInvitationPending)
+	{
+		return 1.0f;
+	}
+	if (bActivityRunning
+		&& CurrentActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase))
+	{
+		return 0.9f;
 	}
 
 	switch (ServiceManager->CurrentState)
@@ -4284,6 +5177,11 @@ void UNPCAutonomyComponent::HandleInteractiveLLMRequestStarted()
 	StopInteractiveFacingPlayer();
 	PreparePlayerSpeechStartle();
 	bStartlePreparedForCurrentInteraction = false;
+	if (bSeatInvitationPending)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[NPCSeatInvitation] player response received; preserving the pending consent gate."));
+		return;
+	}
 
 	if (CanPreserveActivityForEmbodiedResponse())
 	{
@@ -4854,6 +5752,14 @@ void UNPCAutonomyComponent::HandleServiceStateChanged(ECafeServiceState NewState
 		InterruptAutonomy(TEXT("service_priority"));
 		return;
 	}
+	if (NewState == ECafeServiceState::Served
+		&& !FindAvailableSeatOppositePlayerID().IsEmpty())
+	{
+		MarkMeaningfulContextChange(TEXT("player_seated_social_opportunity"));
+		ScheduleNextDecision(InitialIdleDelaySeconds);
+		UE_LOG(LogTemp, Log, TEXT("[NPCSeatInvitation] social seating opportunity queued after service."));
+		return;
+	}
 
 	if (!bActivityRunning && !bDecisionPending)
 	{
@@ -4866,6 +5772,18 @@ void UNPCAutonomyComponent::HandleServiceStateChanged(ECafeServiceState NewState
 
 void UNPCAutonomyComponent::HandleActionQueueFinished(bool bSuccess)
 {
+	if (bSeatInvitationApproachInProgress)
+	{
+		if (bSuccess)
+		{
+			PresentSeatInvitation();
+		}
+		else
+		{
+			CancelSeatInvitation(TEXT("approach_failed"), true, false);
+		}
+		return;
+	}
 	if (!bActivityRunning || bInterruptingActivity)
 	{
 		return;

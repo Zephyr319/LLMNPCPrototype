@@ -311,6 +311,9 @@ public:
 	bool MoveToFurnitureByID(const FString& FurnitureID);
 
 	UFUNCTION(BlueprintCallable, Category = "Scene Target Movement")
+	bool MoveToSeatByID(const FString& FurnitureID);
+
+	UFUNCTION(BlueprintCallable, Category = "Scene Target Movement")
 	bool MoveToFurnitureByTag(const FString& FurnitureTag);
 
 	UFUNCTION(BlueprintCallable, Category = "Scene Target Movement")

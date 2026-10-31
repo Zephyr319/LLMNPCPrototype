@@ -8,6 +8,7 @@
 #include "NPCActionQueueComponent.generated.h"
 
 class AActor;
+class AFurnitureMarkerActor;
 class UAnimInstance;
 class UAnimMontage;
 class UAnimSequenceBase;
@@ -26,6 +27,7 @@ enum class ENPCQueuedActionType : uint8
 	MoveToSceneTag,
 	MoveToFurnitureTag,
 	MoveToFurnitureID,
+	MoveToSeatID,
 	MoveNearPlayer,
 	Wait,
 	Animation,
@@ -34,6 +36,8 @@ enum class ENPCQueuedActionType : uint8
 	PickUpPlacedFood,
 	PlaceCarriedFoodAtCounter,
 	FacePlayer,
+	EnterSeat,
+	ExitSeat,
 	Stop
 };
 
@@ -55,6 +59,8 @@ struct FNPCQueuedAction
 	FName AnimationSlotName = FName(TEXT("DefaultSlot"));
 
 	float AnimationPlayRate = 1.0f;
+
+	int32 AnimationLoopCount = 1;
 
 	UStaticMesh* HeldPropMesh = nullptr;
 
@@ -219,6 +225,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void EnqueueMoveToFurnitureID(const FString& FurnitureID);
 
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Seat")
+	void EnqueueMoveToSeatID(const FString& FurnitureID);
+
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void EnqueueMoveNearPlayer(float StopDistance = 140.0f);
 
@@ -227,6 +236,15 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void EnqueueAnimation(UAnimSequenceBase* Animation, FName SlotName = NAME_None, float PlayRate = 1.0f, float FallbackSeconds = 3.0f);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Animation")
+	void EnqueueLoopedAnimation(UAnimSequenceBase* Animation, int32 LoopCount, FName SlotName = NAME_None, float PlayRate = 1.0f, float FallbackSeconds = 3.0f);
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Seat")
+	void EnqueueEnterSeat();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Seat")
+	void EnqueueExitSeat();
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Held Prop")
 	void EnqueueAttachHeldProp(UStaticMesh* PropMesh, FName SocketName, const FTransform& RelativeTransform);
@@ -351,6 +369,12 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
 	bool IsBusyForAutonomy() const;
 
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue|Seat")
+	bool IsNPCSeated() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue|Seat")
+	FString GetNPCSeatID() const;
+
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
 	FString GetCurrentBlockingGestureName() const;
 
@@ -453,6 +477,11 @@ private:
 	UPROPERTY(Transient)
 	UStaticMeshComponent* ActiveHeldPropComponent;
 
+	UPROPERTY(Transient)
+	TObjectPtr<AFurnitureMarkerActor> ReservedSeat;
+
+	bool bNPCIsSeated;
+
 	TWeakObjectPtr<UAnimMontage> BlockingGestureMontageBeforeRequest;
 
 	float BlockingGestureMontagePositionBeforeRequest;
@@ -517,9 +546,17 @@ private:
 
 	void ExecuteFacePlayerAction();
 
+	void ExecuteSeatAction();
+
 	void CompleteCurrentAction(bool bSuccess, const FString& FailureReason);
 
 	bool IsCurrentActionMove() const;
+
+	AFurnitureMarkerActor* FindFurnitureByID(const FString& FurnitureID) const;
+
+	bool ReserveSeat(const FString& FurnitureID);
+
+	void ReleaseReservedSeat(bool bMoveToExitPoint);
 
 	FString ResolveCurrentServiceTableID() const;
 

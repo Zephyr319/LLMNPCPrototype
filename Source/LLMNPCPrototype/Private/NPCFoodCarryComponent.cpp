@@ -57,36 +57,25 @@ bool UNPCFoodCarryComponent::SpawnAndAttachFoodToHand(const FString& ItemName)
 	UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Mesh=%s"), *MeshComponent->GetName());
 	UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] HandSocketName=%s"), *HandSocketName.ToString());
 
-	const bool bSocketExists = MeshComponent->DoesSocketExist(HandSocketName);
-	UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Socket exists=%s"), bSocketExists ? TEXT("true") : TEXT("false"));
-
 	USceneComponent* AttachComponent = nullptr;
 	FName AttachSocketName = NAME_None;
 	FTransform AttachWorldTransform;
-
-	if (bSocketExists)
+	if (!ResolveCarryAttachment(MeshComponent, AttachComponent, AttachSocketName))
 	{
-		AttachComponent = MeshComponent;
-		AttachSocketName = HandSocketName;
-		AttachWorldTransform = MeshComponent->GetSocketTransform(HandSocketName, RTS_World);
+		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Cannot attach food: no compatible hand bone/socket and no FoodCarryPoint."));
+		return false;
+	}
+
+	if (AttachComponent == MeshComponent && !AttachSocketName.IsNone())
+	{
+		AttachWorldTransform = MeshComponent->GetSocketTransform(AttachSocketName, RTS_World);
 		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Socket world location=%s"), *AttachWorldTransform.GetLocation().ToString());
-		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Using hand socket: %s"), *HandSocketName.ToString());
+		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Using hand socket/bone: %s"), *AttachSocketName.ToString());
 	}
 	else
 	{
-		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Socket world location=Unavailable"));
-		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Hand socket not found, trying FoodCarryPoint fallback."));
-		AttachComponent = FindFoodCarryPoint();
-		if (AttachComponent)
-		{
-			AttachWorldTransform = AttachComponent->GetComponentTransform();
-			UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Attached food to FoodCarryPoint."));
-		}
-		else
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Cannot attach food: no socket and no FoodCarryPoint."));
-			return false;
-		}
+		AttachWorldTransform = AttachComponent->GetComponentTransform();
+		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Using FoodCarryPoint fallback."));
 	}
 
 	UWorld* World = GetWorld();
@@ -142,7 +131,7 @@ bool UNPCFoodCarryComponent::SpawnAndAttachFoodToHand(const FString& ItemName)
 		Warning,
 		TEXT("[FoodCarry] Food attached to hand. Item=%s Socket=%s"),
 		*TrimmedItemName,
-		*HandSocketName.ToString());
+		*AttachSocketName.ToString());
 	return true;
 }
 
@@ -229,18 +218,9 @@ bool UNPCFoodCarryComponent::PickUpPlacedFoodFromTable(AActor* TableActor)
 
 	USceneComponent* AttachComponent = nullptr;
 	FName AttachSocketName = NAME_None;
-	if (MeshComponent->DoesSocketExist(HandSocketName))
+	if (!ResolveCarryAttachment(MeshComponent, AttachComponent, AttachSocketName))
 	{
-		AttachComponent = MeshComponent;
-		AttachSocketName = HandSocketName;
-	}
-	else
-	{
-		AttachComponent = FindFoodCarryPoint();
-	}
-	if (!AttachComponent)
-	{
-		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Cannot collect tableware: no socket and no FoodCarryPoint."));
+		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Cannot collect tableware: no compatible hand bone/socket and no FoodCarryPoint."));
 		return false;
 	}
 
@@ -433,6 +413,52 @@ USkeletalMeshComponent* UNPCFoodCarryComponent::ResolveOwnerMesh() const
 		UE_LOG(LogTemp, Warning, TEXT("[FoodCarry] Selected first mesh candidate: %s"), *FirstMesh->GetName());
 	}
 	return FirstMesh;
+}
+
+bool UNPCFoodCarryComponent::ResolveCarryAttachment(
+	USkeletalMeshComponent* MeshComponent,
+	USceneComponent*& OutAttachComponent,
+	FName& OutAttachSocketName) const
+{
+	OutAttachComponent = nullptr;
+	OutAttachSocketName = NAME_None;
+	if (!MeshComponent)
+	{
+		return false;
+	}
+
+	TArray<FName> CandidateSocketNames;
+	CandidateSocketNames.Add(HandSocketName);
+	CandidateSocketNames.AddUnique(FName(TEXT("FoodCarrySocket")));
+	CandidateSocketNames.AddUnique(FName(TEXT("J_Bip_R_Hand")));
+	CandidateSocketNames.AddUnique(FName(TEXT("hand_R")));
+	CandidateSocketNames.AddUnique(FName(TEXT("RightHand")));
+	CandidateSocketNames.AddUnique(FName(TEXT("hand_r")));
+	CandidateSocketNames.AddUnique(FName(TEXT("mixamorig:RightHand")));
+
+	for (const FName CandidateSocketName : CandidateSocketNames)
+	{
+		if (CandidateSocketName.IsNone() || !MeshComponent->DoesSocketExist(CandidateSocketName))
+		{
+			continue;
+		}
+
+		OutAttachComponent = MeshComponent;
+		OutAttachSocketName = CandidateSocketName;
+		if (CandidateSocketName != HandSocketName)
+		{
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("[FoodCarry] resolved carry socket alias. Requested=%s Resolved=%s"),
+				*HandSocketName.ToString(),
+				*CandidateSocketName.ToString());
+		}
+		return true;
+	}
+
+	OutAttachComponent = FindFoodCarryPoint();
+	return OutAttachComponent != nullptr;
 }
 
 USceneComponent* UNPCFoodCarryComponent::FindFoodCarryPoint() const

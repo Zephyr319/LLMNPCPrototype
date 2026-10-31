@@ -183,6 +183,42 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Ambient", meta = (ClampMin = "1.0"))
 	float MaximumQuietIdleSecondsBeforeAmbient;
 
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat", meta = (ClampMin = "0.0", ClampMax = "100.0"))
+	float SofaRestEnergyThreshold;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat", meta = (ClampMin = "1", ClampMax = "10"))
+	int32 SeatedIdleLoopCount;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat", meta = (ClampMin = "1", ClampMax = "20"))
+	int32 SocialSeatedIdleLoopCount;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat")
+	bool bRequireServedStateForNaturalSocialSit;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat", meta = (ClampMin = "5.0", ClampMax = "120.0"))
+	float SeatInvitationTimeoutSeconds;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat", meta = (ClampMin = "0.0"))
+	float SeatInvitationDeclineCooldownSeconds;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat")
+	FString SeatInvitationText;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat")
+	TSoftObjectPtr<UAnimSequenceBase> SitDownAnimation;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat")
+	TSoftObjectPtr<UAnimSequenceBase> SeatedIdleAnimation;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat")
+	TSoftObjectPtr<UAnimSequenceBase> SeatedConversationAnimation;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat")
+	TSoftObjectPtr<UAnimSequenceBase> StandUpAnimation;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat", meta = (ClampMin = "0.0", ClampMax = "10.0"))
+	float SeatedConversationOpeningDelaySeconds;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|LLM")
 	FString AutonomyModelName;
 
@@ -204,13 +240,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Memory|Spontaneous Recall", meta = (ClampMin = "1.0"))
 	float PostPlanRecallOpportunityMultiplier;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Memory|Validation")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Memory|Validation",
+		meta = (DisplayName = "Seed Demo Memories For Validation",
+			ToolTip = "Adds several context-sensitive demo memories once, without duplicating existing entries."))
 	bool bSeedPositiveMemoryForValidation;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Memory|Validation")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Memory|Validation",
+		meta = (ToolTip = "Forces the first eligible demo recall to pass its probability check."))
 	bool bForceFirstValidationRecall;
 
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Memory|Validation")
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Memory|Validation",
+		meta = (ToolTip = "Prevents demo memories from appearing before the NPC has encountered the player."))
 	bool bWaitForPlayerEncounterBeforeValidation;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Emotion|Performance")
@@ -456,6 +496,26 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "NPC Autonomy|Validation")
 	void ActivateMultiStepPlanValidationScenario();
 
+	UFUNCTION(BlueprintCallable, Category = "NPC Autonomy|Seat|Validation")
+	bool ForceSeatActivityForValidation(const FString& FurnitureID = TEXT("sofa01"));
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Autonomy|Seat|Validation")
+	bool ForceSitOppositePlayerForValidation();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Autonomy|Seat")
+	bool RequestSitOppositePlayer();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Autonomy|Seat|Validation")
+	bool ForceSeatInvitationForValidation();
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Autonomy|Seat")
+	bool ResolveSeatInvitation(bool bAccepted);
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Autonomy|Seat")
+	bool IsSeatInvitationPending() const;
+
+	void NotifyNPCEnteredSeat(const FString& SeatID);
+
 	UFUNCTION(BlueprintCallable, Category = "NPC Autonomy")
 	void InterruptAutonomy(const FString& Reason = TEXT("external_interrupt"));
 
@@ -532,6 +592,8 @@ private:
 	FTimerHandle BlinkFinishTimerHandle;
 	FTimerHandle EmbodiedResponseResumeTimerHandle;
 	FTimerHandle InteractiveFacingFallbackTimerHandle;
+	FTimerHandle SeatInvitationTimeoutTimerHandle;
+	FTimerHandle SeatedConversationOpeningTimerHandle;
 	bool bDecisionPending;
 	bool bAppraisalPending;
 	bool bActivityRunning;
@@ -549,7 +611,12 @@ private:
 	bool bInteractiveFacingPlayer;
 	bool bStartlePreparedForCurrentInteraction;
 	bool bPendingPlayerSpeechStartle;
+	bool bSeatInvitationApproachInProgress;
+	bool bSeatInvitationPending;
+	bool bSeatInvitationAcceptedForStart;
+	int32 SeatedConversationOpeningAttempts;
 	FString PendingInteractiveActivityID;
+	FString PendingSeatInvitationSeatID;
 	bool bBlinkFollowUpPending;
 	int32 PendingDecisionRequestId;
 	int32 PendingAppraisalRequestId;
@@ -583,6 +650,7 @@ private:
 	TArray<FString> RecentActions;
 	TArray<double> RecentActionCompletedWorldTimes;
 	TMap<FString, double> ActivityCooldownUntil;
+	FString ForcedSeatID;
 	TArray<FName> AppliedExpressionMorphs;
 	TMap<FName, float> CurrentExpressionMorphWeights;
 	TMap<FName, float> ExpressionBlendStartWeights;
@@ -605,6 +673,21 @@ private:
 	bool IsServiceStateAutonomyAllowed(ECafeServiceState State) const;
 	TArray<FString> BuildAvailableActivityIDs() const;
 	bool IsActivityAvailable(const FNPCAutonomyActivityDefinition& Activity) const;
+	FString FindAvailableRestSeatID() const;
+	FString FindAvailableSeatOppositePlayerID() const;
+	bool StartSeatActivitySequence(const FNPCAutonomyActivityDefinition& Activity, const FString& SeatID);
+	bool BeginSeatInvitation(
+		const FNPCAutonomyActivityDefinition& Activity,
+		const FString& SeatID,
+		const FString& Reason);
+	void PresentSeatInvitation();
+	void HandleSeatInvitationTimeout();
+	void BeginSeatedConversationOpening();
+	void CancelSeatInvitation(
+		const FString& Reason,
+		bool bClearPlan,
+		bool bReturnToCounter);
+	void ReturnToCounterAfterSeatInvitation();
 	bool HasSceneTargetTag(const FString& TargetTag) const;
 	bool IsMaidNearSceneTargetTag(const FString& TargetTag, float AcceptanceRadius = 180.0f) const;
 	FString BuildDecisionContextJson(const TArray<FString>& AvailableActivityIDs) const;

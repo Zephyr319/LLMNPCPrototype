@@ -13,6 +13,7 @@
 #include "NPCAutonomyComponent.h"
 #include "NPCEmotionComponent.h"
 #include "NPCMemoryComponent.h"
+#include "NPCPersonaProfile.h"
 #include "NPCResearchLoggerComponent.h"
 #include "PlayerSeatComponent.h"
 #include "Serialization/JsonSerializer.h"
@@ -38,7 +39,7 @@ ACafeServiceManagerActor::ACafeServiceManagerActor()
 	DepartureDistanceThreshold = 260.0f;
 	DepartureConfirmationSeconds = 3.0f;
 	bRequireOrderServedBeforeDeparture = true;
-	MealCompletionQuestion = FText::FromString(TEXT("先生、お食事クエストは完了しましたか？ 完了でしたら、アリスがテーブルを片付けます。"));
+	MealCompletionQuestion = FText::FromString(TEXT("お客様、お食事はお済みでしょうか。お済みでしたら、テーブルを片付けてもよろしいですか？"));
 	MealCompletionApproachDistance = 180.0f;
 	MealCompletionApproachDelaySeconds = 6.0f;
 	bAwaitingMealCompletionConfirmation = false;
@@ -207,7 +208,7 @@ void ACafeServiceManagerActor::SubmitReceptionResponse(int32 PartySize, bool bWa
 			0.15f,
 			0.3f,
 			false);
-		RequestMaidSpeech(FText::FromString(TEXT("了解しました、先生。必要になったらアリスを呼んでください。")));
+		RequestMaidSpeech(FText::FromString(TEXT("承知しました。ご用がありましたら、いつでもお声がけください。")));
 		SetState(ECafeServiceState::Idle);
 		bServiceStarted = false;
 		return;
@@ -224,13 +225,13 @@ void ACafeServiceManagerActor::SubmitReceptionResponse(int32 PartySize, bool bWa
 	if (!BestTable)
 	{
 		PrintDebugMessage(TEXT("No available table"), FColor::Red);
-		RequestMaidSpeech(FText::FromString(TEXT("申し訳ありません、先生。現在ご案内できる席がありません。")));
+		RequestMaidSpeech(FText::FromString(TEXT("申し訳ございません。現在ご案内できるお席がありません。")));
 		SetState(ECafeServiceState::WaitingForReceptionResponse);
 		return;
 	}
 
 	TargetTableID = BestTable->GetTableID();
-	RequestMaidSpeech(FText::FromString(TEXT("了解しました、先生。アリスが席まで案内します！")));
+	RequestMaidSpeech(FText::FromString(TEXT("承知しました。お席までご案内します。")));
 	SetState(ECafeServiceState::GuidingToSeat);
 
 	if (!MaidMoveComponent || !MaidMoveComponent->StartGuideToTable(TargetTableID))
@@ -368,7 +369,7 @@ void ACafeServiceManagerActor::HandleMaidMoveCompleted(FName MoveReason, FString
 		if (bSuccess)
 		{
 			SetState(ECafeServiceState::ReceptionGreeting);
-			RequestReceptionGreetingAfterDelay(FText::FromString(TEXT("いらっしゃいませ、先生。お食事クエストを開始しますか？")));
+			RequestReceptionGreetingAfterDelay(FText::FromString(TEXT("いらっしゃいませ。お食事でしたら、お席へご案内いたします。")));
 		}
 		else
 		{
@@ -384,7 +385,7 @@ void ACafeServiceManagerActor::HandleMaidMoveCompleted(FName MoveReason, FString
 		if (bSuccess)
 		{
 			SetState(ECafeServiceState::WaitingForPlayerSeated);
-			RequestMaidSpeech(FText::FromString(TEXT("目的地に到着しました、先生。こちらの席へどうぞ。")));
+			RequestMaidSpeech(FText::FromString(TEXT("こちらのお席へどうぞ。ごゆっくりお過ごしください。")));
 		}
 		else
 		{
@@ -421,7 +422,7 @@ void ACafeServiceManagerActor::HandlePlayerSeated(FString SeatID, FString TableI
 			0.4f,
 			false);
 		SetState(ECafeServiceState::WaitingForOrder);
-		RequestMaidSpeech(FText::FromString(TEXT("注文が決まったら、アリスを呼んでください。")));
+		RequestMaidSpeech(FText::FromString(TEXT("ご注文が決まりましたら、いつでもお声がけください。")));
 	}
 }
 
@@ -483,7 +484,7 @@ void ACafeServiceManagerActor::HandleOrderServed(FString TableID, FString Item)
 	SocialAwaySinceWorldTime = -1.0;
 	MemoryComponent->RecordMemoryEvent(
 		FName(TEXT("order_served")),
-		FString::Printf(TEXT("Alice delivered %s to table %s."), *ResolvedItem, *TableID),
+		FString::Printf(TEXT("%s delivered %s to table %s."), *LLMNPCPersona::NameEnglish(), *ResolvedItem, *TableID),
 		FName(TEXT("dining_area")),
 		{ FName(TEXT("player")), FName(TEXT("customer")), FName(TEXT("order")), FName(TEXT("service")) },
 		0.25f,
@@ -624,6 +625,48 @@ void ACafeServiceManagerActor::UpdatePostServiceSocialOpportunity(float DeltaSec
 		LookDot);
 }
 
+bool ACafeServiceManagerActor::TriggerSeatedConversationOpportunity()
+{
+	if (!CurrentPlayerActor
+		|| !MaidNPCActor
+		|| !PlayerSeatComponent
+		|| !PlayerSeatComponent->bIsSeated)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[NPCSocial] seated opening unavailable because the player is not seated."));
+		return false;
+	}
+
+	ULLMClient* InteractiveClient = ULLMClient::GetMostRecentInteractiveClient();
+	if (!InteractiveClient || !InteractiveClient->IsReadyForSocialOpportunity(0.0f))
+	{
+		return false;
+	}
+
+	const float DistanceToMaid = FVector::Dist2D(
+		CurrentPlayerActor->GetActorLocation(),
+		MaidNPCActor->GetActorLocation());
+	float LookDot = -1.0f;
+	IsPlayerLookingAtMaid(LookDot);
+	const FString ContextJson = BuildSocialOpportunityContext(DistanceToMaid, LookDot, true);
+	const int32 RequestId = InteractiveClient->SendSocialOpportunityMessage(ContextJson);
+	if (RequestId <= 0)
+	{
+		return false;
+	}
+
+	if (const UWorld* World = GetWorld())
+	{
+		LastSocialOpportunityWorldTime = World->GetTimeSeconds();
+	}
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSocial] seated conversation opening triggered. RequestId=%d Table=%s"),
+		RequestId,
+		*PlayerSeatComponent->CurrentTableID);
+	return true;
+}
+
 bool ACafeServiceManagerActor::IsPlayerLookingAtMaid(float& OutLookDot) const
 {
 	OutLookDot = -1.0f;
@@ -648,16 +691,29 @@ bool ACafeServiceManagerActor::IsPlayerLookingAtMaid(float& OutLookDot) const
 	return true;
 }
 
-FString ACafeServiceManagerActor::BuildSocialOpportunityContext(float DistanceToMaid, float LookDot)
+FString ACafeServiceManagerActor::BuildSocialOpportunityContext(
+	float DistanceToMaid,
+	float LookDot,
+	bool bSeatedConversation)
 {
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
-	Root->SetStringField(TEXT("event"), TEXT("post_service_social_opportunity"));
-	Root->SetStringField(TEXT("situation"), TEXT("The customer left the seat, approached Alice, and kept looking at her without calling her."));
+	Root->SetStringField(
+		TEXT("event"),
+		bSeatedConversation ? TEXT("seated_conversation_opening") : TEXT("post_service_social_opportunity"));
+	Root->SetStringField(
+		TEXT("situation"),
+		bSeatedConversation
+			? TEXT("The customer explicitly invited Sumiha to sit across from them and talk. Sumiha has now sat down and should gently introduce one concrete topic that makes it easy for the customer to respond.")
+			: TEXT("The customer left the seat, approached Sumiha, and kept looking at her without calling her."));
+	Root->SetStringField(
+		TEXT("conversation_mode"),
+		bSeatedConversation ? TEXT("seated_with_player") : TEXT("brief_post_service_contact"));
 	Root->SetStringField(TEXT("service_state"), TEXT("served"));
 	Root->SetStringField(TEXT("last_served_item"), LastServedItem.IsEmpty() ? TEXT("unknown") : LastServedItem);
 	Root->SetBoolField(TEXT("first_opportunity_this_approach"), true);
 	Root->SetBoolField(TEXT("player_is_seated"), PlayerSeatComponent && PlayerSeatComponent->bIsSeated);
 	Root->SetBoolField(TEXT("departure_confirmed"), bDepartureConfirmedForCurrentVisit);
+	Root->SetBoolField(TEXT("customer_explicitly_invited_conversation"), bSeatedConversation);
 	Root->SetNumberField(TEXT("distance_to_maid_cm"), DistanceToMaid);
 	Root->SetNumberField(TEXT("camera_look_dot"), LookDot);
 	Root->SetNumberField(TEXT("look_hold_seconds"), SocialLookHeldSeconds);

@@ -15,7 +15,9 @@
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "FurnitureMarkerActor.h"
 #include "GameFramework/Character.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "HAL/PlatformTime.h"
 #include "Kismet/GameplayStatics.h"
 #include "LLMClient.h"
@@ -55,10 +57,10 @@ UNPCActionQueueComponent::UNPCActionQueueComponent()
 	DuplicateGuideLineSuppressSeconds = 1.0f;
 	GuideArrivedSeatGestureName = FName(TEXT("guide_seat_player"));
 	PostSeatingMenuHelpEnableDelay = 1.0f;
-	PostSeatingMenuGuidanceLine = TEXT("先生、メニューはテーブルの上です。注文が決まったら、いつでもアリスを呼んでください。");
+	PostSeatingMenuGuidanceLine = TEXT("メニューはテーブルの上にございます。ご注文が決まりましたら、いつでもお声がけください。");
 	OrderPreparationSeconds = 3.0f;
-	OrderConfirmLine = TEXT("注文を受注しました。少々お待ちください、先生。");
-	OrderServedLine = TEXT("お待たせしました、先生。料理をお届けしました！");
+	OrderConfirmLine = TEXT("ご注文を承りました。少々お待ちください。");
+	OrderServedLine = TEXT("お待たせいたしました。ご注文のお料理です。");
 	bReturnToCounterAfterServing = true;
 	PostServePauseSeconds = 0.8f;
 	BillPresentationPauseSeconds = 0.8f;
@@ -74,9 +76,9 @@ UNPCActionQueueComponent::UNPCActionQueueComponent()
 	GuideSeatGestureFallbackTimeout = 2.0f;
 	DefaultBlockingGestureFallbackTimeout = 3.0f;
 	DefaultOrderPrice = 800;
-	BillLineFormat = TEXT("今回のクエスト報酬は{Price}円です、先生。");
-	ServiceClosingLine = TEXT("次のクエストがあれば、いつでもアリスを呼んでください。");
-	BillFarewellLine = TEXT("何かあれば、アリスを呼んでくださいね、先生。");
+	BillLineFormat = TEXT("お会計は{Price}円です。");
+	ServiceClosingLine = TEXT("ほかにご用がございましたら、いつでもお声がけください。");
+	BillFarewellLine = TEXT("ご来店ありがとうございました。またお待ちしております。");
 	bWaitingForMove = false;
 	bCurrentQueueHadFailure = false;
 	bQueuedAnimationInProgress = false;
@@ -107,6 +109,8 @@ UNPCActionQueueComponent::UNPCActionQueueComponent()
 	ActiveQueuedAnimationMontage = nullptr;
 	ActiveQueuedAnimationInstance = nullptr;
 	ActiveHeldPropComponent = nullptr;
+	ReservedSeat = nullptr;
+	bNPCIsSeated = false;
 	BlockingGestureMontageBeforeRequest = nullptr;
 	BlockingGestureMontagePositionBeforeRequest = 0.0f;
 	PendingGestureAnimationTimingProbe = NAME_None;
@@ -136,6 +140,7 @@ void UNPCActionQueueComponent::ClearActionQueue()
 {
 	StopQueuedAnimation();
 	RemoveActiveHeldProp();
+	ReleaseReservedSeat(true);
 	ActionQueue.Reset();
 	CurrentAction = FNPCQueuedAction();
 	bIsRunningQueue = false;
@@ -157,6 +162,7 @@ void UNPCActionQueueComponent::StopActionQueue()
 {
 	StopQueuedAnimation();
 	RemoveActiveHeldProp();
+	ReleaseReservedSeat(true);
 	ActionQueue.Reset();
 	CurrentAction = FNPCQueuedAction();
 	bIsRunningQueue = false;
@@ -258,6 +264,14 @@ void UNPCActionQueueComponent::EnqueueMoveToFurnitureID(const FString& Furniture
 	EnqueueAction(Action);
 }
 
+void UNPCActionQueueComponent::EnqueueMoveToSeatID(const FString& FurnitureID)
+{
+	FNPCQueuedAction Action;
+	Action.ActionType = ENPCQueuedActionType::MoveToSeatID;
+	Action.Target = FurnitureID;
+	EnqueueAction(Action);
+}
+
 void UNPCActionQueueComponent::EnqueueMoveNearPlayer(float StopDistance)
 {
 	FNPCQueuedAction Action;
@@ -281,7 +295,39 @@ void UNPCActionQueueComponent::EnqueueAnimation(UAnimSequenceBase* Animation, FN
 	Action.Animation = Animation;
 	Action.AnimationSlotName = SlotName.IsNone() ? FName(TEXT("DefaultSlot")) : SlotName;
 	Action.AnimationPlayRate = FMath::Max(FMath::Abs(PlayRate), KINDA_SMALL_NUMBER);
+	Action.AnimationLoopCount = 1;
 	Action.WaitSeconds = FMath::Max(FallbackSeconds, 0.1f);
+	EnqueueAction(Action);
+}
+
+void UNPCActionQueueComponent::EnqueueLoopedAnimation(
+	UAnimSequenceBase* Animation,
+	int32 LoopCount,
+	FName SlotName,
+	float PlayRate,
+	float FallbackSeconds)
+{
+	FNPCQueuedAction Action;
+	Action.ActionType = ENPCQueuedActionType::Animation;
+	Action.Animation = Animation;
+	Action.AnimationSlotName = SlotName.IsNone() ? FName(TEXT("DefaultSlot")) : SlotName;
+	Action.AnimationPlayRate = FMath::Max(FMath::Abs(PlayRate), KINDA_SMALL_NUMBER);
+	Action.AnimationLoopCount = FMath::Max(LoopCount, 1);
+	Action.WaitSeconds = FMath::Max(FallbackSeconds, 0.1f);
+	EnqueueAction(Action);
+}
+
+void UNPCActionQueueComponent::EnqueueEnterSeat()
+{
+	FNPCQueuedAction Action;
+	Action.ActionType = ENPCQueuedActionType::EnterSeat;
+	EnqueueAction(Action);
+}
+
+void UNPCActionQueueComponent::EnqueueExitSeat()
+{
+	FNPCQueuedAction Action;
+	Action.ActionType = ENPCQueuedActionType::ExitSeat;
 	EnqueueAction(Action);
 }
 
@@ -362,6 +408,7 @@ void UNPCActionQueueComponent::StartActionQueue()
 			|| Action.ActionType == ENPCQueuedActionType::MoveToSceneTag
 			|| Action.ActionType == ENPCQueuedActionType::MoveToFurnitureTag
 			|| Action.ActionType == ENPCQueuedActionType::MoveToFurnitureID
+			|| Action.ActionType == ENPCQueuedActionType::MoveToSeatID
 			|| Action.ActionType == ENPCQueuedActionType::MoveNearPlayer;
 	});
 	if (bQueueContainsMove)
@@ -600,6 +647,45 @@ void UNPCActionQueueComponent::HandleStrategyAction(const FString& ActionType, c
 
 	UE_LOG(LogTemp, Warning, TEXT("HandleStrategyAction: ActionType=%s, Item=%s, Quantity=%d"), *NormalizedAction, *NormalizedItem, Quantity);
 	LogActionQueueMoveRequest(TEXT("HandleStrategyAction"), FString::Printf(TEXT("Action=%s Item=%s"), *NormalizedAction, *NormalizedItem));
+
+	UNPCAutonomyComponent* AutonomyComponent = UNPCAutonomyComponent::GetPrimaryAutonomyComponent();
+	if (NormalizedAction.Equals(TEXT("sit_opposite_player"), ESearchCase::IgnoreCase))
+	{
+		if (!AutonomyComponent || !AutonomyComponent->RequestSitOppositePlayer())
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[NPCSeat] explicit sit-opposite action could not be started."));
+		}
+		return;
+	}
+	if (NormalizedAction.Equals(TEXT("accept_seat_invitation"), ESearchCase::IgnoreCase))
+	{
+		if (!AutonomyComponent || !AutonomyComponent->ResolveSeatInvitation(true))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[NPCSeatInvitation] accept action could not be resolved."));
+		}
+		return;
+	}
+	if (NormalizedAction.Equals(TEXT("decline_seat_invitation"), ESearchCase::IgnoreCase))
+	{
+		if (!AutonomyComponent || !AutonomyComponent->ResolveSeatInvitation(false))
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[NPCSeatInvitation] decline action could not be resolved."));
+		}
+		return;
+	}
+	if (AutonomyComponent
+		&& AutonomyComponent->IsSeatInvitationPending()
+		&& !NormalizedAction.Equals(TEXT("none"), ESearchCase::IgnoreCase)
+		&& !NormalizedAction.Equals(TEXT("greet"), ESearchCase::IgnoreCase)
+		&& !NormalizedAction.Equals(TEXT("speak"), ESearchCase::IgnoreCase))
+	{
+		AutonomyComponent->ResolveSeatInvitation(false);
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[NPCSeatInvitation] cancelled because the player requested another action: %s"),
+			*NormalizedAction);
+	}
 
 	const bool bIsCleanTableAction =
 		NormalizedAction.Equals(TEXT("clean_table"), ESearchCase::IgnoreCase)
@@ -1480,7 +1566,18 @@ bool UNPCActionQueueComponent::IsBusyForAutonomy() const
 		|| bActionQueuePausedForFarewellBow
 		|| bBowMovementLockActive
 		|| bBlockingGestureInProgress
-		|| bQueuedAnimationInProgress;
+		|| bQueuedAnimationInProgress
+		|| bNPCIsSeated;
+}
+
+bool UNPCActionQueueComponent::IsNPCSeated() const
+{
+	return bNPCIsSeated && ReservedSeat != nullptr;
+}
+
+FString UNPCActionQueueComponent::GetNPCSeatID() const
+{
+	return ReservedSeat ? ReservedSeat->FurnitureID : TEXT("");
 }
 
 FString UNPCActionQueueComponent::GetCurrentBlockingGestureName() const
@@ -1743,6 +1840,7 @@ void UNPCActionQueueComponent::ExecuteNextQueuedAction()
 	case ENPCQueuedActionType::MoveToSceneTag:
 	case ENPCQueuedActionType::MoveToFurnitureTag:
 	case ENPCQueuedActionType::MoveToFurnitureID:
+	case ENPCQueuedActionType::MoveToSeatID:
 	case ENPCQueuedActionType::MoveNearPlayer:
 		ExecuteMoveAction();
 		break;
@@ -1767,6 +1865,11 @@ void UNPCActionQueueComponent::ExecuteNextQueuedAction()
 
 	case ENPCQueuedActionType::FacePlayer:
 		ExecuteFacePlayerAction();
+		break;
+
+	case ENPCQueuedActionType::EnterSeat:
+	case ENPCQueuedActionType::ExitSeat:
+		ExecuteSeatAction();
 		break;
 
 	case ENPCQueuedActionType::Stop:
@@ -1828,6 +1931,12 @@ void UNPCActionQueueComponent::ExecuteMoveAction()
 	bool bMoveStarted = false;
 	bWaitingForMove = true;
 	MoveComponent->CancelFollowingForExplicitCommand();
+	if (CurrentAction.ActionType == ENPCQueuedActionType::MoveToSeatID && !ReserveSeat(Target))
+	{
+		bWaitingForMove = false;
+		CompleteCurrentAction(false, FString::Printf(TEXT("Seat is unavailable: %s"), *Target));
+		return;
+	}
 
 	switch (CurrentAction.ActionType)
 	{
@@ -1847,6 +1956,10 @@ void UNPCActionQueueComponent::ExecuteMoveAction()
 		bMoveStarted = MoveComponent->MoveToFurnitureByID(Target);
 		break;
 
+	case ENPCQueuedActionType::MoveToSeatID:
+		bMoveStarted = MoveComponent->MoveToSeatByID(Target);
+		break;
+
 	case ENPCQueuedActionType::MoveNearPlayer:
 		PrintDebugMessage(TEXT("Move near player"), FColor::Green);
 		bMoveStarted = MoveComponent->MoveNearPlayer(CurrentAction.StopDistance);
@@ -1861,6 +1974,10 @@ void UNPCActionQueueComponent::ExecuteMoveAction()
 	if (!bMoveStarted && bWaitingForMove)
 	{
 		bWaitingForMove = false;
+		if (CurrentAction.ActionType == ENPCQueuedActionType::MoveToSeatID)
+		{
+			ReleaseReservedSeat(false);
+		}
 		CompleteCurrentAction(false, FString::Printf(TEXT("Move action failed to start: %s"), *Target));
 	}
 }
@@ -1951,13 +2068,14 @@ void UNPCActionQueueComponent::ExecuteAnimationAction()
 		? FName(TEXT("DefaultSlot"))
 		: CurrentAction.AnimationSlotName;
 	const float PlayRate = FMath::Max(FMath::Abs(CurrentAction.AnimationPlayRate), KINDA_SMALL_NUMBER);
+	const int32 LoopCount = FMath::Max(CurrentAction.AnimationLoopCount, 1);
 	ActiveQueuedAnimationMontage = AnimInstance->PlaySlotAnimationAsDynamicMontage(
 		CurrentAction.Animation,
 		SlotName,
 		0.2f,
 		0.2f,
 		PlayRate,
-		1,
+		LoopCount,
 		-1.0f,
 		0.0f);
 
@@ -1974,9 +2092,10 @@ void UNPCActionQueueComponent::ExecuteAnimationAction()
 	ActiveQueuedAnimationInstance = AnimInstance;
 	const float MontagePosition = AnimInstance->Montage_GetPosition(ActiveQueuedAnimationMontage);
 	const float MontageRate = FMath::Max(FMath::Abs(AnimInstance->Montage_GetPlayRate(ActiveQueuedAnimationMontage)), KINDA_SMALL_NUMBER);
-	const float MontageRemainingSeconds = FMath::Max(
-		(ActiveQueuedAnimationMontage->GetPlayLength() - MontagePosition) / MontageRate,
-		0.0f);
+	const float SingleLoopSeconds = FMath::Max(CurrentAction.Animation->GetPlayLength() / MontageRate, 0.0f);
+	const float MontageRemainingSeconds = LoopCount > 1
+		? SingleLoopSeconds * LoopCount
+		: FMath::Max((ActiveQueuedAnimationMontage->GetPlayLength() - MontagePosition) / MontageRate, 0.0f);
 	const float WaitSeconds = MontageRemainingSeconds > KINDA_SMALL_NUMBER
 		? MontageRemainingSeconds + 0.1f
 		: CurrentAction.WaitSeconds;
@@ -2125,6 +2244,65 @@ void UNPCActionQueueComponent::ExecuteFacePlayerAction()
 	CompleteCurrentAction(true, TEXT(""));
 }
 
+void UNPCActionQueueComponent::ExecuteSeatAction()
+{
+	AActor* OwnerActor = GetOwner();
+	if (!OwnerActor)
+	{
+		CompleteCurrentAction(false, TEXT("NPC owner not found for seat action"));
+		return;
+	}
+
+	if (CurrentAction.ActionType == ENPCQueuedActionType::ExitSeat)
+	{
+		ReleaseReservedSeat(true);
+		CompleteCurrentAction(true, TEXT(""));
+		return;
+	}
+
+	if (CurrentAction.ActionType != ENPCQueuedActionType::EnterSeat
+		|| !ReservedSeat
+		|| !ReservedSeat->IsReservedBy(OwnerActor))
+	{
+		CompleteCurrentAction(false, TEXT("Reserved seat not found for NPC"));
+		return;
+	}
+
+	const FTransform SitTransform = ReservedSeat->GetNPCSitTransform();
+	if (ACharacter* CharacterOwner = Cast<ACharacter>(OwnerActor))
+	{
+		if (UCharacterMovementComponent* MovementComponent = CharacterOwner->GetCharacterMovement())
+		{
+			MovementComponent->StopMovementImmediately();
+			MovementComponent->DisableMovement();
+		}
+	}
+
+	if (FaceTargetComponent)
+	{
+		FaceTargetComponent->StopFacingActor();
+	}
+	OwnerActor->SetActorLocationAndRotation(
+		SitTransform.GetLocation(),
+		SitTransform.Rotator(),
+		false,
+		nullptr,
+		ETeleportType::TeleportPhysics);
+	bNPCIsSeated = true;
+	if (UNPCAutonomyComponent* Autonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent())
+	{
+		Autonomy->NotifyNPCEnteredSeat(ReservedSeat->FurnitureID);
+	}
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSeat] entered. Seat=%s Location=%s Rotation=%s"),
+		*ReservedSeat->FurnitureID,
+		*SitTransform.GetLocation().ToCompactString(),
+		*SitTransform.Rotator().ToCompactString());
+	CompleteCurrentAction(true, TEXT(""));
+}
+
 void UNPCActionQueueComponent::CompleteCurrentAction(bool bSuccess, const FString& FailureReason)
 {
 	const bool bFailedPendingOrderReturn =
@@ -2149,6 +2327,7 @@ void UNPCActionQueueComponent::CompleteCurrentAction(bool bSuccess, const FStrin
 	if (!bSuccess && bStopQueueOnActionFailure)
 	{
 		RemoveActiveHeldProp();
+		ReleaseReservedSeat(true);
 		ActionQueue.Reset();
 		CurrentAction = FNPCQueuedAction();
 		bWaitingForMove = false;
@@ -2172,7 +2351,83 @@ bool UNPCActionQueueComponent::IsCurrentActionMove() const
 		|| CurrentAction.ActionType == ENPCQueuedActionType::MoveToSceneTag
 		|| CurrentAction.ActionType == ENPCQueuedActionType::MoveToFurnitureTag
 		|| CurrentAction.ActionType == ENPCQueuedActionType::MoveToFurnitureID
+		|| CurrentAction.ActionType == ENPCQueuedActionType::MoveToSeatID
 		|| CurrentAction.ActionType == ENPCQueuedActionType::MoveNearPlayer;
+}
+
+AFurnitureMarkerActor* UNPCActionQueueComponent::FindFurnitureByID(const FString& FurnitureID) const
+{
+	UWorld* World = GetWorld();
+	const FString TrimmedID = FurnitureID.TrimStartAndEnd();
+	if (!World || TrimmedID.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	for (TActorIterator<AFurnitureMarkerActor> It(World); It; ++It)
+	{
+		AFurnitureMarkerActor* Furniture = *It;
+		if (Furniture && Furniture->FurnitureID.Equals(TrimmedID, ESearchCase::IgnoreCase))
+		{
+			return Furniture;
+		}
+	}
+	return nullptr;
+}
+
+bool UNPCActionQueueComponent::ReserveSeat(const FString& FurnitureID)
+{
+	AActor* OwnerActor = GetOwner();
+	AFurnitureMarkerActor* Seat = FindFurnitureByID(FurnitureID);
+	if (!OwnerActor || !Seat || !Seat->bAllowNPCSit)
+	{
+		return false;
+	}
+
+	if (ReservedSeat && ReservedSeat != Seat)
+	{
+		ReleaseReservedSeat(false);
+	}
+	if (!Seat->TryReserveSeat(OwnerActor))
+	{
+		return false;
+	}
+
+	ReservedSeat = Seat;
+	return true;
+}
+
+void UNPCActionQueueComponent::ReleaseReservedSeat(bool bMoveToExitPoint)
+{
+	AActor* OwnerActor = GetOwner();
+	AFurnitureMarkerActor* Seat = ReservedSeat;
+	if (OwnerActor && Seat && bMoveToExitPoint)
+	{
+		const FTransform ExitTransform = Seat->GetNPCStandTransform();
+		OwnerActor->SetActorLocationAndRotation(
+			ExitTransform.GetLocation(),
+			ExitTransform.Rotator(),
+			false,
+			nullptr,
+			ETeleportType::TeleportPhysics);
+	}
+
+	if (ACharacter* CharacterOwner = Cast<ACharacter>(OwnerActor))
+	{
+		if (UCharacterMovementComponent* MovementComponent = CharacterOwner->GetCharacterMovement())
+		{
+			MovementComponent->SetMovementMode(MOVE_Walking);
+			MovementComponent->bForceNextFloorCheck = true;
+		}
+	}
+
+	if (Seat)
+	{
+		Seat->ReleaseSeat(OwnerActor);
+		UE_LOG(LogTemp, Log, TEXT("[NPCSeat] exited. Seat=%s"), *Seat->FurnitureID);
+	}
+	ReservedSeat = nullptr;
+	bNPCIsSeated = false;
 }
 
 FString UNPCActionQueueComponent::ResolveCurrentServiceTableID() const
@@ -3342,6 +3597,10 @@ void UNPCActionQueueComponent::HandleNPCMoveCompleted(FName MoveReason, FString 
 		&& CompletedTargetID.Equals(OrderReturnTableID, ESearchCase::IgnoreCase);
 
 	bWaitingForMove = false;
+	if (!bSuccess && CurrentAction.ActionType == ENPCQueuedActionType::MoveToSeatID)
+	{
+		ReleaseReservedSeat(false);
+	}
 	const FString FailureReason = bSuccess
 		? TEXT("")
 		: FString::Printf(TEXT("NPC queued move failed: %s %s"), *MoveReason.ToString(), *TargetID);
@@ -3460,6 +3719,7 @@ USkeletalMeshComponent* UNPCActionQueueComponent::ResolveHeldPropAttachmentMesh(
 		CandidateSocketNames.AddUnique(FName(TEXT("RightHand")));
 		CandidateSocketNames.AddUnique(FName(TEXT("hand_r")));
 		CandidateSocketNames.AddUnique(FName(TEXT("mixamorig:RightHand")));
+		CandidateSocketNames.AddUnique(FName(TEXT("J_Bip_R_Hand")));
 	}
 	else if (RequestedSocket.Equals(TEXT("LeftHand"), ESearchCase::IgnoreCase)
 		|| RequestedSocket.Equals(TEXT("hand_l"), ESearchCase::IgnoreCase))
@@ -3468,6 +3728,7 @@ USkeletalMeshComponent* UNPCActionQueueComponent::ResolveHeldPropAttachmentMesh(
 		CandidateSocketNames.AddUnique(FName(TEXT("LeftHand")));
 		CandidateSocketNames.AddUnique(FName(TEXT("hand_l")));
 		CandidateSocketNames.AddUnique(FName(TEXT("mixamorig:LeftHand")));
+		CandidateSocketNames.AddUnique(FName(TEXT("J_Bip_L_Hand")));
 	}
 
 	TArray<USkeletalMeshComponent*> MeshComponents;
