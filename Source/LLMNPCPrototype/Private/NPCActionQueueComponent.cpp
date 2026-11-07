@@ -30,16 +30,6 @@
 #include "Serialization/JsonSerializer.h"
 #include "TableMarkerActor.h"
 
-bool UNPCActionQueueComponent::bLastKnownSeatedForService = false;
-bool UNPCActionQueueComponent::bLastKnownPlayerInTableArea = false;
-bool UNPCActionQueueComponent::bLastKnownGuidePlayerInProgress = false;
-bool UNPCActionQueueComponent::bLastKnownSeatingGuidanceCompleted = false;
-FString UNPCActionQueueComponent::LastKnownCurrentServiceTableID = TEXT("");
-FString UNPCActionQueueComponent::LastKnownGuideTargetID = TEXT("");
-bool UNPCActionQueueComponent::bLastKnownMealCompletionConfirmationPending = false;
-FString UNPCActionQueueComponent::LastKnownMealCompletionConfirmationTableID = TEXT("");
-bool UNPCActionQueueComponent::bLastKnownDiningServiceCompleted = false;
-FString UNPCActionQueueComponent::LastKnownCompletedServiceTableID = TEXT("");
 bool UNPCActionQueueComponent::bSuppressNextOrderConfirmSpeechForStrategyReply = false;
 bool UNPCActionQueueComponent::bSuppressNextGuideStartedSpeechForStrategyReply = false;
 
@@ -111,6 +101,10 @@ UNPCActionQueueComponent::UNPCActionQueueComponent()
 	ActiveHeldPropComponent = nullptr;
 	ReservedSeat = nullptr;
 	bNPCIsSeated = false;
+	bHasDeferredStrategyAction = false;
+	DeferredStrategyActionType = TEXT("");
+	DeferredStrategyActionItem = TEXT("");
+	DeferredStrategyActionQuantity = 0;
 	BlockingGestureMontageBeforeRequest = nullptr;
 	BlockingGestureMontagePositionBeforeRequest = 0.0f;
 	PendingGestureAnimationTimingProbe = NAME_None;
@@ -125,11 +119,15 @@ void UNPCActionQueueComponent::BeginPlay()
 
 	CacheOwnerComponents();
 	BindMoveCompletedEvent();
-	UpdateLastKnownServiceState();
+	PublishServiceExecutionState();
 }
 
 void UNPCActionQueueComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(DeferredStrategyActionTimerHandle);
+	}
 	ClearActionQueue();
 	UnbindMoveCompletedEvent();
 
@@ -189,6 +187,115 @@ void UNPCActionQueueComponent::StopActionQueue()
 	}
 
 	PrintDebugMessage(TEXT("NPC action queue stopped"), FColor::Yellow);
+}
+
+bool UNPCActionQueueComponent::StopActionQueuePreservingSeat()
+{
+	if (!bNPCIsSeated || !ReservedSeat)
+	{
+		return false;
+	}
+
+	StopQueuedAnimation();
+	RemoveActiveHeldProp();
+	ActionQueue.Reset();
+	CurrentAction = FNPCQueuedAction();
+	bIsRunningQueue = false;
+	bWaitingForMove = false;
+	bCurrentQueueHadFailure = false;
+	ClearPendingOrderState();
+
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(WaitTimerHandle);
+	}
+	ClearOrderFulfillmentTimers();
+	ClearPostSeatingMenuGuidanceTimers();
+
+	CacheOwnerComponents();
+	if (MoveComponent && MoveComponent->bIsMovingToTable)
+	{
+		MoveComponent->StopMovingToTable();
+	}
+	if (FaceTargetComponent)
+	{
+		FaceTargetComponent->StopFacingActor();
+	}
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSeat] action queue stopped while preserving seat reservation. Seat=%s"),
+		*ReservedSeat->FurnitureID);
+	return true;
+}
+
+void UNPCActionQueueComponent::DeferStrategyActionUntilStanding(
+	const FString& ActionType,
+	const FString& Item,
+	int32 Quantity)
+{
+	bHasDeferredStrategyAction = true;
+	DeferredStrategyActionType = ActionType;
+	DeferredStrategyActionItem = Item;
+	DeferredStrategyActionQuantity = Quantity;
+
+	if (UNPCAutonomyComponent* Autonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent())
+	{
+		Autonomy->RequestEndSeatedConversation(
+			FString::Printf(TEXT("strategy_action:%s"), *ActionType));
+	}
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(DeferredStrategyActionTimerHandle);
+		World->GetTimerManager().SetTimer(
+			DeferredStrategyActionTimerHandle,
+			this,
+			&UNPCActionQueueComponent::TryExecuteDeferredStrategyAction,
+			0.25f,
+			false);
+	}
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSeat] strategy action deferred until the NPC stands. Action=%s Item=%s"),
+		*ActionType,
+		*Item);
+}
+
+void UNPCActionQueueComponent::TryExecuteDeferredStrategyAction()
+{
+	if (!bHasDeferredStrategyAction)
+	{
+		return;
+	}
+
+	const UNPCAutonomyComponent* Autonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent();
+	if ((Autonomy && Autonomy->IsSeatedConversationActive()) || bNPCIsSeated || bIsRunningQueue)
+	{
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().SetTimer(
+				DeferredStrategyActionTimerHandle,
+				this,
+				&UNPCActionQueueComponent::TryExecuteDeferredStrategyAction,
+				0.25f,
+				false);
+		}
+		return;
+	}
+
+	const FString ActionType = DeferredStrategyActionType;
+	const FString Item = DeferredStrategyActionItem;
+	const int32 Quantity = DeferredStrategyActionQuantity;
+	bHasDeferredStrategyAction = false;
+	DeferredStrategyActionType.Reset();
+	DeferredStrategyActionItem.Reset();
+	DeferredStrategyActionQuantity = 0;
+
+	UE_LOG(LogTemp, Log, TEXT("[NPCSeat] executing deferred standing action. Action=%s"), *ActionType);
+	HandleStrategyAction(ActionType, Item, Quantity);
 }
 
 bool UNPCActionQueueComponent::PauseActiveQueuedAnimation()
@@ -558,7 +665,7 @@ void UNPCActionQueueComponent::RunGuidePlayerToTable(const FString& TableID)
 	if (IsGuidePlayerInProgress())
 	{
 		UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Ignored redundant guide request while already guiding."));
-		UpdateLastKnownServiceState();
+		PublishServiceExecutionState();
 		return;
 	}
 
@@ -578,7 +685,7 @@ void UNPCActionQueueComponent::RunGuidePlayerToTable(const FString& TableID)
 	ClearActionQueue();
 	bSeatingGuidanceCompleted = false;
 	bPostSeatingMenuGuidanceDone = false;
-	UpdateLastKnownServiceState();
+	PublishServiceExecutionState();
 
 	CacheOwnerComponents();
 	if (!MoveComponent)
@@ -588,7 +695,7 @@ void UNPCActionQueueComponent::RunGuidePlayerToTable(const FString& TableID)
 	}
 
 	MoveComponent->StartGuideToTable(TrimmedTableID);
-	UpdateLastKnownServiceState();
+	PublishServiceExecutionState();
 }
 
 void UNPCActionQueueComponent::RunGuidePlayerToSceneTag(const FString& TargetTag)
@@ -618,7 +725,7 @@ void UNPCActionQueueComponent::RunGuidePlayerToSceneTag(const FString& TargetTag
 	}
 
 	MoveComponent->StartGuideToSceneTag(TrimmedTargetTag);
-	UpdateLastKnownServiceState();
+	PublishServiceExecutionState();
 }
 
 void UNPCActionQueueComponent::RunStopGuidePlayer()
@@ -634,7 +741,7 @@ void UNPCActionQueueComponent::RunStopGuidePlayer()
 	}
 
 	MoveComponent->StopGuidingPlayer();
-	UpdateLastKnownServiceState();
+	PublishServiceExecutionState();
 }
 
 void UNPCActionQueueComponent::HandleStrategyAction(const FString& ActionType, const FString& Item, int32 Quantity)
@@ -649,6 +756,14 @@ void UNPCActionQueueComponent::HandleStrategyAction(const FString& ActionType, c
 	LogActionQueueMoveRequest(TEXT("HandleStrategyAction"), FString::Printf(TEXT("Action=%s Item=%s"), *NormalizedAction, *NormalizedItem));
 
 	UNPCAutonomyComponent* AutonomyComponent = UNPCAutonomyComponent::GetPrimaryAutonomyComponent();
+	if (NormalizedAction.Equals(TEXT("end_seated_conversation"), ESearchCase::IgnoreCase))
+	{
+		if (!AutonomyComponent || !AutonomyComponent->RequestEndSeatedConversation(TEXT("player_requested_end")))
+		{
+			UE_LOG(LogTemp, Log, TEXT("[NPCSeat] no active seated conversation to end."));
+		}
+		return;
+	}
 	if (NormalizedAction.Equals(TEXT("sit_opposite_player"), ESearchCase::IgnoreCase))
 	{
 		if (!AutonomyComponent || !AutonomyComponent->RequestSitOppositePlayer())
@@ -672,6 +787,22 @@ void UNPCActionQueueComponent::HandleStrategyAction(const FString& ActionType, c
 			UE_LOG(LogTemp, Warning, TEXT("[NPCSeatInvitation] decline action could not be resolved."));
 		}
 		return;
+	}
+	if (AutonomyComponent && AutonomyComponent->IsSeatedConversationActive())
+	{
+		const bool bConversationCompatibleAction = NormalizedAction.IsEmpty()
+			|| NormalizedAction.Equals(TEXT("none"), ESearchCase::IgnoreCase)
+			|| NormalizedAction.Equals(TEXT("greet"), ESearchCase::IgnoreCase)
+			|| NormalizedAction.Equals(TEXT("speak"), ESearchCase::IgnoreCase)
+			|| NormalizedAction.Equals(TEXT("explain"), ESearchCase::IgnoreCase)
+			|| NormalizedAction.Equals(TEXT("recommend"), ESearchCase::IgnoreCase)
+			|| NormalizedAction.Equals(TEXT("continue_dining"), ESearchCase::IgnoreCase)
+			|| NormalizedAction.Equals(TEXT("not_finished_dining"), ESearchCase::IgnoreCase);
+		if (!bConversationCompatibleAction)
+		{
+			DeferStrategyActionUntilStanding(NormalizedAction, NormalizedItem, Quantity);
+			return;
+		}
 	}
 	if (AutonomyComponent
 		&& AutonomyComponent->IsSeatInvitationPending()
@@ -763,7 +894,7 @@ void UNPCActionQueueComponent::HandleStrategyAction(const FString& ActionType, c
 		if (NormalizedAction.Equals(TEXT("guide_player_to_table"), ESearchCase::IgnoreCase))
 		{
 			UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Ignored redundant guide request while already guiding."));
-			UpdateLastKnownServiceState();
+			PublishServiceExecutionState();
 			return;
 		}
 
@@ -771,7 +902,7 @@ void UNPCActionQueueComponent::HandleStrategyAction(const FString& ActionType, c
 		{
 			PendingPreSeatingOrderItem = NormalizedItem;
 			UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Order requested while guiding. Deferring until seated. Item=%s"), *NormalizedItem);
-			UpdateLastKnownServiceState();
+			PublishServiceExecutionState();
 			return;
 		}
 
@@ -781,7 +912,7 @@ void UNPCActionQueueComponent::HandleStrategyAction(const FString& ActionType, c
 			|| NormalizedAction.Equals(TEXT("greet"), ESearchCase::IgnoreCase))
 		{
 			UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Speech/social action allowed while guiding. Action=%s Item=%s"), *NormalizedAction, *NormalizedItem);
-			UpdateLastKnownServiceState();
+			PublishServiceExecutionState();
 			return;
 		}
 
@@ -794,7 +925,7 @@ void UNPCActionQueueComponent::HandleStrategyAction(const FString& ActionType, c
 			|| NormalizedAction.Equals(TEXT("guide_to_table"), ESearchCase::IgnoreCase))
 		{
 			UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Movement action ignored while guiding. Keeping current guide. Action=%s Item=%s"), *NormalizedAction, *NormalizedItem);
-			UpdateLastKnownServiceState();
+			PublishServiceExecutionState();
 			return;
 		}
 	}
@@ -807,7 +938,7 @@ void UNPCActionQueueComponent::HandleStrategyAction(const FString& ActionType, c
 			TEXT("[ActionQueue] Reception menu inquiry/recommendation allowed without guiding. Action=%s Item=%s"),
 			*NormalizedAction,
 			*NormalizedItem);
-		UpdateLastKnownServiceState();
+		PublishServiceExecutionState();
 		return;
 	}
 
@@ -1306,7 +1437,7 @@ void UNPCActionQueueComponent::SetCurrentServiceTableID(const FString& TableID)
 	{
 		bSeatingGuidanceCompleted = true;
 	}
-	UpdateLastKnownServiceState();
+	PublishServiceExecutionState();
 }
 
 void UNPCActionQueueComponent::PrepareForNewReception()
@@ -1321,9 +1452,7 @@ void UNPCActionQueueComponent::PrepareForNewReception()
 	bSeatingGuidanceCompleted = false;
 	bPostSeatingMenuGuidanceDone = false;
 	CurrentServiceTableID = TEXT("");
-	SetMealCompletionConfirmationPending(false, TEXT(""));
-	SetDiningServiceCompleted(false, TEXT(""));
-	UpdateLastKnownServiceState();
+	PublishServiceExecutionState();
 
 	if (bHadStaleTableState)
 	{
@@ -1369,7 +1498,7 @@ void UNPCActionQueueComponent::SetPlayerInTableArea(bool bInArea, const FString&
 			CurrentServiceTableID = TrimmedTableID;
 		}
 
-		UpdateLastKnownServiceState();
+		PublishServiceExecutionState();
 		UE_LOG(
 			LogTemp,
 			Warning,
@@ -1403,7 +1532,7 @@ void UNPCActionQueueComponent::SetPlayerInTableArea(bool bInArea, const FString&
 	{
 		CurrentServiceTableID = TEXT("");
 	}
-	UpdateLastKnownServiceState();
+	PublishServiceExecutionState();
 	UE_LOG(
 		LogTemp,
 		Warning,
@@ -1442,46 +1571,12 @@ void UNPCActionQueueComponent::NotifyPlayerDepartureConfirmed(const FString& Tab
 	bSeatingGuidanceCompleted = false;
 	bPostSeatingMenuGuidanceDone = false;
 	CurrentServiceTableID = TEXT("");
-	SetMealCompletionConfirmationPending(false, TEXT(""));
-	SetDiningServiceCompleted(true, ConfirmedTableID);
-	UpdateLastKnownServiceState();
+	PublishServiceExecutionState();
 	UE_LOG(
 		LogTemp,
 		Log,
 		TEXT("[ActionQueue] Confirmed player departure; cleared seated service state. Table=%s"),
 		*ConfirmedTableID);
-}
-
-void UNPCActionQueueComponent::SetMealCompletionConfirmationPending(bool bPending, const FString& TableID)
-{
-	bLastKnownMealCompletionConfirmationPending = bPending;
-	LastKnownMealCompletionConfirmationTableID = bPending
-		? TableID.TrimStartAndEnd()
-		: TEXT("");
-	UE_LOG(
-		LogTemp,
-		Log,
-		TEXT("[ActionQueue] meal completion confirmation pending=%s Table=%s"),
-		bPending ? TEXT("true") : TEXT("false"),
-		LastKnownMealCompletionConfirmationTableID.IsEmpty()
-			? TEXT("none")
-			: *LastKnownMealCompletionConfirmationTableID);
-}
-
-void UNPCActionQueueComponent::SetDiningServiceCompleted(bool bCompleted, const FString& TableID)
-{
-	bLastKnownDiningServiceCompleted = bCompleted;
-	LastKnownCompletedServiceTableID = bCompleted
-		? TableID.TrimStartAndEnd()
-		: TEXT("");
-	UE_LOG(
-		LogTemp,
-		Log,
-		TEXT("[ActionQueue] dining service completed=%s Table=%s"),
-		bCompleted ? TEXT("true") : TEXT("false"),
-		LastKnownCompletedServiceTableID.IsEmpty()
-			? TEXT("none")
-			: *LastKnownCompletedServiceTableID);
 }
 
 FString UNPCActionQueueComponent::GetCurrentServiceTableID() const
@@ -1620,56 +1715,6 @@ void UNPCActionQueueComponent::NotifyServiceGestureFinished(const FString& Gestu
 	CompleteBlockingGesture(RequestedGestureName, false);
 }
 
-bool UNPCActionQueueComponent::IsLastKnownSeatedForService()
-{
-	return bLastKnownSeatedForService;
-}
-
-bool UNPCActionQueueComponent::IsLastKnownPlayerInTableArea()
-{
-	return bLastKnownPlayerInTableArea;
-}
-
-bool UNPCActionQueueComponent::IsLastKnownGuidePlayerInProgress()
-{
-	return bLastKnownGuidePlayerInProgress;
-}
-
-bool UNPCActionQueueComponent::IsLastKnownSeatingGuidanceCompleted()
-{
-	return bLastKnownSeatingGuidanceCompleted;
-}
-
-FString UNPCActionQueueComponent::GetLastKnownCurrentServiceTableID()
-{
-	return LastKnownCurrentServiceTableID;
-}
-
-FString UNPCActionQueueComponent::GetLastKnownGuideTargetID()
-{
-	return LastKnownGuideTargetID;
-}
-
-bool UNPCActionQueueComponent::IsLastKnownMealCompletionConfirmationPending()
-{
-	return bLastKnownMealCompletionConfirmationPending;
-}
-
-FString UNPCActionQueueComponent::GetLastKnownMealCompletionConfirmationTableID()
-{
-	return LastKnownMealCompletionConfirmationTableID;
-}
-
-bool UNPCActionQueueComponent::IsLastKnownDiningServiceCompleted()
-{
-	return bLastKnownDiningServiceCompleted;
-}
-
-FString UNPCActionQueueComponent::GetLastKnownCompletedServiceTableID()
-{
-	return LastKnownCompletedServiceTableID;
-}
-
 void UNPCActionQueueComponent::SetSuppressNextOrderConfirmSpeechForStrategyReply(bool bSuppress)
 {
 	bSuppressNextOrderConfirmSpeechForStrategyReply = bSuppress;
@@ -1727,7 +1772,7 @@ void UNPCActionQueueComponent::CancelFollowingForExplicitCommand()
 	}
 }
 
-void UNPCActionQueueComponent::UpdateLastKnownServiceState() const
+void UNPCActionQueueComponent::PublishServiceExecutionState() const
 {
 	const UNPCMoveToTableComponent* ResolvedMoveComponent = MoveComponent;
 	if (!ResolvedMoveComponent)
@@ -1738,14 +1783,16 @@ void UNPCActionQueueComponent::UpdateLastKnownServiceState() const
 		}
 	}
 
-	bLastKnownSeatedForService = IsSeatedForService();
-	bLastKnownPlayerInTableArea = bPlayerInTableArea;
-	bLastKnownGuidePlayerInProgress = ResolvedMoveComponent && ResolvedMoveComponent->IsGuidingPlayer();
-	bLastKnownSeatingGuidanceCompleted = bSeatingGuidanceCompleted;
-	LastKnownCurrentServiceTableID = CurrentServiceTableID.TrimStartAndEnd();
-	LastKnownGuideTargetID = (ResolvedMoveComponent && ResolvedMoveComponent->IsGuidingPlayer())
-		? ResolvedMoveComponent->GetCurrentGuideTargetID()
-		: TEXT("");
+	if (ACafeServiceManagerActor* ServiceManager = ACafeServiceManagerActor::FindForWorld(this, GetOwner()))
+	{
+		const bool bGuiding = ResolvedMoveComponent && ResolvedMoveComponent->IsGuidingPlayer();
+		ServiceManager->SynchronizeActionQueueState(
+			bPlayerInTableArea,
+			bSeatingGuidanceCompleted,
+			CurrentServiceTableID,
+			bGuiding,
+			bGuiding ? ResolvedMoveComponent->GetCurrentGuideTargetID() : TEXT(""));
+	}
 }
 
 bool UNPCActionQueueComponent::CancelReceptionForExplicitNPCCommand(const FString& Reason) const
@@ -3634,9 +3681,11 @@ void UNPCActionQueueComponent::HandleGuideArrived(FName EventName, FString Targe
 
 	CurrentServiceTableID = ArrivedTableID;
 	bSeatingGuidanceCompleted = true;
-	UpdateLastKnownServiceState();
-	bLastKnownGuidePlayerInProgress = false;
-	LastKnownGuideTargetID = TEXT("");
+	PublishServiceExecutionState();
+	if (ACafeServiceManagerActor* ServiceManager = ACafeServiceManagerActor::FindForWorld(this, GetOwner()))
+	{
+		ServiceManager->NotifyGuideExecutionArrived(ArrivedTableID);
+	}
 
 	UE_LOG(
 		LogTemp,

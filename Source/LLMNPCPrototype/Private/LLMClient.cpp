@@ -10,6 +10,7 @@
 #include "Serialization/JsonWriter.h"
 #include "VoicevoxTTSClient.h"
 #include "Components/ActorComponent.h"
+#include "CafeServiceManagerActor.h"
 #include "Engine/World.h"
 #include "EmotionClient.h"
 #include "GameFramework/Actor.h"
@@ -196,27 +197,25 @@ namespace
         return true;
     }
 
-    FString BuildStrategyUserContent(const FString& UserMessage)
+    FString BuildStrategyUserContent(const FString& UserMessage, const UObject* WorldContextObject)
     {
-        const bool bPlayerInTableArea = UNPCActionQueueComponent::IsLastKnownPlayerInTableArea();
-        const bool bSeatedForService = UNPCActionQueueComponent::IsLastKnownSeatedForService();
-        const bool bGuidingPlayer = UNPCActionQueueComponent::IsLastKnownGuidePlayerInProgress();
-        const bool bSeatingGuidanceCompleted = UNPCActionQueueComponent::IsLastKnownSeatingGuidanceCompleted();
-		const bool bMealCompletionConfirmationPending = UNPCActionQueueComponent::IsLastKnownMealCompletionConfirmationPending();
-		const bool bDiningServiceCompleted = UNPCActionQueueComponent::IsLastKnownDiningServiceCompleted();
-        const FString CurrentTableID = UNPCActionQueueComponent::GetLastKnownCurrentServiceTableID();
-        const FString CurrentGuideTargetID = UNPCActionQueueComponent::GetLastKnownGuideTargetID();
-		const FString MealCompletionTableID = UNPCActionQueueComponent::GetLastKnownMealCompletionConfirmationTableID();
-		const FString CompletedServiceTableID = UNPCActionQueueComponent::GetLastKnownCompletedServiceTableID();
-		const FString ServiceState = bMealCompletionConfirmationPending
-			? TEXT("awaiting_meal_completion_confirmation")
-			: (bDiningServiceCompleted
-			? TEXT("post_meal")
-			: (bGuidingPlayer
-            ? TEXT("guiding")
-            : (bPlayerInTableArea
-            ? TEXT("in_table_area")
-			: (bSeatedForService ? TEXT("seated") : TEXT("reception")))));
+		const ACafeServiceManagerActor* ServiceManager = ACafeServiceManagerActor::FindForWorld(WorldContextObject);
+		const FCafeServiceSnapshot ServiceSnapshot = ServiceManager
+			? ServiceManager->GetServiceSnapshot()
+			: FCafeServiceSnapshot();
+		const bool bPlayerInTableArea = ServiceSnapshot.bPlayerInTableArea;
+		const bool bSeatedForService = ServiceSnapshot.bSeatedForService;
+		const bool bGuidingPlayer = ServiceSnapshot.bGuideInProgress;
+		const bool bSeatingGuidanceCompleted = ServiceSnapshot.bSeatingGuidanceCompleted;
+		const bool bMealCompletionConfirmationPending = ServiceSnapshot.bMealCompletionConfirmationPending;
+		const bool bDiningServiceCompleted = ServiceSnapshot.bDiningServiceCompleted;
+		const FString CurrentTableID = ServiceSnapshot.CurrentTableID;
+		const FString CurrentGuideTargetID = ServiceSnapshot.CurrentGuideTargetID;
+		const FString MealCompletionTableID = ServiceSnapshot.MealCompletionTableID;
+		const FString CompletedServiceTableID = ServiceSnapshot.CompletedServiceTableID;
+		const FString ServiceState = ServiceManager
+			? ServiceManager->GetUnifiedServiceStateName()
+			: TEXT("reception");
 		const FString PlayerVoiceEmotion = UEmotionClient::GetLatestPlayerVoiceEmotion();
 		UNPCAutonomyComponent* AutonomyComponent = UNPCAutonomyComponent::GetPrimaryAutonomyComponent();
 		const FString NPCBehaviorContext = AutonomyComponent
@@ -301,6 +300,20 @@ namespace
 			TEXT("sit across from me"), TEXT("sit opposite me"), TEXT("sit with me")
 		};
 		return ContainsAnyInteractionTerm(Message, DirectSitTerms);
+	}
+
+	bool IsDirectEndSeatedConversationRequest(const FString& UserMessage)
+	{
+		const FString Message = UserMessage.TrimStartAndEnd();
+		const TArray<FString> EndTerms = {
+			TEXT("你可以起来了"), TEXT("起来吧"), TEXT("不用陪我了"), TEXT("你去忙吧"),
+			TEXT("结束聊天"), TEXT("我们不聊了"), TEXT("可以回去工作了"),
+			TEXT("もう立っていい"), TEXT("立ってください"), TEXT("席を立って"),
+			TEXT("もう大丈夫です"), TEXT("仕事に戻って"), TEXT("お仕事に戻って"),
+			TEXT("you can stand up"), TEXT("please stand up"), TEXT("go back to work"),
+			TEXT("let's stop talking"), TEXT("end the conversation")
+		};
+		return ContainsAnyInteractionTerm(Message, EndTerms);
 	}
 
 	FNPCInteractionMemorySignal BuildFallbackInteractionMemorySignal(const FString& UserMessage)
@@ -1224,7 +1237,7 @@ void ULLMClient::SendDeepSeekMessage(const FString& UserMessage)
 
 void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 {
-	const FString StrategyUserContent = BuildStrategyUserContent(UserMessage);
+	const FString StrategyUserContent = BuildStrategyUserContent(UserMessage, ResolveSpeechWorld());
 	MostRecentInteractiveClient = this;
 	OnAnyInteractiveRequestStarted.Broadcast();
 	FString ExpressionIntent;
@@ -1318,6 +1331,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 			"- After acceptance, reply naturally in Japanese and acknowledge that Sumiha will sit down. After refusal, accept it politely without pressuring the player.\n"
 			"- When the player directly asks Sumiha to sit across from them, sit opposite them, or sit down and talk, output exactly one sit_opposite_player action. This direct invitation already supplies consent and is not the same as accepting Sumiha's own pending invitation.\n"
 			"- While activity_before_player_interruption.id is sit_with_player, ordinary conversation should use base_action_policy continue so Sumiha remains seated. Use stop or transition only for a service request, a request to stand, or another incompatible action.\n"
+			"- When seated_conversation_session.active is true and the player clearly asks Sumiha to stand, return to work, or end the seated chat, output exactly one end_seated_conversation action.\n"
 			"\n"
 			"Embodied response rules:\n"
 			"- Always include embodied_response. It describes visible and vocal delivery, not a service action.\n"
@@ -1347,7 +1361,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- actions may be used without speech.\n"
             "- If no speech is needed, set \"reply\" to \"\".\n"
             "- If no action is needed, use an empty actions array.\n"
-			"- Use only these action types: greet, explain, recommend, place_order, clean_table, continue_dining, sit_opposite_player, accept_seat_invitation, decline_seat_invitation, guide_to_table, guide_player_to_table, guide_player_to_scene_tag, stop_guide_player, counter_then_return, table_route, action_sequence, move_near_player, follow_player, stop_follow_player, none.\n"
+			"- Use only these action types: greet, explain, recommend, place_order, clean_table, continue_dining, sit_opposite_player, end_seated_conversation, accept_seat_invitation, decline_seat_invitation, guide_to_table, guide_player_to_table, guide_player_to_scene_tag, stop_guide_player, counter_then_return, table_route, action_sequence, move_near_player, follow_player, stop_follow_player, none.\n"
             "- Do not invent unsupported action types.\n"
             "- For greeting or self-introduction, use greet with timing immediate or before_speech.\n"
             "- For explaining the menu, use explain with timing before_speech or during_speech.\n"
@@ -1504,7 +1518,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 			"  \"embodied_response\": {\"enabled\":false,\"reaction_style\":\"neutral\",\"base_action_policy\":\"stop\",\"face\":\"neutral\",\"gaze\":\"none\",\"left_hand\":\"keep_current\",\"right_hand\":\"keep_current\",\"voice\":\"normal\",\"prop\":\"keep_current\",\"display_note\":\"\",\"resume_after_reply\":false,\"reason\":\"short Japanese reason\"},\n"
             "  \"reply\": \"Japanese reply, or empty string when no speech is needed\",\n"
             "  \"actions\": [\n"
-			"    {\"type\":\"greet|explain|recommend|place_order|clean_table|continue_dining|sit_opposite_player|accept_seat_invitation|decline_seat_invitation|guide_to_table|guide_player_to_table|guide_player_to_scene_tag|stop_guide_player|counter_then_return|table_route|action_sequence|move_near_player|follow_player|stop_follow_player|none\",\"timing\":\"immediate|before_speech|during_speech|after_speech\",\"item\":\"none, player, menu item, current_table, table hint, table ID, scene tag, comma-separated table route, or JSON string steps for action_sequence\",\"return_table_id\":\"Table_01 or current_table when type is counter_then_return\",\"quantity\":0}\n"
+			"    {\"type\":\"greet|explain|recommend|place_order|clean_table|continue_dining|sit_opposite_player|end_seated_conversation|accept_seat_invitation|decline_seat_invitation|guide_to_table|guide_player_to_table|guide_player_to_scene_tag|stop_guide_player|counter_then_return|table_route|action_sequence|move_near_player|follow_player|stop_follow_player|none\",\"timing\":\"immediate|before_speech|during_speech|after_speech\",\"item\":\"none, player, menu item, current_table, table hint, table ID, scene tag, comma-separated table route, or JSON string steps for action_sequence\",\"return_table_id\":\"Table_01 or current_table when type is counter_then_return\",\"quantity\":0}\n"
             "  ]\n"
             "}\n"
             "\n"
@@ -2263,9 +2277,34 @@ void ULLMClient::OnStrategyResponseReceived(
 		}
 	}
 
-	const bool bPlayerCanHostOppositeSeat = UNPCActionQueueComponent::IsLastKnownSeatedForService()
-		|| UNPCActionQueueComponent::IsLastKnownPlayerInTableArea();
-	if (bPlayerCanHostOppositeSeat && IsDirectSitOppositeRequest(LastStrategyUserMessage))
+	const ACafeServiceManagerActor* ServiceManager = ACafeServiceManagerActor::FindForWorld(ResolveSpeechWorld());
+	const FCafeServiceSnapshot ServiceSnapshot = ServiceManager
+		? ServiceManager->GetServiceSnapshot()
+		: FCafeServiceSnapshot();
+	const bool bPlayerCanHostOppositeSeat = ServiceSnapshot.bSeatedForService
+		|| ServiceSnapshot.bPlayerInTableArea;
+	const FString RequestedDecision = GetStringFieldOrDefault(
+		StrategyRoot,
+		TEXT("decision"),
+		TEXT("")).TrimStartAndEnd();
+	if (UNPCAutonomyComponent* Autonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent();
+		Autonomy
+		&& Autonomy->IsSeatedConversationActive()
+		&& IsDirectEndSeatedConversationRequest(LastStrategyUserMessage))
+	{
+		FParsedStrategyAction EndSeatAction = MakeParsedStrategyAction(TEXT("end_seated_conversation"), TEXT("current_table"));
+		EndSeatAction.Timing = TEXT("after_speech");
+		ParsedActions.Reset();
+		ParsedActions.Add(EndSeatAction);
+		ActionName = EndSeatAction.ActionType;
+		ActionItem = EndSeatAction.Item;
+		ActionQuantity = 0;
+		bHasNonNoneAction = true;
+		UE_LOG(LogTemp, Log, TEXT("[NPCSeat] locally enforced explicit seated-conversation exit request."));
+	}
+	else if (bPlayerCanHostOppositeSeat
+		&& (IsDirectSitOppositeRequest(LastStrategyUserMessage)
+			|| RequestedDecision.Equals(TEXT("sit_opposite_player"), ESearchCase::IgnoreCase)))
 	{
 		FParsedStrategyAction SitAction = MakeParsedStrategyAction(TEXT("sit_opposite_player"), TEXT("current_table"));
 		SitAction.Timing = TEXT("immediate");
@@ -2919,14 +2958,19 @@ bool ULLMClient::ShouldDeferGuideActionUntilReplyFinished(const FString& ActionT
         return false;
     }
 
-    if (UNPCActionQueueComponent::IsLastKnownGuidePlayerInProgress())
+    const ACafeServiceManagerActor* ServiceManager = ACafeServiceManagerActor::FindForWorld(ResolveSpeechWorld());
+    const FCafeServiceSnapshot ServiceSnapshot = ServiceManager
+		? ServiceManager->GetServiceSnapshot()
+		: FCafeServiceSnapshot();
+
+    if (ServiceSnapshot.bGuideInProgress)
     {
         return false;
     }
 
-    if (UNPCActionQueueComponent::IsLastKnownSeatedForService()
-        || UNPCActionQueueComponent::IsLastKnownPlayerInTableArea()
-        || UNPCActionQueueComponent::IsLastKnownSeatingGuidanceCompleted())
+    if (ServiceSnapshot.bSeatedForService
+        || ServiceSnapshot.bPlayerInTableArea
+        || ServiceSnapshot.bSeatingGuidanceCompleted)
     {
         return false;
     }

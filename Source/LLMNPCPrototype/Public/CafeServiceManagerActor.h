@@ -35,6 +35,54 @@ enum class ECafeServiceState : uint8
 	Served
 };
 
+USTRUCT(BlueprintType)
+struct LLMNPCPROTOTYPE_API FCafeServiceSnapshot
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	ECafeServiceState State = ECafeServiceState::Idle;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	FString StateName = TEXT("Idle");
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	bool bServiceStarted = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	bool bPlayerInTableArea = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	bool bPlayerSeated = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	bool bSeatedForService = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	bool bGuideInProgress = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	bool bSeatingGuidanceCompleted = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	FString CurrentTableID;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	FString CurrentGuideTargetID;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	bool bMealCompletionConfirmationPending = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	FString MealCompletionTableID;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	bool bDiningServiceCompleted = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	FString CompletedServiceTableID;
+};
+
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FCafeServiceStateChangedSignature, ECafeServiceState, NewState);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FMaidSpeechRequestedSignature, FText, SpeechText);
 
@@ -144,6 +192,21 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Cafe Service")
 	bool bServiceStarted;
 
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Cafe Service|State")
+	bool bPlayerInTableArea;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Cafe Service|State")
+	bool bSeatingGuidanceCompleted;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Cafe Service|State")
+	bool bGuideInProgress;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Cafe Service|State")
+	FString CurrentGuideTargetID;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "Cafe Service|State")
+	FString LastCompletedServiceTableID;
+
 	UPROPERTY(BlueprintAssignable, Category = "Cafe Service")
 	FCafeServiceStateChangedSignature OnCafeServiceStateChanged;
 
@@ -167,6 +230,27 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "Cafe Service|Social Initiative")
 	bool TriggerSeatedConversationOpportunity();
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Cafe Service|State")
+	FCafeServiceSnapshot GetServiceSnapshot() const;
+
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "Cafe Service|State")
+	FString GetUnifiedServiceStateName() const;
+
+	void SynchronizeActionQueueState(
+		bool bInPlayerTableArea,
+		bool bGuidanceCompleted,
+		const FString& TableID,
+		bool bInGuideProgress,
+		const FString& GuideTargetID);
+
+	void NotifyGuideExecutionArrived(const FString& TableID);
+
+	void NotifyPlayerTableAreaChanged(bool bInArea, const FString& TableID);
+
+	static ACafeServiceManagerActor* FindForWorld(
+		const UObject* WorldContextObject,
+		const AActor* MaidActor = nullptr);
 
 private:
 	UPROPERTY(Transient)

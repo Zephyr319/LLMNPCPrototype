@@ -185,6 +185,8 @@ UNPCAutonomyComponent::UNPCAutonomyComponent()
 	StandUpAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
 		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_KA_Sit_End_OCM.Anim_KA_Sit_End_OCM")));
 	SeatedConversationOpeningDelaySeconds = 2.5f;
+	SeatedConversationInactivityTimeoutSeconds = 120.0f;
+	SeatedConversationIdleLoopsPerCycle = 1;
 	AutonomyModelName = TEXT("gpt-4o-mini");
 	bEnableMemoryEmotionCycle = true;
 	bEnableSpontaneousRecall = true;
@@ -267,9 +269,12 @@ UNPCAutonomyComponent::UNPCAutonomyComponent()
 	bSeatInvitationApproachInProgress = false;
 	bSeatInvitationPending = false;
 	bSeatInvitationAcceptedForStart = false;
+	bSeatedConversationPerformancePending = false;
+	bSeatedConversationExitWasInterrupted = false;
 	SeatedConversationOpeningAttempts = 0;
 	PendingInteractiveActivityID = TEXT("");
 	PendingSeatInvitationSeatID = TEXT("");
+	SeatedConversationExitReason = TEXT("");
 	bBlinkFollowUpPending = false;
 	TotalAutonomyPromptTokens = 0;
 	TotalAutonomyCompletionTokens = 0;
@@ -308,6 +313,7 @@ UNPCAutonomyComponent::UNPCAutonomyComponent()
 	PlanningSuppressedUntilWorldTime = 0.0;
 	LastPlayerSpeechWorldTime = -1000000.0;
 	LastPlayerSpeechStartleWorldTime = -1000000.0;
+	SeatedConversationStartedWorldTime = 0.0;
 	ExpressionBlendStartWorldTime = 0.0;
 	ExpressionBlendDurationSeconds = 0.0f;
 	PendingStartleFocus = 0.0f;
@@ -827,6 +833,28 @@ bool UNPCAutonomyComponent::IsSeatInvitationPending() const
 	return bSeatInvitationPending;
 }
 
+bool UNPCAutonomyComponent::IsSeatedConversationActive() const
+{
+	return bActivityRunning
+		&& CurrentActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase)
+		&& (RuntimePhase == ENPCAutonomyRuntimePhase::SocialSeatEntering
+			|| RuntimePhase == ENPCAutonomyRuntimePhase::SocialSeatSession
+			|| RuntimePhase == ENPCAutonomyRuntimePhase::SocialSeatExiting);
+}
+
+bool UNPCAutonomyComponent::RequestEndSeatedConversation(const FString& Reason)
+{
+	if (!IsSeatedConversationActive())
+	{
+		return false;
+	}
+
+	BeginSeatedConversationExit(
+		Reason.TrimStartAndEnd().IsEmpty() ? TEXT("player_requested_end") : Reason.TrimStartAndEnd(),
+		false);
+	return true;
+}
+
 void UNPCAutonomyComponent::NotifyNPCEnteredSeat(const FString& SeatID)
 {
 	if (!bActivityRunning
@@ -865,6 +893,35 @@ void UNPCAutonomyComponent::InterruptAutonomy(const FString& Reason)
 	{
 		CancelSeatInvitation(Reason, false, false);
 	}
+	const bool bCanLeaveSocialSeatGracefully = IsSeatedConversationActive()
+		&& RuntimePhase != ENPCAutonomyRuntimePhase::SocialSeatExiting
+		&& !Reason.Equals(TEXT("end_play"), ESearchCase::IgnoreCase)
+		&& !Reason.Equals(TEXT("autonomy_disabled"), ESearchCase::IgnoreCase);
+	if (bCanLeaveSocialSeatGracefully)
+	{
+		StopInteractiveFacingPlayer();
+		if (UWorld* World = GetWorld())
+		{
+			World->GetTimerManager().ClearTimer(MultiStepValidationInterruptTimerHandle);
+			World->GetTimerManager().ClearTimer(PlanThoughtDisplayTimerHandle);
+			World->GetTimerManager().ClearTimer(EmbodiedResponseResumeTimerHandle);
+			World->GetTimerManager().ClearTimer(SeatedConversationOpeningTimerHandle);
+		}
+		bAwaitingEmbodiedResponse = false;
+		bResumePausedActivityAfterReply = false;
+		PendingInteractiveActivityID = TEXT("");
+		PendingPlanSurfaceThought = TEXT("");
+		bDecisionPending = false;
+		PendingDecisionRequestId = 0;
+		bAppraisalPending = false;
+		PendingAppraisalRequestId = 0;
+		PendingPlanningTriggerAfterAppraisal = TEXT("");
+		LastRequestedAvailableActions.Reset();
+		ResetExpressionMorphs();
+		SuspendOrDiscardPlan(Reason);
+		BeginSeatedConversationExit(Reason, true);
+		return;
+	}
 	StopInteractiveFacingPlayer();
 	if (UWorld* World = GetWorld())
 	{
@@ -873,6 +930,7 @@ void UNPCAutonomyComponent::InterruptAutonomy(const FString& Reason)
 		World->GetTimerManager().ClearTimer(EmbodiedResponseResumeTimerHandle);
 		World->GetTimerManager().ClearTimer(SeatInvitationTimeoutTimerHandle);
 		World->GetTimerManager().ClearTimer(SeatedConversationOpeningTimerHandle);
+		World->GetTimerManager().ClearTimer(SeatedConversationInactivityTimerHandle);
 	}
 	bAwaitingEmbodiedResponse = false;
 	bResumePausedActivityAfterReply = false;
@@ -890,6 +948,10 @@ void UNPCAutonomyComponent::InterruptAutonomy(const FString& Reason)
 	if (bActivityRunning)
 	{
 		const FString InterruptedActivityID = CurrentActivityID;
+		if (InterruptedActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase))
+		{
+			ResetSeatedConversationState();
+		}
 		const bool bInterruptedAmbientActivity = bCurrentActivityIsAmbient;
 		const FNPCAutonomyActivityDefinition* InterruptedActivity = FindActivityDefinition(InterruptedActivityID);
 		ActivityCooldownUntil.Remove(InterruptedActivityID);
@@ -1109,6 +1171,27 @@ FString UNPCAutonomyComponent::BuildInteractiveDialogueContext()
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetBoolField(TEXT("activity_running_when_player_spoke"), bActivityRunning);
 	Root->SetStringField(TEXT("npc_location"), LastKnownNPCZone);
+	if (IsSeatedConversationActive())
+	{
+		TSharedRef<FJsonObject> SessionObject = MakeShared<FJsonObject>();
+		const FString Phase = RuntimePhase == ENPCAutonomyRuntimePhase::SocialSeatEntering ? TEXT("entering")
+			: RuntimePhase == ENPCAutonomyRuntimePhase::SocialSeatExiting ? TEXT("exiting")
+			: TEXT("conversing");
+		SessionObject->SetBoolField(TEXT("active"), true);
+		SessionObject->SetStringField(TEXT("phase"), Phase);
+		SessionObject->SetBoolField(TEXT("ordinary_dialogue_keeps_seated"), true);
+		SessionObject->SetBoolField(TEXT("upper_body_performance_available"), !SeatedConversationAnimation.IsNull());
+		SessionObject->SetBoolField(TEXT("suspended_plan_waiting"), ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended);
+		SessionObject->SetNumberField(
+			TEXT("elapsed_seconds"),
+			SeatedConversationStartedWorldTime > 0.0 && GetWorld()
+				? FMath::Max(GetWorld()->GetTimeSeconds() - SeatedConversationStartedWorldTime, 0.0)
+				: 0.0);
+		SessionObject->SetStringField(
+			TEXT("exit_rule_ja"),
+			TEXT("通常の会話では着席を続ける。お客様が終了を明言した場合、離席した場合、または優先業務が発生した場合だけ立ち上がる。"));
+		Root->SetObjectField(TEXT("seated_conversation_session"), SessionObject);
+	}
 	if (bSeatInvitationPending)
 	{
 		TSharedRef<FJsonObject> InvitationObject = MakeShared<FJsonObject>();
@@ -3793,8 +3876,9 @@ FString UNPCAutonomyComponent::ResolvePlayerActivity() const
 	{
 		return TEXT("following_npc");
 	}
+	const FCafeServiceSnapshot ServiceSnapshot = ServiceManager->GetServiceSnapshot();
 	const UPlayerSeatComponent* SeatComponent = PlayerActor->FindComponentByClass<UPlayerSeatComponent>();
-	if (SeatComponent && SeatComponent->bIsSeated)
+	if ((SeatComponent && SeatComponent->bIsSeated) || ServiceSnapshot.bSeatedForService)
 	{
 		return TEXT("seated");
 	}
@@ -3805,10 +3889,6 @@ FString UNPCAutonomyComponent::ResolvePlayerActivity() const
 		&& !ExplicitActivity.Equals(TEXT("seated"), ESearchCase::IgnoreCase))
 	{
 		return ExplicitActivity;
-	}
-	if (!SeatComponent && UNPCActionQueueComponent::IsLastKnownSeatedForService())
-	{
-		return TEXT("seated");
 	}
 	if (PlayerActor->GetVelocity().SizeSquared2D() > FMath::Square(10.0f))
 	{
@@ -3830,9 +3910,10 @@ FString UNPCAutonomyComponent::ResolvePlayerZone() const
 		return ExplicitZone;
 	}
 
-	if (UNPCActionQueueComponent::IsLastKnownPlayerInTableArea())
+	const FCafeServiceSnapshot ServiceSnapshot = ServiceManager->GetServiceSnapshot();
+	if (ServiceSnapshot.bPlayerInTableArea)
 	{
-		const FString TableID = UNPCActionQueueComponent::GetLastKnownCurrentServiceTableID();
+		const FString TableID = ServiceSnapshot.CurrentTableID;
 		return TableID.IsEmpty() ? TEXT("table_area") : TableID;
 	}
 
@@ -4175,6 +4256,10 @@ bool UNPCAutonomyComponent::ShouldSuspendActivePlan(const FString& InterruptionR
 	{
 		return false;
 	}
+	if (InterruptionReason.Equals(TEXT("player_requested_social_seat"), ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
 
 	if (ActivePlan.Commitment.Equals(TEXT("medium"), ESearchCase::IgnoreCase))
 	{
@@ -4373,7 +4458,9 @@ bool UNPCAutonomyComponent::StartActivity(
 			return false;
 		}
 
-		RuntimePhase = ENPCAutonomyRuntimePhase::BuiltInQueue;
+		RuntimePhase = ActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase)
+			? ENPCAutonomyRuntimePhase::SocialSeatEntering
+			: ENPCAutonomyRuntimePhase::BuiltInQueue;
 		ActionQueueComponent->StartActionQueue();
 		if (!ActionQueueComponent->bIsRunningQueue)
 		{
@@ -4483,7 +4570,6 @@ bool UNPCAutonomyComponent::StartSeatActivitySequence(
 
 	UAnimSequenceBase* SitDown = SitDownAnimation.LoadSynchronous();
 	UAnimSequenceBase* SeatedIdle = SeatedIdleAnimation.LoadSynchronous();
-	UAnimSequenceBase* SeatedConversation = SeatedConversationAnimation.LoadSynchronous();
 	UAnimSequenceBase* StandUp = StandUpAnimation.LoadSynchronous();
 	if (!SitDown || !SeatedIdle || !StandUp
 		|| !IsAnimationCompatibleWithMaid(SitDown)
@@ -4504,21 +4590,14 @@ bool UNPCAutonomyComponent::StartSeatActivitySequence(
 	ActionQueueComponent->EnqueueMoveToSeatID(SeatID.TrimStartAndEnd());
 	ActionQueueComponent->EnqueueEnterSeat();
 	ActionQueueComponent->EnqueueAnimation(SitDown, FName(TEXT("DefaultSlot")), 1.0f, 3.0f);
-	if (Activity.ActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase)
-		&& IsAnimationCompatibleWithMaid(SeatedConversation))
+	if (Activity.ActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase))
 	{
-		ActionQueueComponent->EnqueueAnimation(
-			SeatedConversation,
-			FName(TEXT("DefaultSlot")),
-			1.0f,
-			5.0f);
+		return true;
 	}
-	const int32 IdleLoopCount = Activity.ActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase)
-		? SocialSeatedIdleLoopCount
-		: SeatedIdleLoopCount;
+
 	ActionQueueComponent->EnqueueLoopedAnimation(
 		SeatedIdle,
-		FMath::Max(IdleLoopCount, 1),
+		FMath::Max(SeatedIdleLoopCount, 1),
 		FName(TEXT("DefaultSlot")),
 		1.0f,
 		FMath::Max(Activity.AnimationFallbackSeconds, 3.0f));
@@ -4660,6 +4739,259 @@ void UNPCAutonomyComponent::BeginSeatedConversationOpening()
 		TEXT("[NPCSeat] seated conversation opening request started=%s Attempt=%d"),
 		bRequested ? TEXT("true") : TEXT("false"),
 		SeatedConversationOpeningAttempts);
+}
+
+void UNPCAutonomyComponent::BeginSeatedConversationSession()
+{
+	if (!bActivityRunning
+		|| !CurrentActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase)
+		|| !ActionQueueComponent
+		|| !ActionQueueComponent->IsNPCSeated())
+	{
+		BeginSeatedConversationExit(TEXT("seat_entry_not_confirmed"), true);
+		return;
+	}
+
+	RuntimePhase = ENPCAutonomyRuntimePhase::SocialSeatSession;
+	SeatedConversationStartedWorldTime = GetWorld() ? GetWorld()->GetTimeSeconds() : 0.0;
+	RefreshSeatedConversationInactivityTimeout();
+	const bool bPlayPendingConversationPerformance = bSeatedConversationPerformancePending;
+	bSeatedConversationPerformancePending = false;
+	QueueSeatedConversationAnimation(bPlayPendingConversationPerformance);
+	if (RuntimePhase != ENPCAutonomyRuntimePhase::SocialSeatSession)
+	{
+		return;
+	}
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetNumberField(TEXT("inactivity_timeout_seconds"), SeatedConversationInactivityTimeoutSeconds);
+	Payload->SetBoolField(TEXT("opening_performance_pending"), bPlayPendingConversationPerformance);
+	Payload->SetBoolField(TEXT("suspended_plan_waiting"), ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended);
+	RecordResearchEvent(TEXT("seated_conversation_session_started"), Payload);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSeat] persistent seated conversation started. Timeout=%.1fs SuspendedPlan=%s"),
+		SeatedConversationInactivityTimeoutSeconds,
+		ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended ? TEXT("true") : TEXT("false"));
+}
+
+void UNPCAutonomyComponent::QueueSeatedConversationAnimation(bool bConversationPerformance)
+{
+	if (RuntimePhase != ENPCAutonomyRuntimePhase::SocialSeatSession
+		|| !ActionQueueComponent
+		|| ActionQueueComponent->bIsRunningQueue)
+	{
+		return;
+	}
+
+	UAnimSequenceBase* Animation = bConversationPerformance
+		? SeatedConversationAnimation.LoadSynchronous()
+		: SeatedIdleAnimation.LoadSynchronous();
+	if (!IsAnimationCompatibleWithMaid(Animation))
+	{
+		if (bConversationPerformance)
+		{
+			Animation = SeatedIdleAnimation.LoadSynchronous();
+		}
+		if (!IsAnimationCompatibleWithMaid(Animation))
+		{
+			BeginSeatedConversationExit(TEXT("seated_animation_unavailable"), true);
+			return;
+		}
+	}
+
+	ActiveActivityAnimation = Animation;
+	if (bConversationPerformance)
+	{
+		ActionQueueComponent->EnqueueAnimation(
+			Animation,
+			FName(TEXT("DefaultSlot")),
+			1.0f,
+			5.0f);
+	}
+	else
+	{
+		ActionQueueComponent->EnqueueLoopedAnimation(
+			Animation,
+			FMath::Clamp(SeatedConversationIdleLoopsPerCycle, 1, 4),
+			FName(TEXT("DefaultSlot")),
+			1.0f,
+			5.0f);
+	}
+	ActionQueueComponent->StartActionQueue();
+	if (!ActionQueueComponent->bIsRunningQueue)
+	{
+		BeginSeatedConversationExit(TEXT("seated_animation_failed_to_start"), true);
+	}
+}
+
+void UNPCAutonomyComponent::PlaySeatedConversationPerformance()
+{
+	if (!IsSeatedConversationActive())
+	{
+		return;
+	}
+	if (RuntimePhase == ENPCAutonomyRuntimePhase::SocialSeatEntering)
+	{
+		bSeatedConversationPerformancePending = true;
+		return;
+	}
+	if (RuntimePhase != ENPCAutonomyRuntimePhase::SocialSeatSession || !ActionQueueComponent)
+	{
+		return;
+	}
+
+	if (ActionQueueComponent->bIsRunningQueue
+		&& !ActionQueueComponent->StopActionQueuePreservingSeat())
+	{
+		return;
+	}
+	QueueSeatedConversationAnimation(true);
+	RefreshSeatedConversationInactivityTimeout();
+}
+
+void UNPCAutonomyComponent::RefreshSeatedConversationInactivityTimeout()
+{
+	if (RuntimePhase != ENPCAutonomyRuntimePhase::SocialSeatSession)
+	{
+		return;
+	}
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SeatedConversationInactivityTimerHandle);
+		World->GetTimerManager().SetTimer(
+			SeatedConversationInactivityTimerHandle,
+			this,
+			&UNPCAutonomyComponent::HandleSeatedConversationInactivityTimeout,
+			FMath::Max(SeatedConversationInactivityTimeoutSeconds, 15.0f),
+			false);
+	}
+}
+
+void UNPCAutonomyComponent::HandleSeatedConversationInactivityTimeout()
+{
+	if (RuntimePhase == ENPCAutonomyRuntimePhase::SocialSeatSession)
+	{
+		BeginSeatedConversationExit(TEXT("conversation_inactivity_timeout"), false);
+	}
+}
+
+void UNPCAutonomyComponent::BeginSeatedConversationExit(const FString& Reason, bool bInterrupted)
+{
+	if (!bActivityRunning
+		|| !CurrentActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase)
+		|| RuntimePhase == ENPCAutonomyRuntimePhase::SocialSeatExiting)
+	{
+		return;
+	}
+
+	SeatedConversationExitReason = Reason.TrimStartAndEnd().IsEmpty()
+		? TEXT("conversation_finished")
+		: Reason.TrimStartAndEnd();
+	bSeatedConversationExitWasInterrupted = bInterrupted;
+	bSeatedConversationPerformancePending = false;
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SeatedConversationOpeningTimerHandle);
+		World->GetTimerManager().ClearTimer(SeatedConversationInactivityTimerHandle);
+	}
+
+	const bool bNPCIsSeated = ActionQueueComponent && ActionQueueComponent->IsNPCSeated();
+	if (!ActionQueueComponent || !bNPCIsSeated)
+	{
+		if (ActionQueueComponent)
+		{
+			ActionQueueComponent->StopActionQueue();
+		}
+		const bool bPreserveSuspendedPlan = ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended;
+		ResetSeatedConversationState();
+		FinishActivity(!bPreserveSuspendedPlan);
+		return;
+	}
+
+	ActionQueueComponent->StopActionQueuePreservingSeat();
+	RuntimePhase = ENPCAutonomyRuntimePhase::SocialSeatExiting;
+	UAnimSequenceBase* StandUp = StandUpAnimation.LoadSynchronous();
+	if (IsAnimationCompatibleWithMaid(StandUp))
+	{
+		ActionQueueComponent->EnqueueAnimation(
+			StandUp,
+			FName(TEXT("DefaultSlot")),
+			1.0f,
+			3.0f);
+	}
+	ActionQueueComponent->EnqueueExitSeat();
+	ActionQueueComponent->StartActionQueue();
+	if (!bActivityRunning || RuntimePhase != ENPCAutonomyRuntimePhase::SocialSeatExiting)
+	{
+		return;
+	}
+	if (!ActionQueueComponent->bIsRunningQueue)
+	{
+		ActionQueueComponent->StopActionQueue();
+		CompleteSeatedConversationExit(false);
+		return;
+	}
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSeat] seated conversation exit started. Reason=%s Interrupted=%s"),
+		*SeatedConversationExitReason,
+		bInterrupted ? TEXT("true") : TEXT("false"));
+}
+
+void UNPCAutonomyComponent::CompleteSeatedConversationExit(bool bSuccess)
+{
+	const FString ExitReason = SeatedConversationExitReason;
+	const bool bWasInterrupted = bSeatedConversationExitWasInterrupted;
+	const double DurationSeconds = GetWorld()
+		? FMath::Max(GetWorld()->GetTimeSeconds() - SeatedConversationStartedWorldTime, 0.0)
+		: 0.0;
+	const FNPCAutonomyActivityDefinition* Activity = FindActivityDefinition(TEXT("sit_with_player"));
+	if (bSuccess && !bWasInterrupted && Activity)
+	{
+		ApplyActivitySuccess(*Activity);
+	}
+	if (!bSuccess && ActionQueueComponent)
+	{
+		ActionQueueComponent->StopActionQueue();
+	}
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("reason"), ExitReason);
+	Payload->SetBoolField(TEXT("interrupted"), bWasInterrupted);
+	Payload->SetBoolField(TEXT("exit_animation_succeeded"), bSuccess);
+	Payload->SetNumberField(TEXT("duration_seconds"), DurationSeconds);
+	Payload->SetBoolField(TEXT("plan_will_resume"), ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended);
+	RecordResearchEvent(TEXT("seated_conversation_session_finished"), Payload);
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[NPCSeat] seated conversation finished. Reason=%s Duration=%.1fs ExitSuccess=%s ResumePlan=%s"),
+		*ExitReason,
+		DurationSeconds,
+		bSuccess ? TEXT("true") : TEXT("false"),
+		ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended ? TEXT("true") : TEXT("false"));
+
+	const bool bPreserveSuspendedPlan = ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended;
+	ResetSeatedConversationState();
+	FinishActivity(!bSuccess && !bPreserveSuspendedPlan);
+}
+
+void UNPCAutonomyComponent::ResetSeatedConversationState()
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(SeatedConversationOpeningTimerHandle);
+		World->GetTimerManager().ClearTimer(SeatedConversationInactivityTimerHandle);
+	}
+	bSeatedConversationPerformancePending = false;
+	bSeatedConversationExitWasInterrupted = false;
+	SeatedConversationOpeningAttempts = 0;
+	SeatedConversationStartedWorldTime = 0.0;
+	SeatedConversationExitReason.Reset();
 }
 
 void UNPCAutonomyComponent::CancelSeatInvitation(
@@ -4861,7 +5193,12 @@ void UNPCAutonomyComponent::FinishActivity(bool bInterrupted)
 	{
 		World->GetTimerManager().ClearTimer(BlueprintActivityTimeoutTimerHandle);
 		World->GetTimerManager().ClearTimer(SeatedConversationOpeningTimerHandle);
+		World->GetTimerManager().ClearTimer(SeatedConversationInactivityTimerHandle);
 		LastActivityEndWorldTime = World->GetTimeSeconds();
+	}
+	if (FinishedActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase))
+	{
+		ResetSeatedConversationState();
 	}
 	bActivityRunning = false;
 	bCurrentActivityIsAmbient = false;
@@ -5182,6 +5519,10 @@ void UNPCAutonomyComponent::HandleInteractiveLLMRequestStarted()
 		UE_LOG(LogTemp, Log, TEXT("[NPCSeatInvitation] player response received; preserving the pending consent gate."));
 		return;
 	}
+	if (RuntimePhase == ENPCAutonomyRuntimePhase::SocialSeatSession)
+	{
+		RefreshSeatedConversationInactivityTimeout();
+	}
 
 	if (CanPreserveActivityForEmbodiedResponse())
 	{
@@ -5212,7 +5553,8 @@ bool UNPCAutonomyComponent::CanPreserveActivityForEmbodiedResponse() const
 {
 	return bEnableEmbodiedResponseCoordination
 		&& bActivityRunning
-		&& (bPreserveAutonomyActivityUntilLLMResponse
+		&& (CurrentActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase)
+			|| bPreserveAutonomyActivityUntilLLMResponse
 			|| (bPreservePhoneActivityUntilLLMResponse
 				&& CurrentActivityID.Equals(TEXT("phone_at_counter"), ESearchCase::IgnoreCase)));
 }
@@ -5244,6 +5586,12 @@ void UNPCAutonomyComponent::HandleEmbodiedResponseRequested(const FNPCEmbodiedRe
 		&& Policy != TEXT("transition"))
 	{
 		Policy = TEXT("stop");
+	}
+	const bool bSeatedConversationResponse = IsSeatedConversationActive();
+	if (bSeatedConversationResponse
+		&& (Policy == TEXT("soft_pause") || Policy == TEXT("stop") || Policy == TEXT("transition")))
+	{
+		Policy = TEXT("continue");
 	}
 
 	const FString PropIntent = Signal.PropIntent.TrimStartAndEnd().ToLower();
@@ -5385,6 +5733,13 @@ void UNPCAutonomyComponent::HandleEmbodiedResponseRequested(const FNPCEmbodiedRe
 	if (bLocalStartleTriggered && bTerminatesPreservedActivity && !bGestureHandledInternally)
 	{
 		bGestureHandledInternally = TryExecuteStandaloneStartleReaction();
+	}
+	if (bSeatedConversationResponse
+		&& bPreservedActivityStillRunning
+		&& !bTerminatesPreservedActivity
+		&& Signal.bHasSpokenReply)
+	{
+		PlaySeatedConversationPerformance();
 	}
 
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
@@ -5818,6 +6173,34 @@ void UNPCAutonomyComponent::HandleActionQueueFinished(bool bSuccess)
 
 	switch (RuntimePhase)
 	{
+	case ENPCAutonomyRuntimePhase::SocialSeatEntering:
+		if (bSuccess && ActionQueueComponent && ActionQueueComponent->IsNPCSeated())
+		{
+			BeginSeatedConversationSession();
+		}
+		else
+		{
+			const bool bPreserveSuspendedPlan = ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended;
+			ResetSeatedConversationState();
+			FinishActivity(!bPreserveSuspendedPlan);
+		}
+		break;
+
+	case ENPCAutonomyRuntimePhase::SocialSeatSession:
+		if (bSuccess)
+		{
+			QueueSeatedConversationAnimation(false);
+		}
+		else
+		{
+			BeginSeatedConversationExit(TEXT("seated_animation_failed"), true);
+		}
+		break;
+
+	case ENPCAutonomyRuntimePhase::SocialSeatExiting:
+		CompleteSeatedConversationExit(bSuccess);
+		break;
+
 	case ENPCAutonomyRuntimePhase::BuiltInQueue:
 		if (bSuccess)
 		{

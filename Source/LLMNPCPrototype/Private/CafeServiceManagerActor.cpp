@@ -56,6 +56,11 @@ ACafeServiceManagerActor::ACafeServiceManagerActor()
 	SocialMemoryMinimumImportance = 0.45f;
 	SocialMemoryAttentionAvailability = 0.85f;
 	bServiceStarted = false;
+	bPlayerInTableArea = false;
+	bSeatingGuidanceCompleted = false;
+	bGuideInProgress = false;
+	CurrentGuideTargetID = TEXT("");
+	LastCompletedServiceTableID = TEXT("");
 	MaidMoveComponent = nullptr;
 	PlayerSeatComponent = nullptr;
 	MaidActionQueueComponent = nullptr;
@@ -79,6 +84,218 @@ void ACafeServiceManagerActor::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 	UpdatePostServiceSocialOpportunity(DeltaSeconds);
+}
+
+ACafeServiceManagerActor* ACafeServiceManagerActor::FindForWorld(
+	const UObject* WorldContextObject,
+	const AActor* MaidActor)
+{
+	UWorld* World = WorldContextObject ? WorldContextObject->GetWorld() : nullptr;
+	if (!World)
+	{
+		return nullptr;
+	}
+
+	ACafeServiceManagerActor* FirstManager = nullptr;
+	for (TActorIterator<ACafeServiceManagerActor> It(World); It; ++It)
+	{
+		ACafeServiceManagerActor* Candidate = *It;
+		if (!Candidate)
+		{
+			continue;
+		}
+		if (!FirstManager)
+		{
+			FirstManager = Candidate;
+		}
+		if (!MaidActor || Candidate->MaidNPCActor == MaidActor)
+		{
+			return Candidate;
+		}
+	}
+
+	return MaidActor ? nullptr : FirstManager;
+}
+
+FCafeServiceSnapshot ACafeServiceManagerActor::GetServiceSnapshot() const
+{
+	FCafeServiceSnapshot Snapshot;
+	Snapshot.State = CurrentState;
+	Snapshot.StateName = GetStateName(CurrentState);
+	Snapshot.bServiceStarted = bServiceStarted;
+	Snapshot.bPlayerInTableArea = bPlayerInTableArea;
+	Snapshot.bSeatingGuidanceCompleted = bSeatingGuidanceCompleted;
+	Snapshot.bGuideInProgress = bGuideInProgress
+		|| (MaidMoveComponent && MaidMoveComponent->IsGuidingPlayer());
+	Snapshot.CurrentGuideTargetID = Snapshot.bGuideInProgress && MaidMoveComponent
+		? MaidMoveComponent->GetCurrentGuideTargetID().TrimStartAndEnd()
+		: CurrentGuideTargetID.TrimStartAndEnd();
+	Snapshot.bPlayerSeated = PlayerSeatComponent && PlayerSeatComponent->bIsSeated;
+	Snapshot.bSeatedForService = Snapshot.bPlayerSeated || bSeatingGuidanceCompleted;
+	Snapshot.CurrentTableID = TargetTableID.TrimStartAndEnd();
+	if (Snapshot.CurrentTableID.IsEmpty() && PlayerSeatComponent)
+	{
+		Snapshot.CurrentTableID = PlayerSeatComponent->CurrentTableID.TrimStartAndEnd();
+	}
+	Snapshot.bMealCompletionConfirmationPending = bAwaitingMealCompletionConfirmation;
+	Snapshot.MealCompletionTableID = PendingDepartureTableID.TrimStartAndEnd();
+	Snapshot.bDiningServiceCompleted = bDepartureConfirmedForCurrentVisit;
+	Snapshot.CompletedServiceTableID = LastCompletedServiceTableID.TrimStartAndEnd();
+	return Snapshot;
+}
+
+FString ACafeServiceManagerActor::GetUnifiedServiceStateName() const
+{
+	const FCafeServiceSnapshot Snapshot = GetServiceSnapshot();
+	if (Snapshot.bMealCompletionConfirmationPending)
+	{
+		return TEXT("awaiting_meal_completion_confirmation");
+	}
+	if (Snapshot.bDiningServiceCompleted)
+	{
+		return TEXT("post_meal");
+	}
+	if (Snapshot.bGuideInProgress || CurrentState == ECafeServiceState::GuidingToSeat)
+	{
+		return TEXT("guiding");
+	}
+	if (Snapshot.bPlayerInTableArea)
+	{
+		return TEXT("in_table_area");
+	}
+	if (Snapshot.bSeatedForService || CurrentState == ECafeServiceState::WaitingForOrder)
+	{
+		return TEXT("seated");
+	}
+	if (CurrentState == ECafeServiceState::OrderReceived
+		|| CurrentState == ECafeServiceState::GoingToCounter
+		|| CurrentState == ECafeServiceState::DeliveringOrder)
+	{
+		return TEXT("order_in_progress");
+	}
+	if (CurrentState == ECafeServiceState::Served)
+	{
+		return TEXT("served");
+	}
+	return TEXT("reception");
+}
+
+void ACafeServiceManagerActor::SynchronizeActionQueueState(
+	bool bInPlayerTableArea,
+	bool bGuidanceCompleted,
+	const FString& TableID,
+	bool bInGuideProgress,
+	const FString& GuideTargetID)
+{
+	const bool bWasGuideInProgress = bGuideInProgress;
+	const bool bChanged = bPlayerInTableArea != bInPlayerTableArea
+		|| bSeatingGuidanceCompleted != bGuidanceCompleted
+		|| bGuideInProgress != bInGuideProgress
+		|| !CurrentGuideTargetID.Equals(GuideTargetID, ESearchCase::IgnoreCase);
+
+	bPlayerInTableArea = bInPlayerTableArea;
+	bSeatingGuidanceCompleted = bGuidanceCompleted;
+	bGuideInProgress = bInGuideProgress;
+	CurrentGuideTargetID = bInGuideProgress ? GuideTargetID.TrimStartAndEnd() : TEXT("");
+
+	const FString ResolvedTableID = TableID.TrimStartAndEnd();
+	const FString ResolvedGuideTargetID = GuideTargetID.TrimStartAndEnd();
+	if (!ResolvedTableID.IsEmpty())
+	{
+		TargetTableID = ResolvedTableID;
+	}
+	else if (bInGuideProgress && ResolvedGuideTargetID.StartsWith(TEXT("Table"), ESearchCase::IgnoreCase))
+	{
+		TargetTableID = ResolvedGuideTargetID;
+	}
+
+	const bool bCanEnterGuideState = bServiceStarted
+		&& (CurrentState == ECafeServiceState::MaidApproachingPlayer
+			|| CurrentState == ECafeServiceState::ReceptionGreeting
+			|| CurrentState == ECafeServiceState::WaitingForReceptionResponse
+			|| CurrentState == ECafeServiceState::SelectingSeat
+			|| CurrentState == ECafeServiceState::GuidingToSeat);
+	if (bInGuideProgress && bCanEnterGuideState && CurrentState != ECafeServiceState::GuidingToSeat)
+	{
+		bCurrentWantsDining = true;
+		CurrentPartySize = FMath::Max(CurrentPartySize, 1);
+		SetState(ECafeServiceState::GuidingToSeat);
+	}
+	else if (bGuidanceCompleted
+		&& (CurrentState == ECafeServiceState::GuidingToSeat
+			|| CurrentState == ECafeServiceState::WaitingForReceptionResponse
+			|| CurrentState == ECafeServiceState::SelectingSeat))
+	{
+		SetState(ECafeServiceState::WaitingForPlayerSeated);
+	}
+	else if (bWasGuideInProgress
+		&& !bInGuideProgress
+		&& !bGuidanceCompleted
+		&& CurrentState == ECafeServiceState::GuidingToSeat)
+	{
+		SetState(ECafeServiceState::WaitingForReceptionResponse);
+	}
+
+	if (bChanged)
+	{
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[CafeServiceSync] execution state updated. State=%s Table=%s InArea=%s SeatedGuide=%s Guiding=%s GuideTarget=%s"),
+			*GetStateName(CurrentState),
+			TargetTableID.IsEmpty() ? TEXT("none") : *TargetTableID,
+			bPlayerInTableArea ? TEXT("true") : TEXT("false"),
+			bSeatingGuidanceCompleted ? TEXT("true") : TEXT("false"),
+			bGuideInProgress ? TEXT("true") : TEXT("false"),
+			CurrentGuideTargetID.IsEmpty() ? TEXT("none") : *CurrentGuideTargetID);
+	}
+}
+
+void ACafeServiceManagerActor::NotifyGuideExecutionArrived(const FString& TableID)
+{
+	const FString ResolvedTableID = TableID.TrimStartAndEnd();
+	if (!ResolvedTableID.IsEmpty())
+	{
+		TargetTableID = ResolvedTableID;
+	}
+	bGuideInProgress = false;
+	CurrentGuideTargetID.Reset();
+	bSeatingGuidanceCompleted = true;
+	if (CurrentState == ECafeServiceState::GuidingToSeat
+		|| CurrentState == ECafeServiceState::SelectingSeat
+		|| CurrentState == ECafeServiceState::WaitingForReceptionResponse)
+	{
+		SetState(ECafeServiceState::WaitingForPlayerSeated);
+	}
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[CafeServiceSync] guide arrival accepted. State=%s Table=%s"),
+		*GetStateName(CurrentState),
+		TargetTableID.IsEmpty() ? TEXT("none") : *TargetTableID);
+
+	if (PlayerSeatComponent && PlayerSeatComponent->bIsSeated)
+	{
+		HandlePlayerSeated(PlayerSeatComponent->CurrentSeatID, PlayerSeatComponent->CurrentTableID);
+	}
+}
+
+void ACafeServiceManagerActor::NotifyPlayerTableAreaChanged(bool bInArea, const FString& TableID)
+{
+	bPlayerInTableArea = bInArea;
+	const FString ResolvedTableID = TableID.TrimStartAndEnd();
+	if (bInArea && !ResolvedTableID.IsEmpty())
+	{
+		TargetTableID = ResolvedTableID;
+	}
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[CafeServiceSync] player table area changed. InArea=%s Table=%s State=%s"),
+		bPlayerInTableArea ? TEXT("true") : TEXT("false"),
+		ResolvedTableID.IsEmpty() ? TEXT("none") : *ResolvedTableID,
+		*GetStateName(CurrentState));
 }
 
 void ACafeServiceManagerActor::StartServiceForPlayer(AActor* PlayerActor)
@@ -124,6 +341,11 @@ void ACafeServiceManagerActor::StartServiceForPlayer(AActor* PlayerActor)
 
 	CurrentPlayerActor = PlayerActor;
 	TargetTableID = TEXT("");
+	bPlayerInTableArea = false;
+	bSeatingGuidanceCompleted = false;
+	bGuideInProgress = false;
+	CurrentGuideTargetID = TEXT("");
+	LastCompletedServiceTableID = TEXT("");
 	CurrentPartySize = 0;
 	bCurrentWantsDining = false;
 	bOrderServedForCurrentVisit = false;
@@ -231,11 +453,16 @@ void ACafeServiceManagerActor::SubmitReceptionResponse(int32 PartySize, bool bWa
 	}
 
 	TargetTableID = BestTable->GetTableID();
+	bSeatingGuidanceCompleted = false;
+	bGuideInProgress = true;
+	CurrentGuideTargetID = TargetTableID;
 	RequestMaidSpeech(FText::FromString(TEXT("承知しました。お席までご案内します。")));
 	SetState(ECafeServiceState::GuidingToSeat);
 
 	if (!MaidMoveComponent || !MaidMoveComponent->StartGuideToTable(TargetTableID))
 	{
+		bGuideInProgress = false;
+		CurrentGuideTargetID = TEXT("");
 		PrintDebugMessage(TEXT("Failed to start table guide movement"), FColor::Red);
 		SetState(ECafeServiceState::WaitingForReceptionResponse);
 	}
@@ -262,6 +489,11 @@ void ACafeServiceManagerActor::ResetService()
 
 	CurrentPlayerActor = nullptr;
 	TargetTableID = TEXT("");
+	bPlayerInTableArea = false;
+	bSeatingGuidanceCompleted = false;
+	bGuideInProgress = false;
+	CurrentGuideTargetID = TEXT("");
+	LastCompletedServiceTableID = TEXT("");
 	CurrentPartySize = 0;
 	bCurrentWantsDining = false;
 	bServiceStarted = false;
@@ -382,13 +614,21 @@ void ACafeServiceManagerActor::HandleMaidMoveCompleted(FName MoveReason, FString
 
 	if (CurrentState == ECafeServiceState::GuidingToSeat && MoveReason == FName(TEXT("Table")))
 	{
+		bGuideInProgress = false;
+		CurrentGuideTargetID = TEXT("");
 		if (bSuccess)
 		{
+			if (!TargetID.TrimStartAndEnd().IsEmpty())
+			{
+				TargetTableID = TargetID.TrimStartAndEnd();
+			}
+			bSeatingGuidanceCompleted = true;
 			SetState(ECafeServiceState::WaitingForPlayerSeated);
 			RequestMaidSpeech(FText::FromString(TEXT("こちらのお席へどうぞ。ごゆっくりお過ごしください。")));
 		}
 		else
 		{
+			bSeatingGuidanceCompleted = false;
 			PrintDebugMessage(FString::Printf(TEXT("Maid failed to reach table: %s"), *TargetID), FColor::Red);
 			SetState(ECafeServiceState::WaitingForReceptionResponse);
 		}
@@ -398,8 +638,26 @@ void ACafeServiceManagerActor::HandleMaidMoveCompleted(FName MoveReason, FString
 void ACafeServiceManagerActor::HandlePlayerSeated(FString SeatID, FString TableID)
 {
 	ClearPendingDeparture();
-	if (CurrentState == ECafeServiceState::WaitingForPlayerSeated && TableID == TargetTableID)
+	const FString ResolvedTableID = TableID.TrimStartAndEnd();
+	const bool bMatchesTarget = TargetTableID.TrimStartAndEnd().IsEmpty()
+		|| ResolvedTableID.IsEmpty()
+		|| ResolvedTableID.Equals(TargetTableID.TrimStartAndEnd(), ESearchCase::IgnoreCase);
+	const bool bCanAdvanceToOrdering = bServiceStarted
+		&& bMatchesTarget
+		&& (CurrentState == ECafeServiceState::WaitingForPlayerSeated
+			|| CurrentState == ECafeServiceState::GuidingToSeat
+			|| CurrentState == ECafeServiceState::WaitingForReceptionResponse
+			|| CurrentState == ECafeServiceState::SelectingSeat);
+	if (bCanAdvanceToOrdering)
 	{
+		if (!ResolvedTableID.IsEmpty())
+		{
+			TargetTableID = ResolvedTableID;
+		}
+		bPlayerInTableArea = true;
+		bSeatingGuidanceCompleted = true;
+		bGuideInProgress = false;
+		CurrentGuideTargetID = TEXT("");
 		if (MemoryComponent->bRunRecallValidationWhenPlayerSits)
 		{
 			FNPCMemoryEntry RecalledMemory;
@@ -422,7 +680,26 @@ void ACafeServiceManagerActor::HandlePlayerSeated(FString SeatID, FString TableI
 			0.4f,
 			false);
 		SetState(ECafeServiceState::WaitingForOrder);
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[CafeServiceSync] player seating accepted. Seat=%s Table=%s State=%s"),
+			*SeatID,
+			TargetTableID.IsEmpty() ? TEXT("none") : *TargetTableID,
+			*GetStateName(CurrentState));
 		RequestMaidSpeech(FText::FromString(TEXT("ご注文が決まりましたら、いつでもお声がけください。")));
+	}
+	else
+	{
+		UE_LOG(
+			LogTemp,
+			Warning,
+			TEXT("[CafeServiceSync] player seating did not advance service. State=%s Seat=%s Table=%s TargetTable=%s Match=%s"),
+			*GetStateName(CurrentState),
+			*SeatID,
+			ResolvedTableID.IsEmpty() ? TEXT("none") : *ResolvedTableID,
+			TargetTableID.IsEmpty() ? TEXT("none") : *TargetTableID,
+			bMatchesTarget ? TEXT("true") : TEXT("false"));
 	}
 }
 
@@ -452,12 +729,14 @@ void ACafeServiceManagerActor::HandlePlayerLeftSeat(FString SeatID, FString Tabl
 void ACafeServiceManagerActor::HandleOrderStarted(FString TableID, FString Item)
 {
 	ClearPendingDeparture();
-	if (MaidActionQueueComponent)
+	const FString ResolvedTableID = TableID.TrimStartAndEnd();
+	if (!ResolvedTableID.IsEmpty())
 	{
-		MaidActionQueueComponent->SetDiningServiceCompleted(false, TEXT(""));
+		TargetTableID = ResolvedTableID;
 	}
 	bOrderServedForCurrentVisit = false;
 	bDepartureConfirmedForCurrentVisit = false;
+	LastCompletedServiceTableID = TEXT("");
 	bSocialApproachConsumed = false;
 	SocialLookHeldSeconds = 0.0f;
 	SocialAwaySinceWorldTime = -1.0;
@@ -474,8 +753,14 @@ void ACafeServiceManagerActor::HandleOrderStarted(FString TableID, FString Item)
 
 void ACafeServiceManagerActor::HandleOrderServed(FString TableID, FString Item)
 {
+	const FString ResolvedTableID = TableID.TrimStartAndEnd();
+	if (!ResolvedTableID.IsEmpty())
+	{
+		TargetTableID = ResolvedTableID;
+	}
 	bOrderServedForCurrentVisit = true;
 	bDepartureConfirmedForCurrentVisit = false;
+	LastCompletedServiceTableID = TEXT("");
 	const FString ResolvedItem = Item.TrimStartAndEnd().IsEmpty() ? TEXT("the order") : Item.TrimStartAndEnd();
 	LastServedItem = ResolvedItem;
 	LastOrderServedWorldTime = GetWorld() ? GetWorld()->GetTimeSeconds() : -1.0;
@@ -928,10 +1213,6 @@ void ACafeServiceManagerActor::ClearPendingDeparture()
 	OutsideTableAreaSinceWorldTime = -1.0;
 	bAwaitingMealCompletionConfirmation = false;
 	bMaidApproachingForMealConfirmation = false;
-	if (MaidActionQueueComponent)
-	{
-		MaidActionQueueComponent->SetMealCompletionConfirmationPending(false, TEXT(""));
-	}
 }
 
 void ACafeServiceManagerActor::ScheduleMealCompletionConfirmation()
@@ -944,10 +1225,6 @@ void ACafeServiceManagerActor::ScheduleMealCompletionConfirmation()
 	}
 
 	bAwaitingMealCompletionConfirmation = true;
-	if (MaidActionQueueComponent)
-	{
-		MaidActionQueueComponent->SetMealCompletionConfirmationPending(true, PendingDepartureTableID);
-	}
 
 	UWorld* World = GetWorld();
 	const float DelaySeconds = FMath::Max(MealCompletionApproachDelaySeconds, 6.0f);
@@ -986,10 +1263,6 @@ void ACafeServiceManagerActor::BeginMealCompletionConfirmation()
 		World->GetTimerManager().ClearTimer(DepartureEvaluationTimerHandle);
 	}
 	bAwaitingMealCompletionConfirmation = true;
-	if (MaidActionQueueComponent)
-	{
-		MaidActionQueueComponent->SetMealCompletionConfirmationPending(true, PendingDepartureTableID);
-	}
 	if (AutonomyComponent)
 	{
 		AutonomyComponent->NotifyPlayerInteraction();
@@ -1063,6 +1336,8 @@ void ACafeServiceManagerActor::ConfirmPlayerDeparture()
 	const FString ConfirmedSeatID = PendingDepartureSeatID;
 	const FString ConfirmedTableID = PendingDepartureTableID;
 	bDepartureConfirmedForCurrentVisit = true;
+	LastCompletedServiceTableID = ConfirmedTableID;
+	bPlayerInTableArea = false;
 	ClearPendingDeparture();
 	if (MaidActionQueueComponent)
 	{
@@ -1110,9 +1385,22 @@ const ATableMarkerActor* ACafeServiceManagerActor::FindTableByID(const FString& 
 
 void ACafeServiceManagerActor::SetState(ECafeServiceState NewState)
 {
+	const ECafeServiceState PreviousState = CurrentState;
 	CurrentState = NewState;
 	OnCafeServiceStateChanged.Broadcast(CurrentState);
 	PrintDebugMessage(FString::Printf(TEXT("Cafe state: %s"), *GetStateName(CurrentState)), FColor::Cyan);
+	const FCafeServiceSnapshot Snapshot = GetServiceSnapshot();
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[CafeServiceState] %s -> %s | Unified=%s Table=%s InArea=%s Seated=%s Guiding=%s"),
+		*GetStateName(PreviousState),
+		*GetStateName(CurrentState),
+		*GetUnifiedServiceStateName(),
+		Snapshot.CurrentTableID.IsEmpty() ? TEXT("none") : *Snapshot.CurrentTableID,
+		Snapshot.bPlayerInTableArea ? TEXT("true") : TEXT("false"),
+		Snapshot.bPlayerSeated ? TEXT("true") : TEXT("false"),
+		Snapshot.bGuideInProgress ? TEXT("true") : TEXT("false"));
 }
 
 void ACafeServiceManagerActor::RequestReceptionGreetingAfterDelay(const FText& SpeechText)

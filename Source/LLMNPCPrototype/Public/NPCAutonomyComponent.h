@@ -23,6 +23,9 @@ enum class ENPCAutonomyRuntimePhase : uint8
 	None,
 	EmotionReaction,
 	BuiltInQueue,
+	SocialSeatEntering,
+	SocialSeatSession,
+	SocialSeatExiting,
 	BlueprintPreMove,
 	BlueprintExecuting,
 	BlueprintReturnMove
@@ -218,6 +221,12 @@ public:
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat", meta = (ClampMin = "0.0", ClampMax = "10.0"))
 	float SeatedConversationOpeningDelaySeconds;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat", meta = (ClampMin = "15.0", ClampMax = "600.0"))
+	float SeatedConversationInactivityTimeoutSeconds;
+
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|Seat", meta = (ClampMin = "1", ClampMax = "4"))
+	int32 SeatedConversationIdleLoopsPerCycle;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Autonomy|LLM")
 	FString AutonomyModelName;
@@ -514,6 +523,12 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Autonomy|Seat")
 	bool IsSeatInvitationPending() const;
 
+	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Autonomy|Seat")
+	bool IsSeatedConversationActive() const;
+
+	UFUNCTION(BlueprintCallable, Category = "NPC Autonomy|Seat")
+	bool RequestEndSeatedConversation(const FString& Reason = TEXT("player_requested_end"));
+
 	void NotifyNPCEnteredSeat(const FString& SeatID);
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Autonomy")
@@ -594,6 +609,7 @@ private:
 	FTimerHandle InteractiveFacingFallbackTimerHandle;
 	FTimerHandle SeatInvitationTimeoutTimerHandle;
 	FTimerHandle SeatedConversationOpeningTimerHandle;
+	FTimerHandle SeatedConversationInactivityTimerHandle;
 	bool bDecisionPending;
 	bool bAppraisalPending;
 	bool bActivityRunning;
@@ -614,9 +630,12 @@ private:
 	bool bSeatInvitationApproachInProgress;
 	bool bSeatInvitationPending;
 	bool bSeatInvitationAcceptedForStart;
+	bool bSeatedConversationPerformancePending;
+	bool bSeatedConversationExitWasInterrupted;
 	int32 SeatedConversationOpeningAttempts;
 	FString PendingInteractiveActivityID;
 	FString PendingSeatInvitationSeatID;
+	FString SeatedConversationExitReason;
 	bool bBlinkFollowUpPending;
 	int32 PendingDecisionRequestId;
 	int32 PendingAppraisalRequestId;
@@ -630,6 +649,7 @@ private:
 	double PlanningSuppressedUntilWorldTime;
 	double LastPlayerSpeechWorldTime;
 	double LastPlayerSpeechStartleWorldTime;
+	double SeatedConversationStartedWorldTime;
 	double ExpressionBlendStartWorldTime;
 	float ExpressionBlendDurationSeconds;
 	float PendingStartleFocus;
@@ -683,6 +703,14 @@ private:
 	void PresentSeatInvitation();
 	void HandleSeatInvitationTimeout();
 	void BeginSeatedConversationOpening();
+	void BeginSeatedConversationSession();
+	void QueueSeatedConversationAnimation(bool bConversationPerformance);
+	void PlaySeatedConversationPerformance();
+	void RefreshSeatedConversationInactivityTimeout();
+	void HandleSeatedConversationInactivityTimeout();
+	void BeginSeatedConversationExit(const FString& Reason, bool bInterrupted);
+	void CompleteSeatedConversationExit(bool bSuccess);
+	void ResetSeatedConversationState();
 	void CancelSeatInvitation(
 		const FString& Reason,
 		bool bClearPlan,

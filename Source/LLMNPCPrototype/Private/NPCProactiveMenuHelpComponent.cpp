@@ -2,10 +2,10 @@
 
 #include "NPCProactiveMenuHelpComponent.h"
 
+#include "CafeServiceManagerActor.h"
 #include "NPCPersonaProfile.h"
 
 #include "LLMClient.h"
-#include "NPCActionQueueComponent.h"
 
 UNPCProactiveMenuHelpComponent::UNPCProactiveMenuHelpComponent()
 {
@@ -26,13 +26,17 @@ UNPCProactiveMenuHelpComponent::UNPCProactiveMenuHelpComponent()
 
 void UNPCProactiveMenuHelpComponent::TriggerProactiveMenuHelp()
 {
-	if (UNPCActionQueueComponent::IsLastKnownDiningServiceCompleted())
+	const ACafeServiceManagerActor* ServiceManager = ACafeServiceManagerActor::FindForWorld(this);
+	const FCafeServiceSnapshot ServiceSnapshot = ServiceManager
+		? ServiceManager->GetServiceSnapshot()
+		: FCafeServiceSnapshot();
+	if (ServiceSnapshot.bDiningServiceCompleted)
 	{
 		UE_LOG(LogTemp, Log, TEXT("[ProactiveHelp] suppressed because the current dining service is already complete."));
 		return;
 	}
 
-	if (UNPCActionQueueComponent::IsLastKnownMealCompletionConfirmationPending())
+	if (ServiceSnapshot.bMealCompletionConfirmationPending)
 	{
 		UE_LOG(LogTemp, Log, TEXT("[ProactiveHelp] suppressed while meal completion confirmation is pending."));
 		return;

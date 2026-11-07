@@ -204,6 +204,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void StopActionQueue();
 
+	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Seat")
+	bool StopActionQueuePreservingSeat();
+
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Animation")
 	bool PauseActiveQueuedAnimation();
 
@@ -339,12 +342,6 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void NotifyPlayerDepartureConfirmed(const FString& TableID);
 
-	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
-	void SetMealCompletionConfirmationPending(bool bPending, const FString& TableID);
-
-	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
-	void SetDiningServiceCompleted(bool bCompleted, const FString& TableID);
-
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
 	FString GetCurrentServiceTableID() const;
 
@@ -380,26 +377,6 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void NotifyServiceGestureFinished(const FString& GestureName);
-
-	static bool IsLastKnownSeatedForService();
-
-	static bool IsLastKnownPlayerInTableArea();
-
-	static bool IsLastKnownGuidePlayerInProgress();
-
-	static bool IsLastKnownSeatingGuidanceCompleted();
-
-	static FString GetLastKnownCurrentServiceTableID();
-
-	static FString GetLastKnownGuideTargetID();
-
-	static bool IsLastKnownMealCompletionConfirmationPending();
-
-	static FString GetLastKnownMealCompletionConfirmationTableID();
-
-	static bool IsLastKnownDiningServiceCompleted();
-
-	static FString GetLastKnownCompletedServiceTableID();
 
 protected:
 	virtual void BeginPlay() override;
@@ -481,6 +458,10 @@ private:
 	TObjectPtr<AFurnitureMarkerActor> ReservedSeat;
 
 	bool bNPCIsSeated;
+	bool bHasDeferredStrategyAction;
+	FString DeferredStrategyActionType;
+	FString DeferredStrategyActionItem;
+	int32 DeferredStrategyActionQuantity;
 
 	TWeakObjectPtr<UAnimMontage> BlockingGestureMontageBeforeRequest;
 
@@ -507,6 +488,7 @@ private:
 	FTimerHandle PostSeatingMenuGuidanceTimerHandle;
 
 	FTimerHandle PostSeatingMenuHelpEnableTimerHandle;
+	FTimerHandle DeferredStrategyActionTimerHandle;
 
 	UPROPERTY(Transient)
 	UNPCMoveToTableComponent* MoveComponent;
@@ -518,12 +500,14 @@ private:
 	UNPCFoodCarryComponent* FoodCarryComponent;
 
 	void CacheOwnerComponents();
+	void DeferStrategyActionUntilStanding(const FString& ActionType, const FString& Item, int32 Quantity);
+	void TryExecuteDeferredStrategyAction();
 
 	UNPCFoodCarryComponent* ResolveFoodCarryComponent();
 
 	void CancelFollowingForExplicitCommand();
 
-	void UpdateLastKnownServiceState() const;
+	void PublishServiceExecutionState() const;
 	bool CancelReceptionForExplicitNPCCommand(const FString& Reason) const;
 
 	void BindMoveCompletedEvent();
@@ -673,26 +657,6 @@ private:
 	void HandlePostSeatingMenuGuidanceTimerFinished();
 
 	void HandlePostSeatingMenuHelpEnableTimerFinished();
-
-	static bool bLastKnownSeatedForService;
-
-	static bool bLastKnownPlayerInTableArea;
-
-	static bool bLastKnownGuidePlayerInProgress;
-
-	static bool bLastKnownSeatingGuidanceCompleted;
-
-	static FString LastKnownCurrentServiceTableID;
-
-	static FString LastKnownGuideTargetID;
-
-	static bool bLastKnownMealCompletionConfirmationPending;
-
-	static FString LastKnownMealCompletionConfirmationTableID;
-
-	static bool bLastKnownDiningServiceCompleted;
-
-	static FString LastKnownCompletedServiceTableID;
 
 	static bool bSuppressNextOrderConfirmSpeechForStrategyReply;
 
