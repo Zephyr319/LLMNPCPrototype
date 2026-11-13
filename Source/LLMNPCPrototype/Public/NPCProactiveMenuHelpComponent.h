@@ -16,8 +16,16 @@ class LLMNPCPROTOTYPE_API UNPCProactiveMenuHelpComponent : public UActorComponen
 public:
 	UNPCProactiveMenuHelpComponent();
 
+	virtual void BeginPlay() override;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Proactive Menu Help")
 	bool bUseStrategyMode;
+
+	// The NPC blueprint keeps its own bUseStrategyMode (toggled by the M key) whose default is false, which
+	// means a fresh PIE session starts in plain chat and every strategy mechanism (orders, release, ...)
+	// is silently off. When true, BeginPlay sets that blueprint variable to true so M starts in Strategy Mode.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Proactive Menu Help")
+	bool bStartInStrategyMode;
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "NPC Proactive Menu Help")
 	bool bProactiveHelpOffered;

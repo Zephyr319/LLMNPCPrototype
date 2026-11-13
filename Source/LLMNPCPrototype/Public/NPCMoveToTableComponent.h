@@ -307,6 +307,12 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC|Guide")
 	FString GetCurrentGuideTargetID() const;
 
+	// Observation only. CurrentMoveTargetID is cleared when movement ends, so these keep what the last
+	// scene-target selection (by tag or ID) chose, letting later steps of an activity be attributed to it.
+	const FString& GetLastSelectedSceneTargetID() const { return LastSelectedSceneTargetID; }
+	const FName& GetLastSelectedSceneTargetReason() const { return LastSelectedSceneTargetReason; }
+	double GetLastSelectedSceneTargetWorldTime() const { return LastSelectedSceneTargetWorldTime; }
+
 	UFUNCTION(BlueprintCallable, Category = "Scene Target Movement")
 	bool MoveToFurnitureByID(const FString& FurnitureID);
 
@@ -371,6 +377,12 @@ private:
 	FName CurrentMoveReason;
 
 	FString CurrentMoveTargetID;
+
+	FString LastSelectedSceneTargetID;
+
+	FName LastSelectedSceneTargetReason;
+
+	double LastSelectedSceneTargetWorldTime = -1.0;
 
 	TWeakObjectPtr<AActor> FollowPlayerActor;
 

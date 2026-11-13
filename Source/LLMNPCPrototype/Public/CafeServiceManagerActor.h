@@ -46,6 +46,11 @@ struct LLMNPCPROTOTYPE_API FCafeServiceSnapshot
 	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
 	FString StateName = TEXT("Idle");
 
+	// Canonical workflow phase used by every LLM context. Unlike StateName, this deliberately
+	// excludes physical facts such as whether the player is currently seated or inside a table area.
+	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
+	FString PhaseName = TEXT("reception");
+
 	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
 	bool bServiceStarted = false;
 
@@ -55,6 +60,8 @@ struct LLMNPCPROTOTYPE_API FCafeServiceSnapshot
 	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
 	bool bPlayerSeated = false;
 
+	// Backward-compatible workflow readiness flag. This may remain true after the player stands up;
+	// use bPlayerSeated (or FCafePlayerSnapshot::bSeated) for the player's actual posture.
 	UPROPERTY(BlueprintReadOnly, Category = "Cafe Service")
 	bool bSeatedForService = false;
 

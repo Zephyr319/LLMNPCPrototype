@@ -1348,6 +1348,9 @@ bool UNPCMoveToTableComponent::MoveToSceneTargetByID(const FString& TargetID)
 		AWaterablePlantActor* Plant = *It;
 		if (Plant && Plant->bEnabled && Plant->PlantID.Equals(TargetID, ESearchCase::IgnoreCase))
 		{
+			LastSelectedSceneTargetID = Plant->PlantID;
+			LastSelectedSceneTargetReason = TEXT("WaterablePlant");
+			LastSelectedSceneTargetWorldTime = World->GetTimeSeconds();
 			return StartMovingToWaterablePlant(Plant);
 		}
 	}
@@ -1367,6 +1370,13 @@ bool UNPCMoveToTableComponent::MoveToSceneTargetByID(const FString& TargetID)
 
 bool UNPCMoveToTableComponent::MoveToSceneTargetByTag(const FString& TargetTag)
 {
+	// "id:<TargetID>" pins the move to one specific scene target (used to keep a watering pass on the
+	// plant it was bound to instead of re-selecting by tag).
+	if (TargetTag.StartsWith(TEXT("id:"), ESearchCase::IgnoreCase))
+	{
+		return MoveToSceneTargetByID(TargetTag.Mid(3).TrimStartAndEnd());
+	}
+
 	LogMovementRequest(TEXT("MoveToSceneTargetByTag"), TargetTag);
 
 	if (BlockMovementStartIfServiceGesturePaused(TEXT("MoveToSceneTargetByTag"), TargetTag))
@@ -1516,6 +1526,9 @@ bool UNPCMoveToTableComponent::MoveToSceneTargetByTag(const FString& TargetTag)
 
 	if (bHasBestTarget)
 	{
+		LastSelectedSceneTargetID = BestTargetID;
+		LastSelectedSceneTargetReason = BestMoveReason;
+		LastSelectedSceneTargetWorldTime = World->GetTimeSeconds();
 		if (BestMoveReason == FName(TEXT("WaterablePlant")))
 		{
 			UE_LOG(
@@ -1836,13 +1849,30 @@ bool UNPCMoveToTableComponent::StartMovingToLocation(const FVector& MoveLocation
 
 	if (bUseNavigationPath && !BuildNavigationPathToTarget(Owner))
 	{
-		if (bRequireNavigationPath)
+		// Standing on the target already (for example at a seat she approached before asking to sit) yields no
+		// usable path. That is an arrival, not a failure: let the next tick finish the move through the normal
+		// arrival path instead of failing synchronously.
+		if (FVector::Dist2D(Owner->GetActorLocation(), TargetLocation) <= AcceptanceRadius)
+		{
+			CurrentPathPoints.Reset();
+			CurrentPathPoints.Add(TargetLocation);
+			CurrentPathIndex = 1;
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("[NPCMove] already at target; completing on next tick. Target=%s Reason=%s"),
+				*TargetID,
+				*MoveReason.ToString());
+		}
+		else if (bRequireNavigationPath)
 		{
 			FailMoveToTable(FString::Printf(TEXT("Scene target path failed: %s"), *TargetID));
 			return false;
 		}
-
-		PrintDebugMessage(TEXT("Nav path failed, using direct move"), FColor::Yellow);
+		else
+		{
+			PrintDebugMessage(TEXT("Nav path failed, using direct move"), FColor::Yellow);
+		}
 	}
 
 	bIsMovingToTable = true;
@@ -2976,6 +3006,13 @@ void UNPCMoveToTableComponent::FailMoveToTable(const FString& Message)
 			|| FailedMoveReason == FName(TEXT("player"))
 			|| FailedMoveReason == FName(TEXT("follow_player")));
 	const bool bFailedGuideMove = bIsGuidingPlayer && MovementMode == ENPCMovementMode::GuidePlayer;
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[NPCMove] move failed. Reason=%s Target=%s Message=%s"),
+		*FailedMoveReason.ToString(),
+		*FailedMoveTargetID,
+		*Message);
 	ClearMovementState();
 	if (bFailedFollowMove)
 	{

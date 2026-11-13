@@ -5,6 +5,7 @@
 #include "Animation/AnimSequenceBase.h"
 #include "Animation/MorphTarget.h"
 #include "CafeTargetPointActor.h"
+#include "CafeWorldSnapshotSubsystem.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Dom/JsonObject.h"
 #include "Dom/JsonValue.h"
@@ -19,6 +20,7 @@
 #include "NPCActionQueueComponent.h"
 #include "NPCFaceTargetComponent.h"
 #include "NPCFoodCarryComponent.h"
+#include "NPCMoveToTableComponent.h"
 #include "NPCAutonomyActionSet.h"
 #include "NPCEmotionComponent.h"
 #include "NPCMemoryComponent.h"
@@ -176,6 +178,8 @@ UNPCAutonomyComponent::UNPCAutonomyComponent()
 	SeatInvitationTimeoutSeconds = 25.0f;
 	SeatInvitationDeclineCooldownSeconds = 120.0f;
 	SeatInvitationText = TEXT("少しゆっくりお話ししたいのですが、向かいの席に座ってもいいですか？");
+	OrderWaitSelfReleaseLine = TEXT("ご注文はごゆっくりどうぞ。少しだけ作業に戻りますので、お決まりになりましたらお声がけください。");
+	OrderWaitNudgeLine = TEXT("ご注文はお決まりでしょうか。ごゆっくりお選びいただいて大丈夫です。お決まりになりましたらお声がけください。");
 	SitDownAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
 		TEXT("/Game/Characters/OriginalCafeMaid/Animations/Anim_KA_Sit_Start_OCM.Anim_KA_Sit_Start_OCM")));
 	SeatedIdleAnimation = TSoftObjectPtr<UAnimSequenceBase>(FSoftObjectPath(
@@ -346,6 +350,10 @@ void UNPCAutonomyComponent::BeginPlay()
 
 	ServiceManager = Cast<ACafeServiceManagerActor>(GetOwner());
 	ResolveReferences();
+	if (ExperimentCondition != ENPCExperimentCondition::Custom)
+	{
+		ApplyExperimentCondition(ExperimentCondition);
+	}
 	InitializeAutomaticBlinking();
 	SeedPositiveValidationMemory();
 	LoadedActionSet = ActionSet.LoadSynchronous();
@@ -446,6 +454,7 @@ void UNPCAutonomyComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	bAutonomyEnabled = false;
 	InterruptAutonomy(TEXT("end_play"));
+	ReleaseWaterBinding(TEXT("end_play"), false);
 	if (GPrimaryAutonomyComponent.Get() == this)
 	{
 		GPrimaryAutonomyComponent.Reset();
@@ -539,6 +548,12 @@ void UNPCAutonomyComponent::EvaluateAutonomyNow()
 		: 0.0f;
 	LastStateUpdateWorldTime = CurrentTime;
 	UpdateInternalState(DeltaSeconds);
+	if (BoundWaterPlant.IsValid()
+		&& !(bActivityRunning && CurrentActivityID.Equals(TEXT("water_flower"), ESearchCase::IgnoreCase)))
+	{
+		// Safety net: a reservation must never outlive the watering activity, whatever path ended it.
+		ReleaseWaterBinding(TEXT("watchdog_orphaned"), false);
+	}
 	if (EmotionComponent)
 	{
 		EmotionComponent->RefreshStateFromRealTime();
@@ -569,6 +584,11 @@ void UNPCAutonomyComponent::EvaluateAutonomyNow()
 	{
 		return;
 	}
+	if (bHoldNewStepsWhileReplyPending && CurrentTime < InteractiveRequestPendingUntilWorldTime)
+	{
+		// The customer just spoke and the reply is still being generated: do not walk off to a new step.
+		return;
+	}
 
 	if (ActivePlan.Status == ENPCAutonomyPlanStatus::Active
 		|| ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended)
@@ -576,17 +596,54 @@ void UNPCAutonomyComponent::EvaluateAutonomyNow()
 		const bool bWasSuspended = ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended;
 		if (bWasSuspended
 			&& ServiceManager
-			&& ServiceManager->CurrentState == ECafeServiceState::WaitingForOrder)
+			&& ServiceManager->CurrentState == ECafeServiceState::WaitingForOrder
+			&& !bSuspendedPlanReleased)
 		{
+			// The customer is still choosing: the suspended plan stays parked until the player releases her
+			// or has been silent long enough for her to excuse herself.
+			UpdateOrderWaitSilence(CurrentTime, true);
 			return;
 		}
-		if (TryStartCurrentPlanStep(bWasSuspended))
+		FString CompetitionDropReason;
+		if (bWasSuspended && bEnableConcernCompetition && ResolvePlanCompetition(CompetitionDropReason))
+		{
+			// Faded or outcompeted: let the planner decide again with the concern list in front of it.
+			ClearActivePlan(FString::Printf(TEXT("competition:%s"), *CompetitionDropReason));
+			MarkMeaningfulContextChange(TEXT("plan_competition"));
+		}
+		else
+		{
+		FString WaterStepInvalidReason;
+		const bool bCurrentStepIsWater = ActivePlan.Steps.IsValidIndex(ActivePlan.CurrentStepIndex)
+			&& ActivePlan.Steps[ActivePlan.CurrentStepIndex].TrimStartAndEnd().Equals(
+				TEXT("water_flower"), ESearchCase::IgnoreCase);
+		if (bCurrentStepIsWater && !ValidateWaterStepForResume(WaterStepInvalidReason))
+		{
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("[WaterResume] pre-resume validity check failed. Reason=%s Goal=%s Resume=%d"),
+				*WaterStepInvalidReason,
+				*ActivePlan.Goal,
+				bWasSuspended ? 1 : 0);
+		}
+		else if (TryStartCurrentPlanStep(bWasSuspended))
 		{
 			return;
 		}
 
-		ClearActivePlan(TEXT("plan_step_no_longer_available"));
+		ClearActivePlan(WaterStepInvalidReason.IsEmpty()
+			? FString::Printf(TEXT("plan_step_no_longer_available:%s"), *LastPlanStepFailureReason)
+			: FString::Printf(TEXT("water_step_invalid:%s"), *WaterStepInvalidReason));
 		MarkMeaningfulContextChange(TEXT("plan_invalid"));
+		}
+	}
+
+	if (ServiceManager
+		&& ServiceManager->CurrentState == ECafeServiceState::WaitingForOrder
+		&& ActivePlan.Status == ENPCAutonomyPlanStatus::None)
+	{
+		UpdateOrderWaitSilence(CurrentTime, false);
 	}
 
 	FString Trigger;
@@ -955,6 +1012,7 @@ void UNPCAutonomyComponent::InterruptAutonomy(const FString& Reason)
 		const bool bInterruptedAmbientActivity = bCurrentActivityIsAmbient;
 		const FNPCAutonomyActivityDefinition* InterruptedActivity = FindActivityDefinition(InterruptedActivityID);
 		ActivityCooldownUntil.Remove(InterruptedActivityID);
+		ReleaseWaterBinding(*FString::Printf(TEXT("interrupted:%s"), *Reason), false);
 		bInterruptingActivity = true;
 		bActivityRunning = false;
 		bCurrentActivityIsAmbient = false;
@@ -1131,6 +1189,39 @@ bool UNPCAutonomyComponent::IsAutonomyActivityRunning() const
 	return bActivityRunning;
 }
 
+FString UNPCAutonomyComponent::GetSpeechBodyRotationBlockReason() const
+{
+	if (!bActivityRunning)
+	{
+		// These standalone dialogue reactions may face the listener while animating.
+		if (ActionQueueComponent && ActionQueueComponent->HasActiveQueuedAnimation()
+			&& !ActionQueueComponent->IsPlayingQueuedAnimation(StartledReactionAnimation.Get())
+			&& !ActionQueueComponent->IsPlayingQueuedAnimation(ShushGestureAnimation.Get()))
+		{
+			return TEXT("queued_animation");
+		}
+		return FString();
+	}
+	if (CurrentActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase)
+		|| CurrentActivityID.Equals(TEXT("rest_on_sofa"), ESearchCase::IgnoreCase))
+	{
+		return TEXT("seated_activity_keep_seat_rotation");
+	}
+
+	const bool bIdleActivity = CurrentActivityID.Equals(TEXT("daydream_at_counter"), ESearchCase::IgnoreCase)
+		|| CurrentActivityID.Equals(TEXT("look_around"), ESearchCase::IgnoreCase)
+		|| CurrentActivityID.Equals(TEXT("idle"), ESearchCase::IgnoreCase)
+		|| CurrentActivityID.Equals(TEXT("wait"), ESearchCase::IgnoreCase);
+	if (bIdleActivity && RuntimePhase == ENPCAutonomyRuntimePhase::BuiltInQueue
+		&& (!ActionQueueComponent || !ActionQueueComponent->HasActiveQueuedAnimation()))
+	{
+		return FString();
+	}
+
+	// Watering, cleanup, prop use, blueprint tasks and their transitions retain task orientation.
+	return FString::Printf(TEXT("activity_keeps_body_rotation:%s"), *CurrentActivityID);
+}
+
 bool UNPCAutonomyComponent::HasProtectedTaskInProgress() const
 {
 	auto IsProtectedTask = [this](const FString& ActivityID)
@@ -1164,13 +1255,48 @@ UNPCAutonomyComponent* UNPCAutonomyComponent::GetPrimaryAutonomyComponent()
 	return GPrimaryAutonomyComponent.Get();
 }
 
-FString UNPCAutonomyComponent::BuildInteractiveDialogueContext()
+FString UNPCAutonomyComponent::BuildInteractiveDialogueContext(const FCafeWorldSnapshot* ExistingSnapshot)
 {
 	PreparePlayerSpeechStartle();
 
 	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
-	Root->SetBoolField(TEXT("activity_running_when_player_spoke"), bActivityRunning);
-	Root->SetStringField(TEXT("npc_location"), LastKnownNPCZone);
+	FCafeWorldSnapshot WorldSnapshot;
+	bool bHasWorldSnapshot = ExistingSnapshot != nullptr;
+	if (ExistingSnapshot)
+	{
+		WorldSnapshot = *ExistingSnapshot;
+	}
+	else if (UCafeWorldSnapshotSubsystem* SnapshotSubsystem = UCafeWorldSnapshotSubsystem::Get(this))
+	{
+		WorldSnapshot = SnapshotSubsystem->CaptureSnapshot(ServiceManager);
+		bHasWorldSnapshot = true;
+	}
+	Root->SetBoolField(
+		TEXT("activity_running_when_player_spoke"),
+		bHasWorldSnapshot ? WorldSnapshot.NPC.bActivityRunning : bActivityRunning);
+	Root->SetStringField(
+		TEXT("npc_location"),
+		bHasWorldSnapshot ? WorldSnapshot.NPC.Zone : LastKnownNPCZone);
+	if (bHasWorldSnapshot)
+	{
+		TSharedRef<FJsonObject> ServiceObject = MakeShared<FJsonObject>();
+		ServiceObject->SetStringField(TEXT("phase"), WorldSnapshot.Service.PhaseName);
+		ServiceObject->SetStringField(TEXT("raw_state"), WorldSnapshot.Service.StateName);
+		ServiceObject->SetBoolField(TEXT("guide_in_progress"), WorldSnapshot.Service.bGuideInProgress);
+		ServiceObject->SetStringField(TEXT("table_id"), WorldSnapshot.Service.CurrentTableID);
+		Root->SetObjectField(TEXT("service"), ServiceObject);
+
+		TSharedRef<FJsonObject> PlayerObject = MakeShared<FJsonObject>();
+		PlayerObject->SetBoolField(TEXT("exists"), WorldSnapshot.Player.bExists);
+		PlayerObject->SetBoolField(TEXT("present"), WorldSnapshot.Player.bInServiceScene);
+		PlayerObject->SetBoolField(TEXT("seated"), WorldSnapshot.Player.bSeated);
+		PlayerObject->SetBoolField(TEXT("in_table_area"), WorldSnapshot.Player.bInTableArea);
+		PlayerObject->SetStringField(TEXT("pose"), WorldSnapshot.Player.Pose);
+		PlayerObject->SetStringField(TEXT("activity"), WorldSnapshot.Player.Activity);
+		PlayerObject->SetStringField(TEXT("zone"), WorldSnapshot.Player.Zone);
+		PlayerObject->SetStringField(TEXT("table_id"), WorldSnapshot.Player.TableId);
+		Root->SetObjectField(TEXT("player"), PlayerObject);
+	}
 	if (IsSeatedConversationActive())
 	{
 		TSharedRef<FJsonObject> SessionObject = MakeShared<FJsonObject>();
@@ -1350,9 +1476,9 @@ FString UNPCAutonomyComponent::BuildInteractiveDialogueContext()
 	}
 	Root->SetArrayField(TEXT("recent_completed_activities_newest_first"), RecentActivityValues);
 
-	const FNPCEmotionState EmotionState = EmotionComponent
-		? EmotionComponent->GetCurrentState()
-		: FNPCEmotionState();
+	const FNPCEmotionState EmotionState = bHasWorldSnapshot && WorldSnapshot.bEmotionAvailable
+		? WorldSnapshot.Emotion
+		: EmotionComponent ? EmotionComponent->GetCurrentState() : FNPCEmotionState();
 	TSharedRef<FJsonObject> EmotionObject = MakeShared<FJsonObject>();
 	EmotionObject->SetStringField(TEXT("label"), EmotionState.EmotionLabel);
 	EmotionObject->SetStringField(TEXT("performance_tone"), ResolveCurrentPerformanceTone());
@@ -1370,6 +1496,21 @@ FString UNPCAutonomyComponent::BuildInteractiveDialogueContext()
 			TEXT("status"),
 			ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended ? TEXT("suspended") : TEXT("active"));
 		PlanObject->SetNumberField(TEXT("current_step_index"), ActivePlan.CurrentStepIndex);
+		if (ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended
+			&& ActivePlan.Steps.IsValidIndex(ActivePlan.CurrentStepIndex))
+		{
+			// What she would go back to if the player lets her leave (see player_released_npc).
+			const FString StepID = ActivePlan.Steps[ActivePlan.CurrentStepIndex].TrimStartAndEnd();
+			const FNPCAutonomyActivityDefinition* StepActivity = FindActivityDefinition(StepID);
+			PlanObject->SetStringField(
+				TEXT("interrupted_step"),
+				StepActivity && !StepActivity->DisplayName.IsEmpty() ? StepActivity->DisplayName.ToString() : StepID);
+			PlanObject->SetBoolField(
+				TEXT("waiting_for_player_release"),
+				ServiceManager
+					&& ServiceManager->CurrentState == ECafeServiceState::WaitingForOrder
+					&& !bSuspendedPlanReleased);
+		}
 		Root->SetObjectField(TEXT("active_plan"), PlanObject);
 	}
 
@@ -1784,7 +1925,9 @@ bool UNPCAutonomyComponent::HasOutstandingTask() const
 		if (Activity.bEnabled
 			&& Activity.Category == ENPCAutonomyActivityCategory::Task
 			&& !Activity.RequiredWorldStateTag.IsNone()
-			&& GetWorldStateTag(Activity.RequiredWorldStateTag))
+			&& GetWorldStateTag(Activity.RequiredWorldStateTag)
+			// Plants never create task pressure; whether to water is the LLM's optional choice.
+			&& !IsWaterActivity(Activity))
 		{
 			return true;
 		}
@@ -1831,6 +1974,25 @@ bool UNPCAutonomyComponent::ShouldRequestNewDecision(FString& OutTrigger) const
 		OutTrigger = TEXT("boredom_threshold");
 		return true;
 	}
+	if (bEnableConcernPressureTrigger
+		&& World->GetTimeSeconds() - LastConcernTriggerWorldTime >= ConcernTriggerCooldownSeconds)
+	{
+		// Concerns pile up quietly; planning starts only when they are strong enough together.
+		TArray<FNPCConcern> Concerns;
+		BuildConcerns(Concerns);
+		FString TopPlantId;
+		float PlantScore = 0.0f;
+		const float Pressure = ComputeConcernPressure(Concerns, &TopPlantId, &PlantScore);
+		if (PlantScore > 0.0f && Pressure >= ConcernTriggerPressure)
+		{
+			OutTrigger = FString::Printf(
+				TEXT("concern_pressure:%s:plant%.0f+boredom%.0f"),
+				*TopPlantId,
+				PlantScore,
+				MotiveState.Boredom);
+			return true;
+		}
+	}
 
 	return false;
 }
@@ -1863,6 +2025,10 @@ void UNPCAutonomyComponent::RequestNewDecision(const FString& Trigger)
 	if (const UWorld* World = GetWorld())
 	{
 		LastDecisionRequestWorldTime = World->GetTimeSeconds();
+		if (Trigger.StartsWith(TEXT("concern_pressure"), ESearchCase::IgnoreCase))
+		{
+			LastConcernTriggerWorldTime = World->GetTimeSeconds();
+		}
 	}
 	++TotalDecisionRequests;
 	TotalContextCharactersSent += LastDecisionContextJson.Len();
@@ -1889,6 +2055,991 @@ void UNPCAutonomyComponent::MarkMeaningfulContextChange(const FString& Trigger)
 {
 	bMeaningfulContextChangePending = true;
 	PendingDecisionTrigger = Trigger.TrimStartAndEnd();
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Concern competition: the unfinished plan competes with other concerns by score
+// ---------------------------------------------------------------------------------------------------
+
+FString UNPCAutonomyComponent::GetPlanPlantID() const
+{
+	if (!ActivePlan.Steps.IsValidIndex(ActivePlan.CurrentStepIndex)
+		|| !ActivePlan.Steps[ActivePlan.CurrentStepIndex].TrimStartAndEnd().Equals(TEXT("water_flower"), ESearchCase::IgnoreCase))
+	{
+		return FString();
+	}
+	if (!UnfinishedWaterPlantID.IsEmpty())
+	{
+		return UnfinishedWaterPlantID;
+	}
+	return BoundWaterPlant.IsValid() ? BoundWaterPlant->PlantID : FString();
+}
+
+float UNPCAutonomyComponent::ComputePlanConcern(FString* OutBreakdown) const
+{
+	if (ActivePlan.Status == ENPCAutonomyPlanStatus::None)
+	{
+		return 0.0f;
+	}
+	const UWorld* World = GetWorld();
+	const double Now = World ? World->GetTimeSeconds() : 0.0;
+
+	float Base = ActivePlan.Commitment.Equals(TEXT("medium"), ESearchCase::IgnoreCase)
+		? PlanBaseConcernMedium
+		: PlanBaseConcernLow;
+	float TaskBonus = 0.0f;
+	if (bResumeTaskPlansAfterService)
+	{
+		for (int32 StepIndex = ActivePlan.CurrentStepIndex; StepIndex < ActivePlan.Steps.Num(); ++StepIndex)
+		{
+			const FNPCAutonomyActivityDefinition* Activity = FindActivityDefinition(ActivePlan.Steps[StepIndex]);
+			if (Activity && Activity->Category == ENPCAutonomyActivityCategory::Task)
+			{
+				TaskBonus = PlanTaskStepBonus;
+				break;
+			}
+		}
+	}
+	const double Age = PlanSuspendedWorldTime >= 0.0 ? FMath::Max(Now - PlanSuspendedWorldTime, 0.0) : 0.0;
+	const float Decay = FMath::Pow(0.5f, static_cast<float>(Age) / FMath::Max(PlanConcernHalfLifeSeconds, 1.0f));
+	const float CommitmentPart = (Base + TaskBonus) * Decay;
+
+	float WaterPart = 0.0f;
+	const FString PlantID = GetPlanPlantID();
+	if (!PlantID.IsEmpty())
+	{
+		TArray<FNPCConcern> Concerns;
+		BuildConcerns(Concerns);
+		for (const FNPCConcern& Concern : Concerns)
+		{
+			if (Concern.Kind == TEXT("plant") && Concern.Id.Equals(PlantID, ESearchCase::IgnoreCase))
+			{
+				WaterPart = Concern.Score * PlanWaterConcernWeight;
+				break;
+			}
+		}
+	}
+
+	const float Score = FMath::Min(CommitmentPart + WaterPart, 100.0f);
+	if (OutBreakdown)
+	{
+		*OutBreakdown = FString::Printf(
+			TEXT("commitment=%s base=%.0f task=%.0f decay=%.2f age=%.0fs water(%s)=%.0f"),
+			*ActivePlan.Commitment,
+			Base,
+			TaskBonus,
+			Decay,
+			Age,
+			PlantID.IsEmpty() ? TEXT("-") : *PlantID,
+			WaterPart);
+	}
+	return Score;
+}
+
+bool UNPCAutonomyComponent::ResolvePlanCompetition(FString& OutDropReason) const
+{
+	FString Breakdown;
+	const float PlanScore = ComputePlanConcern(&Breakdown);
+	const FString OwnPlantID = GetPlanPlantID();
+
+	TArray<FNPCConcern> Concerns;
+	BuildConcerns(Concerns);
+	const FNPCConcern* Top = nullptr;
+	for (const FNPCConcern& Concern : Concerns)
+	{
+		// Rivals: other plants and tiredness. Boredom and duty are drives to start something, not claims on her time.
+		const bool bRival = (Concern.Kind == TEXT("plant") && !Concern.Id.Equals(OwnPlantID, ESearchCase::IgnoreCase))
+			|| Concern.Id == TEXT("tired");
+		if (bRival)
+		{
+			Top = &Concern;
+			break;
+		}
+	}
+
+	const bool bFaded = PlanScore < PlanKeepThreshold;
+	const bool bOutcompeted = Top && Top->Score > PlanScore + ConcernCompetitionMargin;
+	if (bFaded)
+	{
+		OutDropReason = TEXT("faded");
+	}
+	else if (bOutcompeted)
+	{
+		OutDropReason = FString::Printf(TEXT("outcompeted_by_%s"), *Top->Id);
+	}
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[PlanCompetition] resume check. Plan=%.0f (%s) Keep>=%.0f Rival=%s:%.0f Margin=%.0f -> %s"),
+		PlanScore,
+		*Breakdown,
+		PlanKeepThreshold,
+		Top ? *Top->Id : TEXT("-"),
+		Top ? Top->Score : 0.0f,
+		ConcernCompetitionMargin,
+		OutDropReason.IsEmpty() ? TEXT("resume") : *OutDropReason);
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("goal"), ActivePlan.Goal);
+	Payload->SetNumberField(TEXT("plan_score"), PlanScore);
+	Payload->SetStringField(TEXT("plan_breakdown"), Breakdown);
+	Payload->SetStringField(TEXT("rival_id"), Top ? Top->Id : FString());
+	Payload->SetNumberField(TEXT("rival_score"), Top ? Top->Score : 0.0f);
+	Payload->SetStringField(TEXT("decision"), OutDropReason.IsEmpty() ? FString(TEXT("resume")) : OutDropReason);
+	RecordResearchEvent(TEXT("plan_competition"), Payload);
+	return !OutDropReason.IsEmpty();
+}
+
+FString UNPCAutonomyComponent::GetActivityUnavailableReason(const FNPCAutonomyActivityDefinition& Activity) const
+{
+	const FString ActivityID = Activity.ActivityID.TrimStartAndEnd();
+	if (!Activity.bEnabled || ActivityID.IsEmpty())
+	{
+		return TEXT("disabled");
+	}
+	if (ResourceState.Energy + KINDA_SMALL_NUMBER < Activity.MinimumEnergy)
+	{
+		return TEXT("energy_below_minimum");
+	}
+	if (ActivityID.Equals(TEXT("rest_on_sofa"), ESearchCase::IgnoreCase))
+	{
+		return TEXT("no_rest_seat_or_not_tired_enough");
+	}
+	if (ActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase))
+	{
+		return TEXT("no_seat_opposite_player_or_not_served");
+	}
+	if (!Activity.RequiredWorldStateTag.IsNone() && !GetWorldStateTag(Activity.RequiredWorldStateTag))
+	{
+		return FString::Printf(TEXT("world_state_missing:%s"), *Activity.RequiredWorldStateTag.ToString());
+	}
+	if (!Activity.TargetSceneTag.TrimStartAndEnd().IsEmpty() && !HasSceneTargetTag(Activity.TargetSceneTag))
+	{
+		return FString::Printf(TEXT("no_scene_target:%s"), *Activity.TargetSceneTag);
+	}
+	return TEXT("cooldown_or_other");
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Experiment condition and plan lifecycle events
+// ---------------------------------------------------------------------------------------------------
+
+void UNPCAutonomyComponent::ApplyExperimentCondition(ENPCExperimentCondition Condition)
+{
+	ExperimentCondition = Condition;
+	if (Condition != ENPCExperimentCondition::Custom)
+	{
+		const bool bFull = Condition == ENPCExperimentCondition::Full;
+		bEnablePlayerReleaseResume = bFull;
+		bEnableOrderWaitSilencePrompt = bFull;
+		bEnableConcernPressureTrigger = bFull;
+		bPlantReminderTriggersPlanning = !bFull;
+		bHoldNewStepsWhileReplyPending = bFull;
+		bReplaceStaleGuideReply = bFull;
+		bEnableConcernCompetition = bFull;
+	}
+	const FString Switches = DescribeExperimentSwitchesJson();
+	UE_LOG(LogTemp, Warning, TEXT("[Experiment] condition=%s switches=%s"), *GetExperimentConditionName(), *Switches);
+	if (ResearchLoggerComponent)
+	{
+		ResearchLoggerComponent->RecordStructuredEvent(TEXT("experiment_condition_applied"), Switches);
+	}
+}
+
+FString UNPCAutonomyComponent::GetExperimentConditionName() const
+{
+	switch (ExperimentCondition)
+	{
+	case ENPCExperimentCondition::Baseline:
+		return TEXT("baseline");
+	case ENPCExperimentCondition::Full:
+		return TEXT("full");
+	default:
+		return TEXT("custom");
+	}
+}
+
+FString UNPCAutonomyComponent::DescribeExperimentSwitchesJson() const
+{
+	TSharedRef<FJsonObject> Root = MakeShared<FJsonObject>();
+	Root->SetStringField(TEXT("condition"), GetExperimentConditionName());
+	Root->SetBoolField(TEXT("player_release_resume"), bEnablePlayerReleaseResume);
+	Root->SetBoolField(TEXT("order_wait_silence_prompt"), bEnableOrderWaitSilencePrompt);
+	Root->SetBoolField(TEXT("concern_pressure_trigger"), bEnableConcernPressureTrigger);
+	Root->SetBoolField(TEXT("plant_reminder_triggers_planning"), bPlantReminderTriggersPlanning);
+	Root->SetBoolField(TEXT("hold_new_steps_while_reply_pending"), bHoldNewStepsWhileReplyPending);
+	Root->SetBoolField(TEXT("replace_stale_guide_reply"), bReplaceStaleGuideReply);
+	Root->SetBoolField(TEXT("concern_competition"), bEnableConcernCompetition);
+	return SerializeResearchPayload(Root);
+}
+
+void UNPCAutonomyComponent::RecordPlanEvent(const TCHAR* EventType, const FString& Reason) const
+{
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("reason"), Reason);
+	Payload->SetStringField(TEXT("goal"), ActivePlan.Goal);
+	Payload->SetStringField(TEXT("steps"), FString::Join(ActivePlan.Steps, TEXT(",")));
+	Payload->SetNumberField(TEXT("step_index"), ActivePlan.CurrentStepIndex);
+	Payload->SetStringField(
+		TEXT("step"),
+		ActivePlan.Steps.IsValidIndex(ActivePlan.CurrentStepIndex) ? ActivePlan.Steps[ActivePlan.CurrentStepIndex] : FString());
+	Payload->SetStringField(TEXT("service_state"), GetServiceStateName());
+	Payload->SetStringField(TEXT("unfinished_plant"), UnfinishedWaterPlantID);
+	RecordResearchEvent(EventType, Payload);
+
+	const UWorld* PanelWorld = GetWorld();
+	const double PanelNow = PanelWorld ? PanelWorld->GetTimeSeconds() : 0.0;
+	FString HistoryEntry = FString::Printf(
+		TEXT("%02d:%02d  %s"),
+		FMath::FloorToInt(PanelNow / 60.0),
+		FMath::FloorToInt(FMath::Fmod(PanelNow, 60.0)),
+		EventType);
+	if (!Reason.IsEmpty())
+	{
+		HistoryEntry += TEXT(" - ") + Reason;
+	}
+	if (ActivePlan.Steps.IsValidIndex(ActivePlan.CurrentStepIndex))
+	{
+		HistoryEntry += TEXT(" [") + ActivePlan.Steps[ActivePlan.CurrentStepIndex] + TEXT("]");
+	}
+	PlanHistoryLog.Add(HistoryEntry);
+	while (PlanHistoryLog.Num() > 16)
+	{
+		PlanHistoryLog.RemoveAt(0);
+	}
+}
+
+void UNPCAutonomyComponent::GetPlanPanelData(FNPCPlanPanelData& OutData) const
+{
+	OutData = FNPCPlanPanelData();
+	OutData.Status = ActivePlan.Status;
+	OutData.Goal = ActivePlan.Goal;
+	OutData.Trigger = ActivePlan.Trigger;
+	OutData.Commitment = ActivePlan.Commitment;
+	OutData.Steps = ActivePlan.Steps;
+	OutData.CurrentStepIndex = ActivePlan.CurrentStepIndex;
+	OutData.CurrentActivity = bActivityRunning ? CurrentActivityID : FString();
+	OutData.bDecisionPending = bDecisionPending;
+	OutData.ServiceState = GetServiceStateName();
+	OutData.bWaitingForRelease = IsSuspendedPlanWaitingForRelease();
+	const UWorld* World = GetWorld();
+	if (World && bOrderWaitActive)
+	{
+		OutData.OrderWaitSilenceSeconds = GetOrderWaitSilenceSeconds(World->GetTimeSeconds());
+	}
+	if (ActivePlan.Status != ENPCAutonomyPlanStatus::None)
+	{
+		OutData.bHasPlanConcern = true;
+		OutData.PlanConcern = ComputePlanConcern(&OutData.PlanConcernBreakdown);
+	}
+	OutData.PlanKeepThreshold = PlanKeepThreshold;
+
+	BuildConcerns(OutData.Concerns);
+	OutData.Concerns.Sort([](const FNPCConcern& A, const FNPCConcern& B)
+	{
+		return A.Score > B.Score;
+	});
+	FString TopPlantId;
+	float PlantScore = 0.0f;
+	OutData.Pressure = ComputeConcernPressure(OutData.Concerns, &TopPlantId, &PlantScore);
+	OutData.TriggerPressure = ConcernTriggerPressure;
+	OutData.LastFailureReason = LastPlanStepFailureReason;
+	OutData.Condition = GetExperimentConditionName();
+	OutData.History = PlanHistoryLog;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Concerns: things on her mind, each with a 0-100 strength
+// ---------------------------------------------------------------------------------------------------
+
+void UNPCAutonomyComponent::BuildConcerns(TArray<FNPCConcern>& OutConcerns) const
+{
+	OutConcerns.Reset();
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return;
+	}
+	const double Now = World->GetTimeSeconds();
+
+	for (TActorIterator<AWaterablePlantActor> It(const_cast<UWorld*>(World)); It; ++It)
+	{
+		const AWaterablePlantActor* Plant = *It;
+		if (!Plant || !Plant->bEnabled || !Plant->NeedsWater())
+		{
+			continue;
+		}
+
+		FNPCConcern Concern;
+		Concern.Id = Plant->PlantID;
+		Concern.Kind = TEXT("plant");
+		Concern.Score = FMath::Clamp(
+			(Plant->NeedsWaterEnterMoisture - Plant->GetMoisture()) * PlantConcernScorePerMoisturePoint,
+			1.0f,
+			100.0f);
+		Concern.Detail = FString::Printf(TEXT("%s is %s (moisture %.0f)"),
+			*Plant->PlantID, *Plant->GetMoistureTierName(), Plant->GetMoisture());
+		if (!UnfinishedWaterPlantID.IsEmpty()
+			&& Plant->PlantID.Equals(UnfinishedWaterPlantID, ESearchCase::IgnoreCase))
+		{
+			// Interrupted halfway: it weighs more than a fresh dry plant, and fades the longer it waits.
+			const double Age = UnfinishedWaterSinceWorldTime >= 0.0 ? FMath::Max(Now - UnfinishedWaterSinceWorldTime, 0.0) : 0.0;
+			const float Bonus = UnfinishedConcernBonus
+				* FMath::Pow(0.5f, static_cast<float>(Age) / FMath::Max(UnfinishedConcernHalfLifeSeconds, 1.0f));
+			Concern.Score = FMath::Min(Concern.Score + Bonus, 100.0f);
+			Concern.bUnfinished = true;
+			Concern.Detail += FString::Printf(TEXT(", watering was interrupted %.0fs ago and is unfinished"), Age);
+		}
+		OutConcerns.Add(MoveTemp(Concern));
+	}
+
+	// Existing motives and energy are the other sources; their own formulas are untouched.
+	auto AddMotiveConcern = [&OutConcerns](const TCHAR* Id, const TCHAR* Detail, float Score)
+	{
+		if (Score >= 10.0f)
+		{
+			FNPCConcern Concern;
+			Concern.Id = Id;
+			Concern.Kind = TEXT("motive");
+			Concern.Detail = Detail;
+			Concern.Score = FMath::Clamp(Score, 0.0f, 100.0f);
+			OutConcerns.Add(MoveTemp(Concern));
+		}
+	};
+	AddMotiveConcern(TEXT("boredom"), TEXT("feeling bored and wanting something to do"), MotiveState.Boredom);
+	AddMotiveConcern(TEXT("duty"), TEXT("feeling that work is waiting"), MotiveState.Duty);
+	AddMotiveConcern(TEXT("tired"), TEXT("feeling tired and wanting a rest"), (50.0f - ResourceState.Energy) * 2.0f);
+
+	OutConcerns.Sort([](const FNPCConcern& A, const FNPCConcern& B)
+	{
+		return A.Score > B.Score;
+	});
+}
+
+float UNPCAutonomyComponent::ComputeConcernPressure(
+	const TArray<FNPCConcern>& Concerns,
+	FString* OutTopPlantId,
+	float* OutPlantScore) const
+{
+	float PlantScore = 0.0f;
+	FString TopPlantId;
+	for (const FNPCConcern& Concern : Concerns)
+	{
+		if (Concern.Kind == TEXT("plant"))
+		{
+			// Sorted by strength, so the first plant is the strongest.
+			PlantScore = Concern.Score;
+			TopPlantId = Concern.Id;
+			break;
+		}
+	}
+	if (OutTopPlantId)
+	{
+		*OutTopPlantId = TopPlantId;
+	}
+	if (OutPlantScore)
+	{
+		*OutPlantScore = PlantScore;
+	}
+	return PlantScore + ConcernBoredomWeight * MotiveState.Boredom;
+}
+
+FString UNPCAutonomyComponent::DescribeConcerns() const
+{
+	TArray<FNPCConcern> Concerns;
+	BuildConcerns(Concerns);
+	FString TopPlantId;
+	float PlantScore = 0.0f;
+	const float Pressure = ComputeConcernPressure(Concerns, &TopPlantId, &PlantScore);
+	FString Out = FString::Printf(
+		TEXT("pressure=%.0f (plant %.0f + %.2f*boredom %.0f) trigger>=%.0f cooldown=%.0fs enabled=%d"),
+		Pressure,
+		PlantScore,
+		ConcernBoredomWeight,
+		MotiveState.Boredom,
+		ConcernTriggerPressure,
+		ConcernTriggerCooldownSeconds,
+		bEnableConcernPressureTrigger ? 1 : 0);
+	for (const FNPCConcern& Concern : Concerns)
+	{
+		Out += FString::Printf(TEXT("\n  %s/%s %.0f%s - %s"),
+			*Concern.Kind, *Concern.Id, Concern.Score, Concern.bUnfinished ? TEXT(" [unfinished]") : TEXT(""), *Concern.Detail);
+	}
+	UE_LOG(LogTemp, Warning, TEXT("[Concerns] %s"), *Out);
+	return Out;
+}
+
+void UNPCAutonomyComponent::AppendConcernsToDecisionContext(const TSharedPtr<FJsonObject>& Root) const
+{
+	if (!Root.IsValid())
+	{
+		return;
+	}
+	TArray<FNPCConcern> Concerns;
+	BuildConcerns(Concerns);
+	if (Concerns.IsEmpty())
+	{
+		return;
+	}
+
+	TSharedPtr<FJsonObject> ConcernsObject = MakeShared<FJsonObject>();
+	ConcernsObject->SetStringField(TEXT("context_version"), TEXT("concerns_v1"));
+	ConcernsObject->SetStringField(
+		TEXT("note"),
+		TEXT("things on Sumiha's mind, strongest first, each scored 0-100. Weigh them together with her mood, energy and the service situation; she does not have to act on the strongest one."));
+	TArray<TSharedPtr<FJsonValue>> Items;
+	FString LogSummary;
+	for (int32 Index = 0; Index < Concerns.Num() && Index < 5; ++Index)
+	{
+		const FNPCConcern& Concern = Concerns[Index];
+		TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+		Item->SetStringField(TEXT("id"), Concern.Id);
+		Item->SetStringField(TEXT("kind"), Concern.Kind);
+		Item->SetNumberField(TEXT("score"), FMath::RoundToFloat(Concern.Score));
+		Item->SetStringField(TEXT("detail"), Concern.Detail);
+		Item->SetBoolField(TEXT("unfinished"), Concern.bUnfinished);
+		Items.Add(MakeShared<FJsonValueObject>(Item));
+		LogSummary += FString::Printf(TEXT("%s:%.0f%s "), *Concern.Id, Concern.Score, Concern.bUnfinished ? TEXT("(unfinished)") : TEXT(""));
+	}
+	ConcernsObject->SetArrayField(TEXT("items"), Items);
+	Root->SetObjectField(TEXT("concerns"), ConcernsObject);
+	UE_LOG(LogTemp, Log, TEXT("[ConcernContext] version=concerns_v1 %s"), *LogSummary);
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Suspended plan release while the customer is choosing (WaitingForOrder)
+// ---------------------------------------------------------------------------------------------------
+
+bool UNPCAutonomyComponent::ReleaseSuspendedPlan(const TCHAR* Source, float ResumeDelaySeconds)
+{
+	if (ActivePlan.Status != ENPCAutonomyPlanStatus::Suspended)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[PlanRelease] source=%s ignored: no suspended plan."), Source);
+		return false;
+	}
+
+	bSuspendedPlanReleased = true;
+	const FString StepID = ActivePlan.Steps.IsValidIndex(ActivePlan.CurrentStepIndex)
+		? ActivePlan.Steps[ActivePlan.CurrentStepIndex]
+		: FString();
+	const UWorld* World = GetWorld();
+	const double SilenceSeconds = World ? GetOrderWaitSilenceSeconds(World->GetTimeSeconds()) : 0.0;
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[PlanRelease] source=%s goal=%s step=%s service=%s silence=%.0fs resumeIn=%.1fs"),
+		Source,
+		*ActivePlan.Goal,
+		*StepID,
+		*GetServiceStateName(),
+		SilenceSeconds,
+		ResumeDelaySeconds);
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("source"), Source);
+	Payload->SetStringField(TEXT("goal"), ActivePlan.Goal);
+	Payload->SetStringField(TEXT("step"), StepID);
+	Payload->SetStringField(TEXT("service_state"), GetServiceStateName());
+	Payload->SetNumberField(TEXT("silence_seconds"), SilenceSeconds);
+	RecordResearchEvent(TEXT("suspended_plan_released"), Payload);
+
+	if (!bActivityRunning && !bDecisionPending)
+	{
+		ScheduleNextDecision(ResumeDelaySeconds);
+	}
+	return true;
+}
+
+double UNPCAutonomyComponent::GetOrderWaitSilenceSeconds(double Now) const
+{
+	const double SilenceStart = FMath::Max3(
+		OrderWaitStartWorldTime,
+		LastPlayerSpeechWorldTime,
+		LastInteractiveReplyFinishedWorldTime);
+	return SilenceStart >= 0.0 ? FMath::Max(Now - SilenceStart, 0.0) : 0.0;
+}
+
+void UNPCAutonomyComponent::UpdateOrderWaitSilence(double Now, bool bPlanSuspended)
+{
+	if (OrderWaitStartWorldTime < 0.0)
+	{
+		// The state change was not observed (e.g. already waiting at BeginPlay): start counting now.
+		OrderWaitStartWorldTime = Now;
+		bOrderWaitActive = true;
+	}
+	if (!bEnableOrderWaitSilencePrompt)
+	{
+		return;
+	}
+
+	const double SilenceSeconds = GetOrderWaitSilenceSeconds(Now);
+	if (bPlanSuspended)
+	{
+		// Score comparison instead of a fixed wait: the strongest plant concern (drier / unfinished = stronger)
+		// plus accumulated silence is weighed against the customer's claim on her attention.
+		TArray<FNPCConcern> Concerns;
+		BuildConcerns(Concerns);
+		FString TopPlantId;
+		float PlantScore = 0.0f;
+		ComputeConcernPressure(Concerns, &TopPlantId, &PlantScore);
+		const float ReleasePressure = PlantScore + static_cast<float>(SilenceSeconds) * OrderWaitSilencePressurePerSecond;
+		const bool bPressureReached = SilenceSeconds >= OrderWaitMinSilenceSeconds && ReleasePressure >= OrderWaitReleasePressure;
+		if (!bPressureReached && SilenceSeconds < OrderWaitSelfReleaseSilenceSeconds)
+		{
+			return;
+		}
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[OrderWait] self release. Silence=%.0fs PlantConcern=%s:%.0f Pressure=%.0f/%.0f Cap=%d"),
+			SilenceSeconds,
+			*TopPlantId,
+			PlantScore,
+			ReleasePressure,
+			OrderWaitReleasePressure,
+			bPressureReached ? 0 : 1);
+		// The player has been quiet for a while: excuse herself and go back to the interrupted plan.
+		SpeakAutonomyIntent(
+			TEXT("You have been waiting for the customer to order, but they have stayed quiet for a while. "
+				"You decide to go back to your interrupted task for a moment. "
+				"Let them know, in your own words, that they can call you whenever they have decided."),
+			OrderWaitSelfReleaseLine,
+			SilenceSeconds);
+		ReleaseSuspendedPlan(TEXT("self_after_silence"), ReleaseResumeDelaySeconds);
+		return;
+	}
+
+	if (bOrderWaitNudgeSpoken || SilenceSeconds < OrderWaitNudgeSilenceSeconds)
+	{
+		return;
+	}
+	// Nothing to go back to: a single gentle prompt per order wait.
+	bOrderWaitNudgeSpoken = true;
+	SpeakAutonomyIntent(
+		TEXT("The customer has been silent for a while after sitting down and you have nothing else to do. "
+			"Gently check, just once, whether they have decided what to order, without pressuring them."),
+		OrderWaitNudgeLine,
+		SilenceSeconds);
+	UE_LOG(LogTemp, Log, TEXT("[OrderWait] nudge spoken after %.0fs of silence."), SilenceSeconds);
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetNumberField(TEXT("silence_seconds"), SilenceSeconds);
+	RecordResearchEvent(TEXT("order_wait_nudge"), Payload);
+}
+
+void UNPCAutonomyComponent::SpeakAutonomyIntent(const FString& Intent, const FString& FallbackLine, double SilenceSeconds)
+{
+	ULLMClient* InteractiveClient = ULLMClient::GetMostRecentInteractiveClient();
+	if (!bGenerateOrderWaitLinesWithLLM || !InteractiveClient)
+	{
+		SpeakAutonomyLine(FallbackLine);
+		return;
+	}
+
+	TSharedRef<FJsonObject> Context = MakeShared<FJsonObject>();
+	Context->SetStringField(TEXT("intent"), Intent);
+	Context->SetStringField(TEXT("service_state"), GetServiceStateName());
+	Context->SetNumberField(TEXT("customer_silence_seconds"), SilenceSeconds);
+	if (ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended && !ActivePlan.Goal.IsEmpty())
+	{
+		Context->SetStringField(TEXT("interrupted_task"), ActivePlan.Goal);
+	}
+	FString ContextJson;
+	TSharedRef<TJsonWriter<>> ContextWriter = TJsonWriterFactory<>::Create(&ContextJson);
+	FJsonSerializer::Serialize(Context, ContextWriter);
+	InteractiveClient->RequestAutonomyUtterance(ContextJson, FallbackLine);
+}
+
+void UNPCAutonomyComponent::SpeakAutonomyLine(const FString& Line) const
+{
+	const FString Trimmed = Line.TrimStartAndEnd();
+	if (Trimmed.IsEmpty())
+	{
+		return;
+	}
+	if (ULLMClient* InteractiveClient = ULLMClient::GetMostRecentInteractiveClient())
+	{
+		InteractiveClient->SpeakDirectText(Trimmed);
+	}
+	else if (GEngine)
+	{
+		GEngine->AddOnScreenDebugMessage(-1, 8.0f, FColor::Cyan, Trimmed);
+	}
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Watering with continuous plant moisture
+// ---------------------------------------------------------------------------------------------------
+
+bool UNPCAutonomyComponent::IsWaterActivity(const FNPCAutonomyActivityDefinition& Activity) const
+{
+	return Activity.ActivityID.TrimStartAndEnd().Equals(TEXT("water_flower"), ESearchCase::IgnoreCase);
+}
+
+void UNPCAutonomyComponent::NotifyPlantMoistureReminder(const FString& PlantID, float Moisture, int32 Threshold)
+{
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[PlantReminder] %s crossed below %d (moisture=%.1f). TriggersPlanning=%d (otherwise it only grows the concern)."),
+		*PlantID,
+		Threshold,
+		Moisture,
+		bPlantReminderTriggersPlanning ? 1 : 0);
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("plant_id"), PlantID);
+	Payload->SetNumberField(TEXT("moisture"), Moisture);
+	Payload->SetNumberField(TEXT("threshold"), Threshold);
+	RecordResearchEvent(TEXT("plant_moisture_reminder"), Payload);
+	if (bPlantReminderTriggersPlanning)
+	{
+		// Baseline behaviour: marks the context as changed, no interruption, planning on the next evaluation.
+		MarkMeaningfulContextChange(FString::Printf(TEXT("plant_moisture:%s:below_%d"), *PlantID, Threshold));
+	}
+}
+
+bool UNPCAutonomyComponent::ForceWaterPlantForValidation(const FString& PlantID)
+{
+	ResolveReferences();
+	const FNPCAutonomyActivityDefinition* Activity = FindActivityDefinition(TEXT("water_flower"));
+	if (!Activity || !ServiceManager || !IsServiceStateAutonomyAllowed(ServiceManager->CurrentState))
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[WaterTest] water_flower unavailable in the current service state."));
+		return false;
+	}
+	if (bActivityRunning)
+	{
+		InterruptAutonomy(TEXT("water_validation_override"));
+	}
+	if (!CanRunAutonomy())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[WaterTest] NPC is busy; watering test was not started."));
+		return false;
+	}
+
+	ForcedWaterPlantID = PlantID.TrimStartAndEnd();
+	ActivityCooldownUntil.Remove(Activity->ActivityID.TrimStartAndEnd());
+	const bool bStarted = StartActivity(*Activity, TEXT("manual_water_validation"), true);
+	ForcedWaterPlantID.Reset();
+	UE_LOG(
+		LogTemp,
+		Warning,
+		TEXT("[WaterTest] request. Plant=%s Started=%s (the plant must be below its needs-water line)"),
+		*PlantID,
+		bStarted ? TEXT("true") : TEXT("false"));
+	return bStarted;
+}
+
+bool UNPCAutonomyComponent::IsMaidNearPlant(const AWaterablePlantActor& Plant) const
+{
+	if (!MaidNPCActor)
+	{
+		return false;
+	}
+	const float Radius = FMath::Max(Plant.ApproachDistance + 40.0f, 140.0f);
+	return FVector::DistSquared2D(MaidNPCActor->GetActorLocation(), Plant.GetPlantTargetLocation())
+		<= FMath::Square(Radius);
+}
+
+AWaterablePlantActor* UNPCAutonomyComponent::BindWaterTarget(const FNPCAutonomyActivityDefinition& Activity)
+{
+	UWorld* World = GetWorld();
+	if (!World || !MaidNPCActor)
+	{
+		return nullptr;
+	}
+
+	const FString TargetTag = Activity.TargetSceneTag.TrimStartAndEnd();
+	AWaterablePlantActor* Chosen = nullptr;
+	AWaterablePlantActor* Driest = nullptr;
+	FString ChosenWhy;
+	int32 CandidateCount = 0;
+	int32 BestPriority = MIN_int32;
+	float BestMoisture = TNumericLimits<float>::Max();
+	float BestDistanceSq = TNumericLimits<float>::Max();
+
+	for (TActorIterator<AWaterablePlantActor> It(World); It; ++It)
+	{
+		AWaterablePlantActor* Plant = *It;
+		if (!Plant || !Plant->bEnabled || Plant->IsReserved()
+			|| (!TargetTag.IsEmpty() && !Plant->HasTagString(TargetTag)))
+		{
+			continue;
+		}
+
+		const bool bForced = !ForcedWaterPlantID.IsEmpty()
+			&& Plant->PlantID.Equals(ForcedWaterPlantID, ESearchCase::IgnoreCase);
+		if (bForced)
+		{
+			Chosen = Plant;
+			ChosenWhy = TEXT("forced_by_console");
+			break;
+		}
+		if (!Plant->NeedsWater())
+		{
+			continue;
+		}
+
+		++CandidateCount;
+		if (!Driest || Plant->GetMoisture() < Driest->GetMoisture())
+		{
+			Driest = Plant;
+		}
+		if (!UnfinishedWaterPlantID.IsEmpty()
+			&& Plant->PlantID.Equals(UnfinishedWaterPlantID, ESearchCase::IgnoreCase))
+		{
+			Chosen = Plant;
+			ChosenWhy = TEXT("resume_unfinished");
+			BestPriority = MAX_int32;
+			continue;
+		}
+		if (ChosenWhy == TEXT("resume_unfinished"))
+		{
+			continue;
+		}
+
+		const float DistanceSq = FVector::DistSquared2D(MaidNPCActor->GetActorLocation(), Plant->GetPlantTargetLocation());
+		const float Moisture = Plant->GetMoisture();
+		const bool bBetter = Plant->Priority > BestPriority
+			|| (Plant->Priority == BestPriority && Moisture < BestMoisture - 0.5f)
+			|| (Plant->Priority == BestPriority && FMath::Abs(Moisture - BestMoisture) <= 0.5f && DistanceSq < BestDistanceSq);
+		if (bBetter)
+		{
+			Chosen = Plant;
+			ChosenWhy = TEXT("priority_then_driest_then_nearest");
+			BestPriority = Plant->Priority;
+			BestMoisture = Moisture;
+			BestDistanceSq = DistanceSq;
+		}
+	}
+
+	if (!Chosen || !Chosen->TryReserve(MaidNPCActor))
+	{
+		return nullptr;
+	}
+
+	BoundWaterPlant = Chosen;
+	WateringStartMoisture = Chosen->GetMoisture();
+	WateringAddedMoisture = 0.0f;
+	LastWateringProgressWorldTime = World->GetTimeSeconds();
+	World->GetTimerManager().SetTimer(
+		WateringProgressTimerHandle,
+		this,
+		&UNPCAutonomyComponent::HandleWateringProgressTick,
+		0.1f,
+		true);
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[Watering] bound plant=%s why=%s moisture=%.1f driest=%s(%.1f) candidates=%d"),
+		*Chosen->PlantID,
+		*ChosenWhy,
+		Chosen->GetMoisture(),
+		Driest ? *Driest->PlantID : TEXT("-"),
+		Driest ? Driest->GetMoisture() : 0.0f,
+		CandidateCount);
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("plant_id"), Chosen->PlantID);
+	Payload->SetStringField(TEXT("why"), ChosenWhy);
+	Payload->SetNumberField(TEXT("moisture"), Chosen->GetMoisture());
+	Payload->SetStringField(TEXT("driest_plant_id"), Driest ? Driest->PlantID : FString());
+	RecordResearchEvent(TEXT("watering_bound"), Payload);
+	return Chosen;
+}
+
+void UNPCAutonomyComponent::ReleaseWaterBinding(const TCHAR* Reason, bool bCompleted)
+{
+	if (UWorld* World = GetWorld())
+	{
+		World->GetTimerManager().ClearTimer(WateringProgressTimerHandle);
+	}
+
+	AWaterablePlantActor* Plant = BoundWaterPlant.Get();
+	BoundWaterPlant.Reset();
+	if (!Plant)
+	{
+		return;
+	}
+
+	Plant->ReleaseReservation(MaidNPCActor);
+	// An unfinished pass is remembered only while the plan that owns it is suspended and will resume.
+	const bool bRemember = !bCompleted
+		&& Plant->NeedsWater()
+		&& ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended;
+	if (bRemember)
+	{
+		UnfinishedWaterPlantID = Plant->PlantID;
+		if (const UWorld* World = GetWorld())
+		{
+			UnfinishedWaterSinceWorldTime = World->GetTimeSeconds();
+		}
+	}
+	else
+	{
+		UnfinishedWaterPlantID.Reset();
+	}
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[Watering] released plant=%s reason=%s completed=%d start=%.1f end=%.1f added=%.1f needsWater=%d unfinishedRecorded=%d"),
+		*Plant->PlantID,
+		Reason,
+		bCompleted ? 1 : 0,
+		WateringStartMoisture,
+		Plant->GetMoisture(),
+		WateringAddedMoisture,
+		Plant->NeedsWater() ? 1 : 0,
+		bRemember ? 1 : 0);
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("plant_id"), Plant->PlantID);
+	Payload->SetStringField(TEXT("reason"), Reason);
+	Payload->SetBoolField(TEXT("completed"), bCompleted);
+	Payload->SetNumberField(TEXT("start_moisture"), WateringStartMoisture);
+	Payload->SetNumberField(TEXT("end_moisture"), Plant->GetMoisture());
+	Payload->SetBoolField(TEXT("unfinished_recorded"), bRemember);
+	RecordResearchEvent(TEXT("watering_ended"), Payload);
+}
+
+void UNPCAutonomyComponent::HandleWateringProgressTick()
+{
+	UWorld* World = GetWorld();
+	AWaterablePlantActor* Plant = BoundWaterPlant.Get();
+	if (!World || !Plant)
+	{
+		ReleaseWaterBinding(TEXT("progress_tick_lost_plant"), false);
+		return;
+	}
+
+	const double Now = World->GetTimeSeconds();
+	const float DeltaSeconds = LastWateringProgressWorldTime >= 0.0
+		? static_cast<float>(FMath::Clamp(Now - LastWateringProgressWorldTime, 0.0, 0.5))
+		: 0.0f;
+	LastWateringProgressWorldTime = Now;
+
+	// Moisture rises only while the watering motion is really playing (not walking, not paused).
+	if (bActivityRunning
+		&& CurrentActivityID.Equals(TEXT("water_flower"), ESearchCase::IgnoreCase)
+		&& ActionQueueComponent
+		&& ActionQueueComponent->IsQueuedAnimationOrWaitActive())
+	{
+		const float Amount = WateringMoisturePerSecond * DeltaSeconds;
+		const float Before = Plant->GetMoisture();
+		const float After = Plant->AddMoisture(Amount, TEXT("npc_watering"));
+		WateringAddedMoisture += FMath::Max(After - Before, 0.0f);
+	}
+}
+
+bool UNPCAutonomyComponent::ValidateWaterStepForResume(FString& OutReason) const
+{
+	// Without an unfinished record this is a fresh watering step; the normal availability check applies.
+	if (UnfinishedWaterPlantID.IsEmpty())
+	{
+		return true;
+	}
+
+	const UWorld* World = GetWorld();
+	if (!World)
+	{
+		return true;
+	}
+	const AWaterablePlantActor* Target = nullptr;
+	const AWaterablePlantActor* Driest = nullptr;
+	for (TActorIterator<AWaterablePlantActor> It(const_cast<UWorld*>(World)); It; ++It)
+	{
+		const AWaterablePlantActor* Plant = *It;
+		if (!Plant)
+		{
+			continue;
+		}
+		if (Plant->PlantID.Equals(UnfinishedWaterPlantID, ESearchCase::IgnoreCase))
+		{
+			Target = Plant;
+		}
+		if (Plant->bEnabled && Plant->NeedsWater() && (!Driest || Plant->GetMoisture() < Driest->GetMoisture()))
+		{
+			Driest = Plant;
+		}
+	}
+
+	UE_LOG(
+		LogTemp,
+		Log,
+		TEXT("[WaterResume] record=%s targetMoisture=%.1f driest=%s(%.1f)"),
+		*UnfinishedWaterPlantID,
+		Target ? Target->GetMoisture() : -1.0f,
+		Driest ? *Driest->PlantID : TEXT("-"),
+		Driest ? Driest->GetMoisture() : -1.0f);
+
+	if (!Target)
+	{
+		OutReason = TEXT("target_plant_missing");
+	}
+	else if (!Target->bEnabled)
+	{
+		OutReason = TEXT("target_plant_disabled");
+	}
+	else if (!Target->NeedsWater())
+	{
+		OutReason = TEXT("target_no_longer_needs_water");
+	}
+	else if (Target->IsReserved())
+	{
+		OutReason = TEXT("target_reserved_by_other");
+	}
+	return OutReason.IsEmpty();
+}
+
+void UNPCAutonomyComponent::AppendPlantsToDecisionContext(const TSharedPtr<FJsonObject>& Root) const
+{
+	UWorld* World = GetWorld();
+	if (!World || !Root.IsValid())
+	{
+		return;
+	}
+
+	TArray<const AWaterablePlantActor*> Plants;
+	for (TActorIterator<AWaterablePlantActor> It(World); It; ++It)
+	{
+		const AWaterablePlantActor* Plant = *It;
+		if (Plant && Plant->bEnabled)
+		{
+			Plants.Add(Plant);
+		}
+	}
+	if (Plants.IsEmpty())
+	{
+		return;
+	}
+	// Driest first; the list is short on purpose (this is a planning context, not a world dump).
+	Plants.Sort([](const AWaterablePlantActor& A, const AWaterablePlantActor& B)
+	{
+		return A.GetMoisture() < B.GetMoisture();
+	});
+
+	TSharedPtr<FJsonObject> PlantsObject = MakeShared<FJsonObject>();
+	PlantsObject->SetStringField(TEXT("context_version"), TEXT("plants_v1"));
+	PlantsObject->SetStringField(
+		TEXT("note"),
+		TEXT("moisture is 0-100. needs_water turns on below 60 and stays on until 95, but watering is optional: weigh your energy, boredom, duty, mood and the service situation."));
+	TArray<TSharedPtr<FJsonValue>> Items;
+	FString LogSummary;
+	for (int32 Index = 0; Index < Plants.Num() && Index < 6; ++Index)
+	{
+		const AWaterablePlantActor* Plant = Plants[Index];
+		TSharedPtr<FJsonObject> Item = MakeShared<FJsonObject>();
+		Item->SetStringField(TEXT("id"), Plant->PlantID);
+		Item->SetNumberField(TEXT("moisture"), FMath::RoundToFloat(Plant->GetMoisture() * 10.0f) / 10.0f);
+		Item->SetStringField(TEXT("tier"), Plant->GetMoistureTierName());
+		Item->SetBoolField(TEXT("needs_water"), Plant->NeedsWater());
+		Item->SetNumberField(TEXT("urgency"), FMath::RoundToFloat(Plant->GetWaterUrgency01() * 100.0f) / 100.0f);
+		Item->SetBoolField(TEXT("being_watered"), Plant->IsReserved());
+		Items.Add(MakeShared<FJsonValueObject>(Item));
+		LogSummary += FString::Printf(TEXT("%s:%.0f/%s "), *Plant->PlantID, Plant->GetMoisture(), *Plant->GetMoistureTierName());
+	}
+	PlantsObject->SetArrayField(TEXT("items"), Items);
+	Root->SetObjectField(TEXT("plants"), PlantsObject);
+	UE_LOG(LogTemp, Log, TEXT("[PlantContext] version=plants_v1 %s"), *LogSummary);
 }
 
 void UNPCAutonomyComponent::RollNextBoredomThreshold()
@@ -3714,26 +4865,52 @@ void UNPCAutonomyComponent::SetBlinkMorphWeight(float Weight)
 
 FString UNPCAutonomyComponent::BuildDecisionContextJson(const TArray<FString>& AvailableActivityIDs) const
 {
+	FCafeWorldSnapshot WorldSnapshot;
+	bool bHasWorldSnapshot = false;
+	if (UCafeWorldSnapshotSubsystem* SnapshotSubsystem = UCafeWorldSnapshotSubsystem::Get(this))
+	{
+		WorldSnapshot = SnapshotSubsystem->CaptureSnapshot(ServiceManager);
+		bHasWorldSnapshot = true;
+	}
+
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	TSharedPtr<FJsonObject> TriggerObject = MakeShared<FJsonObject>();
 	TriggerObject->SetStringField(TEXT("type"), LastDecisionTrigger);
 	Root->SetObjectField(TEXT("trigger"), TriggerObject);
 
 	TSharedPtr<FJsonObject> NPCObject = MakeShared<FJsonObject>();
-	NPCObject->SetStringField(TEXT("state"), TEXT("idle"));
-	NPCObject->SetStringField(TEXT("location"), LastKnownNPCZone);
-	NPCObject->SetStringField(TEXT("service_state"), GetServiceStateName());
+	const FString NPCState = bActivityRunning ? TEXT("acting")
+		: (bDecisionPending || bAppraisalPending) ? TEXT("thinking")
+		: ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended ? TEXT("plan_suspended")
+		: ActivePlan.Status == ENPCAutonomyPlanStatus::Active ? TEXT("plan_active")
+		: TEXT("idle");
+	NPCObject->SetStringField(TEXT("state"), NPCState);
+	NPCObject->SetStringField(
+		TEXT("location"),
+		bHasWorldSnapshot ? WorldSnapshot.NPC.Zone : LastKnownNPCZone);
+	NPCObject->SetStringField(
+		TEXT("service_state"),
+		bHasWorldSnapshot ? WorldSnapshot.Service.PhaseName : GetServiceStateName());
+	if (bHasWorldSnapshot)
+	{
+		NPCObject->SetStringField(TEXT("service_raw_state"), WorldSnapshot.Service.StateName);
+	}
 	TSharedPtr<FJsonObject> MotiveObject = MakeShared<FJsonObject>();
-	MotiveObject->SetNumberField(TEXT("boredom"), MotiveState.Boredom);
-	MotiveObject->SetNumberField(TEXT("duty"), MotiveState.Duty);
-	MotiveObject->SetNumberField(TEXT("social_attention"), MotiveState.SocialAttention);
+	const FNPCAutonomyMotiveState& SnapshotMotives = bHasWorldSnapshot
+		? WorldSnapshot.NPC.Motives : MotiveState;
+	MotiveObject->SetNumberField(TEXT("boredom"), SnapshotMotives.Boredom);
+	MotiveObject->SetNumberField(TEXT("duty"), SnapshotMotives.Duty);
+	MotiveObject->SetNumberField(TEXT("social_attention"), SnapshotMotives.SocialAttention);
 	NPCObject->SetObjectField(TEXT("motives"), MotiveObject);
 	TSharedPtr<FJsonObject> ResourceObject = MakeShared<FJsonObject>();
-	ResourceObject->SetNumberField(TEXT("energy"), ResourceState.Energy);
+	ResourceObject->SetNumberField(
+		TEXT("energy"),
+		bHasWorldSnapshot ? WorldSnapshot.NPC.Resources.Energy : ResourceState.Energy);
 	NPCObject->SetObjectField(TEXT("resources"), ResourceObject);
-	if (EmotionComponent)
+	if ((bHasWorldSnapshot && WorldSnapshot.bEmotionAvailable) || EmotionComponent)
 	{
-		const FNPCEmotionState EmotionState = EmotionComponent->GetCurrentState();
+		const FNPCEmotionState EmotionState = bHasWorldSnapshot && WorldSnapshot.bEmotionAvailable
+			? WorldSnapshot.Emotion : EmotionComponent->GetCurrentState();
 		TSharedPtr<FJsonObject> EmotionObject = MakeShared<FJsonObject>();
 		EmotionObject->SetStringField(TEXT("label"), EmotionState.EmotionLabel);
 		EmotionObject->SetNumberField(TEXT("short_term_valence"), EmotionState.ShortTermValence);
@@ -3761,11 +4938,34 @@ FString UNPCAutonomyComponent::BuildDecisionContextJson(const TArray<FString>& A
 		Root->SetObjectField(TEXT("recently_appraised_memory"), MemoryObject);
 	}
 
-	const bool bPlayerPresent = ServiceManager && ServiceManager->CurrentPlayerActor != nullptr;
 	TSharedPtr<FJsonObject> PlayerObject = MakeShared<FJsonObject>();
-	PlayerObject->SetBoolField(TEXT("present"), bPlayerPresent);
-	PlayerObject->SetStringField(TEXT("activity"), ResolvePlayerActivity());
-	PlayerObject->SetStringField(TEXT("zone"), ResolvePlayerZone());
+	PlayerObject->SetBoolField(
+		TEXT("present"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.bInServiceScene
+			: ServiceManager && ServiceManager->CurrentPlayerActor != nullptr);
+	PlayerObject->SetBoolField(
+		TEXT("exists"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.bExists
+			: ServiceManager && ServiceManager->CurrentPlayerActor != nullptr);
+	PlayerObject->SetBoolField(
+		TEXT("seated"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.bSeated : false);
+	PlayerObject->SetBoolField(
+		TEXT("in_table_area"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.bInTableArea : false);
+	PlayerObject->SetStringField(
+		TEXT("pose"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.Pose : TEXT("unknown"));
+	PlayerObject->SetStringField(
+		TEXT("activity"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.Activity : ResolvePlayerActivity());
+	PlayerObject->SetStringField(
+		TEXT("zone"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.Zone : ResolvePlayerZone());
+	if (bHasWorldSnapshot)
+	{
+		PlayerObject->SetStringField(TEXT("table_id"), WorldSnapshot.Player.TableId);
+	}
 	PlayerObject->SetStringField(
 		TEXT("attention"),
 		PlayerContext.AttentionTarget.TrimStartAndEnd().IsEmpty() ? TEXT("unknown") : PlayerContext.AttentionTarget);
@@ -3792,12 +4992,27 @@ FString UNPCAutonomyComponent::BuildDecisionContextJson(const TArray<FString>& A
 	PlayerObject->SetArrayField(TEXT("recent_events"), RecentEventValues);
 	Root->SetObjectField(TEXT("player"), PlayerObject);
 
+	if (bHasWorldSnapshot)
+	{
+		TSharedPtr<FJsonObject> ServiceObject = MakeShared<FJsonObject>();
+		ServiceObject->SetStringField(TEXT("phase"), WorldSnapshot.Service.PhaseName);
+		ServiceObject->SetStringField(TEXT("raw_state"), WorldSnapshot.Service.StateName);
+		ServiceObject->SetBoolField(TEXT("guide_in_progress"), WorldSnapshot.Service.bGuideInProgress);
+		ServiceObject->SetStringField(TEXT("table_id"), WorldSnapshot.Service.CurrentTableID);
+		ServiceObject->SetBoolField(
+			TEXT("meal_confirmation_pending"),
+			WorldSnapshot.Service.bMealCompletionConfirmationPending);
+		Root->SetObjectField(TEXT("service"), ServiceObject);
+	}
+
 	TSharedPtr<FJsonObject> WorldObject = MakeShared<FJsonObject>();
 	for (const TPair<FName, bool>& Pair : WorldStateTags)
 	{
 		WorldObject->SetBoolField(Pair.Key.ToString(), Pair.Value);
 	}
 	Root->SetObjectField(TEXT("world"), WorldObject);
+	AppendPlantsToDecisionContext(Root);
+	AppendConcernsToDecisionContext(Root);
 
 	TSharedPtr<FJsonObject> PlanObject = MakeShared<FJsonObject>();
 	PlanObject->SetStringField(TEXT("status"),
@@ -3866,6 +5081,11 @@ FString UNPCAutonomyComponent::BuildDecisionContextJson(const TArray<FString>& A
 
 FString UNPCAutonomyComponent::ResolvePlayerActivity() const
 {
+	if (UCafeWorldSnapshotSubsystem* SnapshotSubsystem = UCafeWorldSnapshotSubsystem::Get(this))
+	{
+		return SnapshotSubsystem->CaptureSnapshot(ServiceManager).Player.Activity;
+	}
+
 	AActor* PlayerActor = ServiceManager ? ServiceManager->CurrentPlayerActor : nullptr;
 	if (!PlayerActor)
 	{
@@ -3876,9 +5096,8 @@ FString UNPCAutonomyComponent::ResolvePlayerActivity() const
 	{
 		return TEXT("following_npc");
 	}
-	const FCafeServiceSnapshot ServiceSnapshot = ServiceManager->GetServiceSnapshot();
 	const UPlayerSeatComponent* SeatComponent = PlayerActor->FindComponentByClass<UPlayerSeatComponent>();
-	if ((SeatComponent && SeatComponent->bIsSeated) || ServiceSnapshot.bSeatedForService)
+	if (SeatComponent && SeatComponent->bIsSeated)
 	{
 		return TEXT("seated");
 	}
@@ -3899,6 +5118,11 @@ FString UNPCAutonomyComponent::ResolvePlayerActivity() const
 
 FString UNPCAutonomyComponent::ResolvePlayerZone() const
 {
+	if (UCafeWorldSnapshotSubsystem* SnapshotSubsystem = UCafeWorldSnapshotSubsystem::Get(this))
+	{
+		return SnapshotSubsystem->CaptureSnapshot(ServiceManager).Player.Zone;
+	}
+
 	if (!ServiceManager || !ServiceManager->CurrentPlayerActor)
 	{
 		return TEXT("outside");
@@ -3932,10 +5156,7 @@ FString UNPCAutonomyComponent::GetServiceStateName() const
 		return TEXT("unknown");
 	}
 
-	const UEnum* Enum = StaticEnum<ECafeServiceState>();
-	return Enum
-		? Enum->GetNameStringByValue(static_cast<int64>(ServiceManager->CurrentState))
-		: TEXT("unknown");
+	return ServiceManager->GetUnifiedServiceStateName();
 }
 
 FString UNPCAutonomyComponent::ResolveCurrentPerformanceTone() const
@@ -4122,8 +5343,15 @@ bool UNPCAutonomyComponent::TryStartCurrentPlanStep(bool bIsResume)
 
 	const FString StepID = ActivePlan.Steps[ActivePlan.CurrentStepIndex].TrimStartAndEnd();
 	const FNPCAutonomyActivityDefinition* Activity = FindActivityDefinition(StepID);
-	if (!Activity || !IsActivityAvailable(*Activity))
+	LastPlanStepFailureReason.Reset();
+	if (!Activity)
 	{
+		LastPlanStepFailureReason = FString::Printf(TEXT("%s:activity_not_defined"), *StepID);
+		return false;
+	}
+	if (!IsActivityAvailable(*Activity))
+	{
+		LastPlanStepFailureReason = FString::Printf(TEXT("%s:%s"), *StepID, *GetActivityUnavailableReason(*Activity));
 		return false;
 	}
 
@@ -4131,6 +5359,7 @@ bool UNPCAutonomyComponent::TryStartCurrentPlanStep(bool bIsResume)
 	if (bIsResume)
 	{
 		++TotalPlansResumed;
+		RecordPlanEvent(TEXT("plan_resumed"), StepID);
 		UE_LOG(
 			LogTemp,
 			Log,
@@ -4143,6 +5372,7 @@ bool UNPCAutonomyComponent::TryStartCurrentPlanStep(bool bIsResume)
 
 	if (!StartActivity(*Activity, LastDecisionReason))
 	{
+		LastPlanStepFailureReason = FString::Printf(TEXT("%s:start_activity_failed"), *StepID);
 		return false;
 	}
 
@@ -4171,6 +5401,7 @@ void UNPCAutonomyComponent::AdvanceOrFinishPlan()
 		TEXT("[AutonomyPlan] completed. Goal=%s Steps=%d"),
 		*ActivePlan.Goal,
 		ActivePlan.Steps.Num());
+	RecordPlanEvent(TEXT("plan_completed"), TEXT("completed"));
 	ClearActivePlan(TEXT("completed"));
 	RollNextBoredomThreshold();
 	if (UWorld* World = GetWorld())
@@ -4221,6 +5452,7 @@ void UNPCAutonomyComponent::ClearActivePlan(const FString& Reason)
 	const FString ClearedGoal = ActivePlan.Goal;
 	if (ActivePlan.Status != ENPCAutonomyPlanStatus::None || !ActivePlan.Steps.IsEmpty())
 	{
+		RecordPlanEvent(TEXT("plan_cleared"), Reason);
 		UE_LOG(
 			LogTemp,
 			Log,
@@ -4231,6 +5463,10 @@ void UNPCAutonomyComponent::ClearActivePlan(const FString& Reason)
 			ActivePlan.Steps.Num());
 	}
 	ActivePlan = FNPCAutonomyPlan();
+	UnfinishedWaterPlantID.Reset();
+	UnfinishedWaterSinceWorldTime = -1.0;
+	PlanSuspendedWorldTime = -1.0;
+	bSuspendedPlanReleased = false;
 	if (bReleasedExpressionOverlay)
 	{
 		ResetExpressionMorphs();
@@ -4259,6 +5495,40 @@ bool UNPCAutonomyComponent::ShouldSuspendActivePlan(const FString& InterruptionR
 	if (InterruptionReason.Equals(TEXT("player_requested_social_seat"), ESearchCase::IgnoreCase))
 	{
 		return true;
+	}
+
+	// An interrupted watering pass whose plant still needs water is resumable, so it can be picked up again
+	// after the interaction (the pre-resume validity check decides whether it is still worth doing).
+	if (bActivityRunning
+		&& CurrentActivityID.Equals(TEXT("water_flower"), ESearchCase::IgnoreCase)
+		&& BoundWaterPlant.IsValid()
+		&& BoundWaterPlant->NeedsWater())
+	{
+		return true;
+	}
+
+	if (bEnableConcernCompetition)
+	{
+		if (ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended)
+		{
+			// Already parked: a repeated interruption must not re-judge (and possibly discard) it; the resume
+			// check decides later.
+			return true;
+		}
+		// Score instead of fixed rules: commitment and remaining task steps feed the plan's concern score,
+		// and the plan is kept only while that score reaches the keep threshold.
+		FString Breakdown;
+		const float Score = ComputePlanConcern(&Breakdown);
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[PlanCompetition] suspend check. Reason=%s Score=%.0f Keep>=%.0f (%s) -> %s"),
+			*InterruptionReason,
+			Score,
+			PlanKeepThreshold,
+			*Breakdown,
+			Score >= PlanKeepThreshold ? TEXT("keep") : TEXT("discard"));
+		return Score >= PlanKeepThreshold;
 	}
 
 	if (ActivePlan.Commitment.Equals(TEXT("medium"), ESearchCase::IgnoreCase))
@@ -4294,6 +5564,11 @@ void UNPCAutonomyComponent::SuspendOrDiscardPlan(const FString& InterruptionReas
 		{
 			ActivePlan.Status = ENPCAutonomyPlanStatus::Suspended;
 			++TotalPlanInterruptions;
+			if (const UWorld* SuspendWorld = GetWorld())
+			{
+				PlanSuspendedWorldTime = SuspendWorld->GetTimeSeconds();
+			}
+			RecordPlanEvent(TEXT("plan_suspended"), InterruptionReason);
 			UE_LOG(
 				LogTemp,
 				Log,
@@ -4328,6 +5603,19 @@ bool UNPCAutonomyComponent::StartActivity(
 			? ForcedSeatID
 			: FindAvailableSeatOppositePlayerID();
 		return !SeatID.IsEmpty() && BeginSeatInvitation(Activity, SeatID, Reason);
+	}
+
+	// Watering is bound to exactly one plant (reserved) before any state changes, so the walk, the
+	// animation and the moisture change all refer to the same plant.
+	AWaterablePlantActor* WaterTarget = nullptr;
+	if (IsWaterActivity(Activity))
+	{
+		WaterTarget = BindWaterTarget(Activity);
+		if (!WaterTarget)
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[Watering] no plant could be bound; activity not started."));
+			return false;
+		}
 	}
 
 	CurrentActivityID = ActivityID;
@@ -4485,7 +5773,14 @@ bool UNPCAutonomyComponent::StartActivity(
 		&& FoodCarryComponent
 		&& FoodCarryComponent->IsCarryingFood();
 
-	if (!bResumingTablewareReturn
+	if (WaterTarget)
+	{
+		if (!IsMaidNearPlant(*WaterTarget))
+		{
+			ActionQueueComponent->EnqueueMoveToSceneTag(FString::Printf(TEXT("id:%s"), *WaterTarget->PlantID));
+		}
+	}
+	else if (!bResumingTablewareReturn
 		&& !Activity.TargetSceneTag.TrimStartAndEnd().IsEmpty()
 		&& !IsMaidNearSceneTargetTag(Activity.TargetSceneTag))
 	{
@@ -4514,17 +5809,53 @@ bool UNPCAutonomyComponent::StartActivity(
 			*ActivityID,
 			*Activity.HeldPropMesh.ToSoftObjectPath().ToString());
 	}
+	// Watering needs enough animation time to bring the bound plant up to its clear line.
+	const float WaterNeededSeconds = WaterTarget
+		? FMath::Max(WaterTarget->NeedsWaterClearMoisture - WaterTarget->GetMoisture(), 0.0f)
+			/ FMath::Max(WateringMoisturePerSecond, 0.1f)
+		: 0.0f;
 	if (ActiveActivityAnimation)
 	{
-		ActionQueueComponent->EnqueueAnimation(
-			ActiveActivityAnimation,
-			Activity.AnimationSlotName,
-			Activity.AnimationPlayRate,
-			Activity.AnimationFallbackSeconds);
+		if (WaterTarget)
+		{
+			const float OneLoopSeconds = FMath::Max(
+				ActiveActivityAnimation->GetPlayLength() / FMath::Max(FMath::Abs(Activity.AnimationPlayRate), 0.01f),
+				0.5f);
+			const int32 Loops = FMath::Clamp(
+				FMath::CeilToInt(WaterNeededSeconds / OneLoopSeconds),
+				1,
+				FMath::Max(MaxWateringAnimationLoops, 1));
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("[Watering] animation loops=%d needed=%.1fs oneLoop=%.1fs plant=%s moisture=%.1f"),
+				Loops,
+				WaterNeededSeconds,
+				OneLoopSeconds,
+				*WaterTarget->PlantID,
+				WaterTarget->GetMoisture());
+			ActionQueueComponent->EnqueueLoopedAnimation(
+				ActiveActivityAnimation,
+				Loops,
+				Activity.AnimationSlotName,
+				Activity.AnimationPlayRate,
+				Activity.AnimationFallbackSeconds);
+		}
+		else
+		{
+			ActionQueueComponent->EnqueueAnimation(
+				ActiveActivityAnimation,
+				Activity.AnimationSlotName,
+				Activity.AnimationPlayRate,
+				Activity.AnimationFallbackSeconds);
+		}
 	}
 	else if (!bResumingTablewareReturn)
 	{
-		ActionQueueComponent->EnqueueWait(Activity.AnimationFallbackSeconds);
+		ActionQueueComponent->EnqueueWait(
+			WaterTarget
+				? FMath::Clamp(WaterNeededSeconds, Activity.AnimationFallbackSeconds, 40.0f)
+				: Activity.AnimationFallbackSeconds);
 		UE_LOG(LogTemp, Warning, TEXT("[Autonomy] animation not loaded for %s; using wait fallback."), *ActivityID);
 	}
 	if (HeldPropMesh)
@@ -4589,13 +5920,15 @@ bool UNPCAutonomyComponent::StartSeatActivitySequence(
 	ActiveActivityAnimation = SeatedIdle;
 	ActionQueueComponent->EnqueueMoveToSeatID(SeatID.TrimStartAndEnd());
 	ActionQueueComponent->EnqueueEnterSeat();
-	ActionQueueComponent->EnqueueAnimation(SitDown, FName(TEXT("DefaultSlot")), 1.0f, 3.0f);
+	// Seated poses hand over to each other before blending out, otherwise she pops up to the standing
+	// base pose for a moment between two montages.
+	ActionQueueComponent->EnqueueSeamlessAnimation(SitDown, 1, FName(TEXT("DefaultSlot")), 1.0f, 3.0f);
 	if (Activity.ActivityID.Equals(TEXT("sit_with_player"), ESearchCase::IgnoreCase))
 	{
 		return true;
 	}
 
-	ActionQueueComponent->EnqueueLoopedAnimation(
+	ActionQueueComponent->EnqueueSeamlessAnimation(
 		SeatedIdle,
 		FMath::Max(SeatedIdleLoopCount, 1),
 		FName(TEXT("DefaultSlot")),
@@ -4804,15 +6137,16 @@ void UNPCAutonomyComponent::QueueSeatedConversationAnimation(bool bConversationP
 	ActiveActivityAnimation = Animation;
 	if (bConversationPerformance)
 	{
-		ActionQueueComponent->EnqueueAnimation(
+		ActionQueueComponent->EnqueueSeamlessAnimation(
 			Animation,
+			1,
 			FName(TEXT("DefaultSlot")),
 			1.0f,
 			5.0f);
 	}
 	else
 	{
-		ActionQueueComponent->EnqueueLoopedAnimation(
+		ActionQueueComponent->EnqueueSeamlessAnimation(
 			Animation,
 			FMath::Clamp(SeatedConversationIdleLoopsPerCycle, 1, 4),
 			FName(TEXT("DefaultSlot")),
@@ -5096,37 +6430,9 @@ void UNPCAutonomyComponent::HandleBlueprintActivityTimeout()
 
 void UNPCAutonomyComponent::ApplyActivitySuccess(const FNPCAutonomyActivityDefinition& Activity)
 {
-	AWaterablePlantActor* WateredPlant = nullptr;
-	const FString TargetSceneTag = Activity.TargetSceneTag.TrimStartAndEnd();
-	if (!TargetSceneTag.IsEmpty() && MaidNPCActor)
-	{
-		float BestDistanceSq = TNumericLimits<float>::Max();
-		if (UWorld* World = GetWorld())
-		{
-			for (TActorIterator<AWaterablePlantActor> It(World); It; ++It)
-			{
-				AWaterablePlantActor* Plant = *It;
-				if (!Plant || !Plant->IsAvailableForTag(TargetSceneTag))
-				{
-					continue;
-				}
-
-				const float DistanceSq = FVector::DistSquared2D(
-					MaidNPCActor->GetActorLocation(),
-					Plant->GetPlantTargetLocation());
-				if (DistanceSq < BestDistanceSq)
-				{
-					BestDistanceSq = DistanceSq;
-					WateredPlant = Plant;
-				}
-			}
-		}
-	}
-
-	if (WateredPlant)
-	{
-		WateredPlant->WaterPlant(100.0f, false);
-	}
+	// Watering is no longer an instant refill: moisture was added per second while the animation played
+	// (HandleWateringProgressTick), so success only releases the bound plant.
+	AWaterablePlantActor* WateredPlant = IsWaterActivity(Activity) ? BoundWaterPlant.Get() : nullptr;
 
 	MotiveState.Boredom = FMath::Clamp(
 		MotiveState.Boredom - FMath::Max(Activity.StimulationGain, 0.0f),
@@ -5147,6 +6453,7 @@ void UNPCAutonomyComponent::ApplyActivitySuccess(const FNPCAutonomyActivityDefin
 	}
 	if (WateredPlant)
 	{
+		ReleaseWaterBinding(TEXT("completed"), true);
 		WateredPlant->RefreshAutonomyWorldState(false);
 	}
 	if (!Activity.TargetSceneTag.TrimStartAndEnd().IsEmpty())
@@ -5173,6 +6480,10 @@ void UNPCAutonomyComponent::FinishActivity(bool bInterrupted)
 	}
 
 	const FString FinishedActivityID = CurrentActivityID;
+	if (BoundWaterPlant.IsValid())
+	{
+		ReleaseWaterBinding(bInterrupted ? TEXT("activity_failed") : TEXT("activity_finished"), !bInterrupted);
+	}
 	if (PendingInteractiveActivityID.Equals(FinishedActivityID, ESearchCase::IgnoreCase))
 	{
 		bAwaitingEmbodiedResponse = false;
@@ -5511,6 +6822,28 @@ void UNPCAutonomyComponent::PreparePlayerSpeechStartle()
 
 void UNPCAutonomyComponent::HandleInteractiveLLMRequestStarted()
 {
+	// A new utterance calls her attention back: an earlier release no longer applies.
+	// (LastPlayerSpeechWorldTime is updated by PreparePlayerSpeechStartle below.)
+	bSuspendedPlanReleased = false;
+	if (ResearchLoggerComponent)
+	{
+		// One id per player utterance; every later event carries it until the next utterance.
+		ResearchLoggerComponent->BeginInteraction();
+		TSharedRef<FJsonObject> InteractionPayload = MakeShared<FJsonObject>();
+		InteractionPayload->SetStringField(TEXT("activity"), CurrentActivityID);
+		InteractionPayload->SetBoolField(TEXT("activity_running"), bActivityRunning);
+		InteractionPayload->SetStringField(TEXT("plan_goal"), ActivePlan.Goal);
+		InteractionPayload->SetNumberField(TEXT("plan_status"), static_cast<int32>(ActivePlan.Status));
+		InteractionPayload->SetNumberField(TEXT("plan_step_index"), ActivePlan.CurrentStepIndex);
+		InteractionPayload->SetStringField(TEXT("service_state"), GetServiceStateName());
+		InteractionPayload->SetStringField(TEXT("bound_plant"), BoundWaterPlant.IsValid() ? BoundWaterPlant->PlantID : FString());
+		RecordResearchEvent(TEXT("interaction_started"), InteractionPayload);
+	}
+	if (const UWorld* PendingWorld = GetWorld())
+	{
+		// Cleared when the reply arrives; the timeout covers failed requests.
+		InteractiveRequestPendingUntilWorldTime = PendingWorld->GetTimeSeconds() + 15.0;
+	}
 	StopInteractiveFacingPlayer();
 	PreparePlayerSpeechStartle();
 	bStartlePreparedForCurrentInteraction = false;
@@ -5561,6 +6894,18 @@ bool UNPCAutonomyComponent::CanPreserveActivityForEmbodiedResponse() const
 
 void UNPCAutonomyComponent::HandleEmbodiedResponseRequested(const FNPCEmbodiedResponseSignal& Signal)
 {
+	InteractiveRequestPendingUntilWorldTime = -1.0;
+	if (Signal.bPlayerReleasedNPC)
+	{
+		if (bEnablePlayerReleaseResume)
+		{
+			ReleaseSuspendedPlan(TEXT("player_released"), ReleaseResumeDelaySeconds);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Log, TEXT("[PlanRelease] player release ignored (bEnablePlayerReleaseResume=false)."));
+		}
+	}
 	const bool bLocalStartleTriggered = bPendingPlayerSpeechStartle;
 	if (!bEnableEmbodiedResponseCoordination)
 	{
@@ -5776,6 +7121,16 @@ void UNPCAutonomyComponent::HandleEmbodiedResponseRequested(const FNPCEmbodiedRe
 
 void UNPCAutonomyComponent::HandleInteractiveReplyFinished()
 {
+	RecordResearchEvent(TEXT("interaction_reply_finished"), MakeShared<FJsonObject>());
+	if (const UWorld* World = GetWorld())
+	{
+		LastInteractiveReplyFinishedWorldTime = World->GetTimeSeconds();
+	}
+	if (bSuspendedPlanReleased && ActivePlan.Status == ENPCAutonomyPlanStatus::Suspended && !bActivityRunning)
+	{
+		// The reply that acknowledged the release has been spoken; go back to the plan now.
+		ScheduleNextDecision(1.0f);
+	}
 	ResumePausedActivityAfterInteraction();
 	StopInteractiveFacingPlayer();
 }
@@ -6098,6 +7453,15 @@ void UNPCAutonomyComponent::HandleServiceStateChanged(ECafeServiceState NewState
 		bHasEncounteredPlayer = true;
 		UE_LOG(LogTemp, Log, TEXT("[AutonomyPlanTest] player encounter observed; visible validation is now enabled."));
 	}
+	const bool bNowWaitingForOrder = NewState == ECafeServiceState::WaitingForOrder;
+	if (bNowWaitingForOrder != bOrderWaitActive)
+	{
+		bOrderWaitActive = bNowWaitingForOrder;
+		bOrderWaitNudgeSpoken = false;
+		bSuspendedPlanReleased = false;
+		const UWorld* World = GetWorld();
+		OrderWaitStartWorldTime = bNowWaitingForOrder && World ? World->GetTimeSeconds() : -1.0;
+	}
 	if (!IsServiceStateAutonomyAllowed(NewState))
 	{
 		ResourceState.Energy = FMath::Clamp(
@@ -6404,6 +7768,34 @@ void UNPCAutonomyComponent::HandleAutonomyDecisionReceived(
 		*ResolveCurrentPerformanceTone(),
 		*SurfaceThought,
 		*FString::Join(ActivePlan.Steps, TEXT(",")));
+	RecordPlanEvent(TEXT("plan_created"), LastDecisionTrigger);
+
+	if (ValidatedSteps.ContainsByPredicate([](const FString& Step)
+		{
+			return Step.Equals(TEXT("water_flower"), ESearchCase::IgnoreCase);
+		}))
+	{
+		FString PlantSummary;
+		for (TActorIterator<AWaterablePlantActor> It(GetWorld()); It; ++It)
+		{
+			if (const AWaterablePlantActor* Plant = *It)
+			{
+				PlantSummary += FString::Printf(TEXT("%s:%.0f/%s/needs=%d "),
+					*Plant->PlantID, Plant->GetMoisture(), *Plant->GetMoistureTierName(), Plant->NeedsWater() ? 1 : 0);
+			}
+		}
+		UE_LOG(
+			LogTemp,
+			Log,
+			TEXT("[WaterDecision] LLM chose watering. Trigger=%s Energy=%.0f Boredom=%.0f Duty=%.0f Emotion=%s Service=%s Plants=%s"),
+			*LastDecisionTrigger,
+			ResourceState.Energy,
+			MotiveState.Boredom,
+			MotiveState.Duty,
+			*CurrentEmotionLabel,
+			*GetServiceStateName(),
+			*PlantSummary);
+	}
 
 	if (!TryStartCurrentPlanStep())
 	{

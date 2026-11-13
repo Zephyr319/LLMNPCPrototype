@@ -37,6 +37,8 @@ namespace
 		return Payload;
 	}
 
+	TWeakObjectPtr<UNPCResearchLoggerComponent> GActiveResearchLogger;
+
 	TArray<TSharedPtr<FJsonValue>> NamesToJsonValues(const TArray<FName>& Names)
 	{
 		TArray<TSharedPtr<FJsonValue>> Values;
@@ -90,8 +92,10 @@ void UNPCResearchLoggerComponent::BeginPlay()
 		}
 	}
 
+	GActiveResearchLogger = this;
 	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 	Payload->SetStringField(TEXT("map"), GetWorld() ? GetWorld()->GetMapName() : TEXT("unknown"));
+	Payload->SetNumberField(TEXT("log_schema_version"), 2);
 	RecordStructuredEvent(TEXT("session_started"), SerializeJsonObject(Payload));
 	UE_LOG(LogTemp, Log, TEXT("[NPCResearch] session log started. Path=%s"), *LogFilePath);
 }
@@ -100,6 +104,10 @@ void UNPCResearchLoggerComponent::EndPlay(const EEndPlayReason::Type EndPlayReas
 {
 	if (bLoggingEnabled && !LogFilePath.IsEmpty())
 	{
+		if (!TrialID.IsEmpty())
+		{
+			EndTrial(TEXT("session_ended_before_trial_end"));
+		}
 		TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
 		Payload->SetNumberField(TEXT("end_play_reason"), static_cast<int32>(EndPlayReason));
 		RecordStructuredEvent(TEXT("session_ended"), SerializeJsonObject(Payload));
@@ -123,7 +131,56 @@ void UNPCResearchLoggerComponent::EndPlay(const EEndPlayReason::Type EndPlayReas
 			Autonomy->OnAutonomyActivityFinished.RemoveDynamic(this, &UNPCResearchLoggerComponent::HandleActivityFinished);
 		}
 	}
+	if (GActiveResearchLogger.Get() == this)
+	{
+		GActiveResearchLogger.Reset();
+	}
 	Super::EndPlay(EndPlayReason);
+}
+
+UNPCResearchLoggerComponent* UNPCResearchLoggerComponent::GetActiveLogger()
+{
+	return GActiveResearchLogger.Get();
+}
+
+void UNPCResearchLoggerComponent::RecordGlobalEvent(const FString& EventType, const FString& PayloadJson)
+{
+	if (UNPCResearchLoggerComponent* Logger = GActiveResearchLogger.Get())
+	{
+		Logger->RecordStructuredEvent(EventType, PayloadJson);
+	}
+}
+
+void UNPCResearchLoggerComponent::BeginTrial(const FString& InTrialID, const FString& InCondition)
+{
+	if (!TrialID.IsEmpty())
+	{
+		EndTrial(TEXT("superseded_by_new_trial"));
+	}
+	TrialID = InTrialID.TrimStartAndEnd();
+	TrialCondition = InCondition.TrimStartAndEnd();
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("map"), GetWorld() ? GetWorld()->GetMapName() : TEXT("unknown"));
+	RecordStructuredEvent(TEXT("trial_started"), SerializeJsonObject(Payload));
+	UE_LOG(LogTemp, Warning, TEXT("[Trial] started. Trial=%s Condition=%s"), *TrialID, *TrialCondition);
+}
+
+void UNPCResearchLoggerComponent::EndTrial(const FString& Note)
+{
+	if (TrialID.IsEmpty())
+	{
+		return;
+	}
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("note"), Note);
+	RecordStructuredEvent(TEXT("trial_ended"), SerializeJsonObject(Payload));
+	UE_LOG(LogTemp, Warning, TEXT("[Trial] ended. Trial=%s Note=%s"), *TrialID, *Note);
+	TrialID.Reset();
+}
+
+int32 UNPCResearchLoggerComponent::BeginInteraction()
+{
+	return ++InteractionID;
 }
 
 void UNPCResearchLoggerComponent::RecordStructuredEvent(const FString& EventType, const FString& PayloadJson)
@@ -137,6 +194,11 @@ void UNPCResearchLoggerComponent::RecordStructuredEvent(const FString& EventType
 	Root->SetStringField(TEXT("timestamp_utc"), FDateTime::UtcNow().ToIso8601());
 	Root->SetStringField(TEXT("session_id"), SessionID);
 	Root->SetStringField(TEXT("event_type"), EventType.TrimStartAndEnd());
+	Root->SetNumberField(TEXT("seq"), static_cast<double>(++EventSequence));
+	Root->SetNumberField(TEXT("world_time"), GetWorld() ? GetWorld()->GetTimeSeconds() : -1.0);
+	Root->SetStringField(TEXT("trial_id"), TrialID);
+	Root->SetStringField(TEXT("condition"), TrialCondition);
+	Root->SetNumberField(TEXT("interaction_id"), InteractionID);
 	Root->SetObjectField(TEXT("payload"), ParsePayloadObject(PayloadJson));
 	const FString Line = SerializeJsonObject(Root) + LINE_TERMINATOR;
 	if (!FFileHelper::SaveStringToFile(

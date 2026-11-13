@@ -65,6 +65,10 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "NPC Dialogue UI")
 	void SetDialogueWidget(UUserWidget* Widget);
 
+	// Scripted input for experiments (Cafe.Say): takes exactly the same path as the Send button.
+	UFUNCTION(BlueprintCallable, Category = "NPC Dialogue UI")
+	void SubmitPlayerMessage(const FString& Message);
+
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Dialogue UI")
 	UUserWidget* GetDialogueWidget() const;
 

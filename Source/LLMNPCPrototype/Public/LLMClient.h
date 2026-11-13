@@ -140,6 +140,13 @@ public:
     UFUNCTION(BlueprintCallable, Category = "LLM|Social")
     int32 SendSocialOpportunityMessage(const FString& ContextJson);
 
+    // Asks the model to word one short spontaneous utterance from an intent description (no fixed line).
+    // Speaks the model's reply; speaks FallbackLine only if the request fails (empty = stay silent).
+    // Dropped silently when a player-facing request is pending or starts before the reply arrives.
+    // Returns the request id, or 0 when nothing was sent.
+    UFUNCTION(BlueprintCallable, Category = "LLM|Autonomy")
+    int32 RequestAutonomyUtterance(const FString& IntentJson, const FString& FallbackLine);
+
     UFUNCTION(BlueprintCallable, BlueprintPure, Category = "LLM|Social")
     bool IsInteractiveRequestPending() const;
 
@@ -286,6 +293,14 @@ private:
         FHttpResponsePtr Response,
         bool bWasSuccessful,
         int32 RequestId
+    );
+
+    void OnAutonomyUtteranceResponseReceived(
+        FHttpRequestPtr Request,
+        FHttpResponsePtr Response,
+        bool bWasSuccessful,
+        int32 BaseInteractiveRequestId,
+        FString FallbackLine
     );
 
     void OnAutonomyResponseReceived(

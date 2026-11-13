@@ -11,6 +11,7 @@
 #include "VoicevoxTTSClient.h"
 #include "Components/ActorComponent.h"
 #include "CafeServiceManagerActor.h"
+#include "CafeWorldSnapshotSubsystem.h"
 #include "Engine/World.h"
 #include "EmotionClient.h"
 #include "GameFramework/Actor.h"
@@ -18,6 +19,9 @@
 #include "NPCActionQueueComponent.h"
 #include "NPCAutonomyComponent.h"
 #include "NPCPersonaProfile.h"
+#include "NPCResearchLoggerComponent.h"
+#include "NPCFaceTargetComponent.h"
+#include "Kismet/GameplayStatics.h"
 
 FOnInteractiveLLMRequestStartedNative ULLMClient::OnAnyInteractiveRequestStarted;
 FOnInteractionMemoryExtractedNative ULLMClient::OnInteractionMemoryExtracted;
@@ -29,6 +33,28 @@ TWeakObjectPtr<ULLMClient> ULLMClient::MostRecentInteractiveClient;
 namespace
 {
     int32 GServiceSpeechDispatchDepth = 0;
+    // Several LLM clients can share one voice component. Only its latest speaker owns completion.
+    TMap<TWeakObjectPtr<UVoicevoxTTSClient>, TWeakObjectPtr<ULLMClient>> GVoicevoxSpeechOwners;
+
+    void RequestPlayerFacingForSpeech(UWorld* World, UVoicevoxTTSClient* VoiceSource, const FString& SpeechText)
+    {
+        if (!World || SpeechText.IsEmpty())
+        {
+            return;
+        }
+        ACafeServiceManagerActor* Manager = ACafeServiceManagerActor::FindForWorld(World);
+        AActor* Maid = Manager ? Manager->MaidNPCActor : (VoiceSource ? VoiceSource->GetOwner() : nullptr);
+        AActor* Player = UGameplayStatics::GetPlayerPawn(World, 0);
+        if (IsValid(Maid) && Maid->GetWorld() == World && IsValid(Player))
+        {
+            if (UNPCFaceTargetComponent* Facing = Maid->FindComponentByClass<UNPCFaceTargetComponent>())
+            {
+                // The subtitle window also works when TTS is disabled or its local server is offline.
+                const float SubtitleSeconds = FMath::Clamp(2.0f + SpeechText.Len() / 7.0f, 3.0f, 18.0f);
+                Facing->StartSpeechFacing(Player, VoiceSource, SubtitleSeconds);
+            }
+        }
+    }
 
     const FString OpenAIChatCompletionsUrl = TEXT("https://api.openai.com/v1/chat/completions");
 
@@ -199,10 +225,22 @@ namespace
 
     FString BuildStrategyUserContent(const FString& UserMessage, const UObject* WorldContextObject)
     {
-		const ACafeServiceManagerActor* ServiceManager = ACafeServiceManagerActor::FindForWorld(WorldContextObject);
-		const FCafeServiceSnapshot ServiceSnapshot = ServiceManager
+		ACafeServiceManagerActor* ServiceManager = ACafeServiceManagerActor::FindForWorld(WorldContextObject);
+		FCafeWorldSnapshot WorldSnapshot;
+		bool bHasWorldSnapshot = false;
+		if (UCafeWorldSnapshotSubsystem* SnapshotSubsystem = UCafeWorldSnapshotSubsystem::Get(WorldContextObject))
+		{
+			WorldSnapshot = SnapshotSubsystem->CaptureSnapshot(ServiceManager);
+			bHasWorldSnapshot = true;
+		}
+		const FCafeServiceSnapshot ServiceSnapshot = bHasWorldSnapshot
+			? WorldSnapshot.Service
+			: ServiceManager
 			? ServiceManager->GetServiceSnapshot()
 			: FCafeServiceSnapshot();
+		const FCafePlayerSnapshot PlayerSnapshot = bHasWorldSnapshot
+			? WorldSnapshot.Player
+			: FCafePlayerSnapshot();
 		const bool bPlayerInTableArea = ServiceSnapshot.bPlayerInTableArea;
 		const bool bSeatedForService = ServiceSnapshot.bSeatedForService;
 		const bool bGuidingPlayer = ServiceSnapshot.bGuideInProgress;
@@ -213,18 +251,23 @@ namespace
 		const FString CurrentGuideTargetID = ServiceSnapshot.CurrentGuideTargetID;
 		const FString MealCompletionTableID = ServiceSnapshot.MealCompletionTableID;
 		const FString CompletedServiceTableID = ServiceSnapshot.CompletedServiceTableID;
-		const FString ServiceState = ServiceManager
-			? ServiceManager->GetUnifiedServiceStateName()
-			: TEXT("reception");
+		const FString ServiceState = ServiceSnapshot.PhaseName;
 		const FString PlayerVoiceEmotion = UEmotionClient::GetLatestPlayerVoiceEmotion();
 		UNPCAutonomyComponent* AutonomyComponent = UNPCAutonomyComponent::GetPrimaryAutonomyComponent();
 		const FString NPCBehaviorContext = AutonomyComponent
-			? AutonomyComponent->BuildInteractiveDialogueContext()
+			? AutonomyComponent->BuildInteractiveDialogueContext(bHasWorldSnapshot ? &WorldSnapshot : nullptr)
 			: TEXT("{}");
 		UE_LOG(LogTemp, Log, TEXT("[DialogueContext] captured before interruption: %s"), *NPCBehaviorContext);
         return FString::Printf(
-			TEXT("State: %s\nIsGuidingPlayer: %s\nCurrentGuideTargetID: %s\nIsSeatedForService: %s\nPlayerInTableArea: %s\nbPlayerInTableArea: %s\nCurrentServiceTableID: %s\nbSeatingGuidanceCompleted: %s\nSeatingGuidanceCompleted: %s\nMealCompletionConfirmationPending: %s\nMealCompletionConfirmationTableID: %s\nDiningServiceCompleted: %s\nCompletedServiceTableID: %s\nDetectedPlayerVoiceEmotion: %s\nNPCBehaviorContext: %s\nUser: %s"),
+			TEXT("State: %s\nRawServiceState: %s\nPlayerExists: %s\nPlayerPresentInServiceScene: %s\nPlayerPose: %s\nPlayerActivity: %s\nPlayerZone: %s\nPlayerActuallySeated: %s\nIsGuidingPlayer: %s\nCurrentGuideTargetID: %s\nIsSeatedForService: %s\nPlayerInTableArea: %s\nbPlayerInTableArea: %s\nCurrentServiceTableID: %s\nbSeatingGuidanceCompleted: %s\nSeatingGuidanceCompleted: %s\nMealCompletionConfirmationPending: %s\nMealCompletionConfirmationTableID: %s\nDiningServiceCompleted: %s\nCompletedServiceTableID: %s\nDetectedPlayerVoiceEmotion: %s\nNPCBehaviorContext: %s\nUser: %s"),
             *ServiceState,
+			*ServiceSnapshot.StateName,
+			PlayerSnapshot.bExists ? TEXT("true") : TEXT("false"),
+			PlayerSnapshot.bInServiceScene ? TEXT("true") : TEXT("false"),
+			*PlayerSnapshot.Pose,
+			*PlayerSnapshot.Activity,
+			*PlayerSnapshot.Zone,
+			PlayerSnapshot.bSeated ? TEXT("true") : TEXT("false"),
             bGuidingPlayer ? TEXT("true") : TEXT("false"),
             CurrentGuideTargetID.IsEmpty() ? TEXT("none") : *CurrentGuideTargetID,
             bSeatedForService ? TEXT("true") : TEXT("false"),
@@ -300,6 +343,20 @@ namespace
 			TEXT("sit across from me"), TEXT("sit opposite me"), TEXT("sit with me")
 		};
 		return ContainsAnyInteractionTerm(Message, DirectSitTerms);
+	}
+
+	// Clear "go and do your own work" phrases. Used as a local safety net when the model does not set
+	// player_released_npc although a suspended plan is waiting (the model sometimes ignores the rule).
+	bool IsDirectReleaseRequest(const FString& UserMessage)
+	{
+		const FString Message = UserMessage.TrimStartAndEnd();
+		const TArray<FString> ReleaseTerms = {
+			TEXT("你先去忙吧"), TEXT("你去忙吧"), TEXT("先去忙吧"), TEXT("去忙吧"), TEXT("你先忙"), TEXT("先忙你的"),
+			TEXT("忙你的吧"), TEXT("做你自己的事"), TEXT("做你自己的事情"), TEXT("不用管我"), TEXT("别管我"), TEXT("你忙你的"), TEXT("继续忙吧"), TEXT("继续去忙"),
+			TEXT("先に仕事して"), TEXT("先にお仕事"), TEXT("お仕事に戻って"), TEXT("仕事に戻って"), TEXT("私のことは気にしないで"),
+			TEXT("go ahead and work"), TEXT("go back to work"), TEXT("don't mind me"), TEXT("you can go do your work")
+		};
+		return ContainsAnyInteractionTerm(Message, ReleaseTerms);
 	}
 
 	bool IsDirectEndSeatedConversationRequest(const FString& UserMessage)
@@ -528,6 +585,7 @@ namespace
 
         ResponseObject->TryGetBoolField(TEXT("enabled"), Signal.bEnabled);
         ResponseObject->TryGetBoolField(TEXT("resume_after_reply"), Signal.bResumeAfterReply);
+        ResponseObject->TryGetBoolField(TEXT("player_released_npc"), Signal.bPlayerReleasedNPC);
         Signal.ReactionStyle = GetStringFieldOrDefault(ResponseObject, TEXT("reaction_style"), TEXT("neutral")).TrimStartAndEnd().ToLower();
         Signal.BaseActionPolicy = GetStringFieldOrDefault(ResponseObject, TEXT("base_action_policy"), TEXT("stop")).TrimStartAndEnd().ToLower();
         Signal.FaceIntent = GetStringFieldOrDefault(ResponseObject, TEXT("face"), TEXT("neutral")).TrimStartAndEnd().ToLower();
@@ -1351,6 +1409,9 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
 			"- When Sumiha is noticed using her phone, choose a context-appropriate reaction instead of one fixed response. She may be mildly embarrassed about taking a short puzzle-game break, keep playing if no duty is urgent, lower or hide the phone, or admit it honestly. Base the choice on her current emotion, workload, and the player's wording.\n"
 			"- The available shush performance is a full-body animation, so it cannot layer over phone_at_counter. For playful embarrassment with a visible shush, use transition + startled_blush + player gaze + shush + remove the phone + whisper + resume_after_reply false.\n"
 			"- For absorption in a tense phone game, a valid combination is continue + alert + alternate_phone_player gaze + keep_current hands and prop + hurried or nervous voice.\n"
+			"- player_released_npc is about the player's utterance, not about delivery. Set it true only when the player clearly lets Sumiha leave them for now and get back to her own work, for example \u4F60\u5148\u53BB\u5FD9\u5427, \u4E0D\u7528\u7BA1\u6211, \u5148\u306B\u304A\u4ED5\u4E8B\u3057\u3066\u3066, \u6C7A\u307E\u3063\u305F\u3089\u547C\u3073\u307E\u3059, go ahead, or I will call you later. Thanks, small talk, questions and service requests are not a release; use false for them.\n"
+			"- When player_released_npc is true and NPCBehaviorContext.active_plan.status is suspended, Sumiha will really go back to that interrupted plan after the reply. The reply must say so using active_plan.goal or active_plan.interrupted_step, and ask the player to call her when they are ready. Never say she will rest or do something that is not in the plan.\n"
+			"- When player_released_npc is true but there is no suspended active_plan, simply thank the player and say she will be nearby; do not invent a task.\n"
             "\n"
 
             "Decision and action rules:\n"
@@ -1381,9 +1442,15 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- If the user says \u5E26\u6211\u53BB3\u53F7\u684C, \u6848\u5185\u6211\u52303\u53F7\u684C, \u5E26\u8DEF\u53BB3\u53F7\u684C, show me to table 3, or guide me to table 3, output {\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"Table_03\",\"quantity\":0}.\n"
             "- In the entrance/reception flow, if the user confirms dining or asks to be seated, such as \u662F, \u53EF\u4EE5, \u6211\u8981\u7528\u9910, \u7528\u9910, \u5E26\u6211\u53BB\u5EA7\u4F4D, \u5E26\u6211\u53BB\u5E2D\u4F4D, yes, sure, seat me, \u306F\u3044, \u304A\u9858\u3044\u3057\u307E\u3059, or \u304A\u5E2D\u3078\u304A\u9858\u3044\u3057\u307E\u3059, output {\"type\":\"guide_player_to_table\",\"timing\":\"immediate\",\"item\":\"nearest\",\"quantity\":0}.\n"
             "\n"
+            "Canonical state facts:\n"
+            "- State is the service workflow phase only: reception, guiding, waiting_for_order, order_in_progress, served, meal_confirmation, or post_meal. It is not the player's pose or location.\n"
+            "- PlayerActuallySeated and PlayerPose are the authoritative physical posture. Only say the customer is seated when PlayerActuallySeated is true or PlayerPose is seated.\n"
+            "- PlayerInTableArea and PlayerZone describe location only. Being near a table never proves that the customer is seated.\n"
+            "- IsSeatedForService is a legacy workflow-readiness flag. It can remain true after the customer stands up, so never use it as physical posture.\n"
+            "\n"
             "Reception menu inquiry and pre-seating intent rules:\n"
             "- These reception rules do not apply when State is guiding or IsGuidingPlayer is true; during guiding, keep the current guide and answer verbally.\n"
-            "- Reception means State is reception, IsSeatedForService is false, PlayerInTableArea is false, and seating guidance has not completed.\n"
+            "- Reception means State is reception and no guide is in progress.\n"
             "- At reception, the NPC is asking whether the customer wants to dine. A menu question or recommendation question is not a confirmation to dine.\n"
             "- If the customer asks about menu items, available foods, recommendations, prices, or choices before confirming dining, answer the menu/recommendation first.\n"
             "- For reception menu/recommendation questions, do not output guide_player_to_table, place_order, order, serve, counter_then_return, or any action that goes to the counter or serves food.\n"
@@ -1406,39 +1473,32 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "- If IsGuidingPlayer is true, Sumiha is already guiding the customer to a table.\n"
             "- During guiding, menu or recommendation questions must be answered directly while continuing the current guide.\n"
             "- During guiding, do not output guide_player_to_table again.\n"
-            "- During guiding, do not output place_order unless IsSeatedForService is true.\n"
+            "- During guiding, do not output place_order. Wait until State is waiting_for_order.\n"
             "- If the user asks \u6709\u4EC0\u4E48\u63A8\u8350? during guiding, reply with a recommendation such as \u30AB\u30EC\u30FC\u30E9\u30A4\u30B9 and use recommend or speak only.\n"
             "- State: guiding. User: \u6709\u4EC0\u4E48\u63A8\u8350\uFF1F Expected decision: speak. Expected reply: \u304A\u3059\u3059\u3081\u306F\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u3002\u5E2D\u307E\u3067\u3054\u6848\u5185\u3057\u306A\u304C\u3089\u3001\u30E1\u30CB\u30E5\u30FC\u3082\u3054\u8AAC\u660E\u3057\u307E\u3059\u306D\u3002 Expected actions: [{\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}].\n"
             "- State: guiding. User: \u7ED9\u6211\u6765\u4E00\u4EFD\u62C9\u9762 Expected decision: speak. Expected reply: \u30E9\u30FC\u30E1\u30F3\u3067\u3059\u306D\u3002\u304A\u5E2D\u306B\u7740\u304D\u307E\u3057\u305F\u3089\u78BA\u8A8D\u3044\u305F\u3057\u307E\u3059\u306E\u3067\u3001\u3053\u306E\u307E\u307E\u3054\u6848\u5185\u3057\u307E\u3059\u3002 Expected actions: [].\n"
             "\n"
-            "Seated/order phase rules:\n"
-            "- The user message includes a State line. If State is seated, guide_player_to_table has completed and the customer is now seated.\n"
-            "- If State is in_table_area or PlayerInTableArea is true, the player is already in the table/menu/interaction area and must be treated as seated.\n"
-            "- After guide_player_to_table has completed, treat the customer as seated and in the order phase.\n"
-            "- If the player is in the table area, treat them as seated.\n"
-            "- In seated/order phase, recommendation or menu questions should be answered directly.\n"
-            "- If the customer is seated or in the table area, never output guide_player_to_table.\n"
-            "- Do not output guide_player_to_table after seating guidance is completed.\n"
+            "Order phase rules:\n"
+            "- State waiting_for_order means the seating guide has completed and the service can accept an order. It does not by itself prove the customer's current physical posture.\n"
+            "- In waiting_for_order, recommendation or menu questions should be answered directly.\n"
+            "- Do not output guide_player_to_table after seating guidance is completed or when State is waiting_for_order, order_in_progress, served, meal_confirmation, or post_meal.\n"
+            "- If PlayerActuallySeated is false, do not describe the customer as sitting even when ordering is allowed.\n"
             "- Do not repeat \"the menu is on the table\" as the only answer after the customer asks for recommendations.\n"
             "- Do not say \"\u307E\u305A\u306F\u304A\u5E2D\u3078\u3054\u6848\u5185\u3057\u307E\u3059\" after the player is in the table area.\n"
-            "- If the customer asks for recommendations after being seated, recommend a concrete item, preferably \u30AB\u30EC\u30FC\u30E9\u30A4\u30B9, and ask if they would like to order it.\n"
-            "- If the customer says \u7ED9\u6211\u6765\u4E00\u4EFD\u62C9\u9762, \u30E9\u30FC\u30E1\u30F3\u304F\u3060\u3055\u3044, or \u6211\u8981\u5496\u55B1 while in table area, output place_order.\n"
-            "- If the customer asks \u6709\u4EC0\u4E48\u63A8\u8350 or \u304A\u3059\u3059\u3081\u306F\uFF1F while in table area, answer with a recommendation directly.\n"
+            "- If the customer asks for recommendations in waiting_for_order, recommend a concrete item, preferably \u30AB\u30EC\u30FC\u30E9\u30A4\u30B9, and ask if they would like to order it.\n"
+            "- If the customer explicitly orders an item while State is waiting_for_order, output place_order.\n"
             "- Only output place_order when the customer explicitly orders or confirms the item.\n"
-            "- State: in_table_area. User: \u7ED9\u6211\u6765\u4E00\u4EFD\u62C9\u9762 Expected decision: place_order. Expected reply: \u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\u3002\u30E9\u30FC\u30E1\u30F3\u3092\u3054\u7528\u610F\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"place_order\",\"timing\":\"immediate\",\"item\":\"\u30E9\u30FC\u30E1\u30F3\",\"quantity\":1}].\n"
-            "- State: in_table_area. User: \u6709\u4EC0\u4E48\u63A8\u8350\uFF1F Expected decision: speak. Expected reply: \u304A\u3059\u3059\u3081\u306F\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u3002\u30B9\u30D1\u30A4\u30B7\u30FC\u3067\u98DF\u3079\u3084\u3059\u304F\u3001\u521D\u3081\u3066\u306E\u304A\u5BA2\u69D8\u306B\u3082\u4EBA\u6C17\u3067\u3059\u3002\u3088\u308D\u3057\u3051\u308C\u3070\u3054\u6CE8\u6587\u3092\u627F\u308A\u307E\u3059\u3002 Expected actions: [{\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}].\n"
-            "- State: seated. User: \u6709\u4EC0\u4E48\u63A8\u8350\uFF1F Expected decision: speak. Expected reply: \u304A\u3059\u3059\u3081\u306F\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u3002\u30B9\u30D1\u30A4\u30B7\u30FC\u3067\u98DF\u3079\u3084\u3059\u304F\u3001\u521D\u3081\u3066\u306E\u304A\u5BA2\u69D8\u306B\u3082\u4EBA\u6C17\u3067\u3059\u3002\u3088\u308D\u3057\u3051\u308C\u3070\u3054\u6CE8\u6587\u3092\u627F\u308A\u307E\u3059\u3002 Expected actions: [{\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}].\n"
-            "- State: seated. User: \u304A\u3059\u3059\u3081\u306F\uFF1F Expected decision: speak. Expected reply: \u304A\u3059\u3059\u3081\u306F\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u3002\u307B\u304B\u306B\u3082\u30E9\u30FC\u30E1\u30F3\u3084\u30B5\u30E9\u30C0\u304C\u3054\u3056\u3044\u307E\u3059\u3002\u6C17\u306B\u306A\u308B\u3082\u306E\u304C\u3042\u308C\u3070\u304A\u7533\u3057\u4ED8\u3051\u304F\u3060\u3055\u3044\u3002 Expected actions: [{\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}].\n"
-            "- State: seated. User: \u3058\u3083\u3042\u30AB\u30EC\u30FC\u3067 Expected decision: place_order. Expected reply: \u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\u3002\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3092\u3054\u7528\u610F\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"place_order\",\"timing\":\"immediate\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":1}].\n"
+            "- State: waiting_for_order. User: \u7ED9\u6211\u6765\u4E00\u4EFD\u62C9\u9762 Expected decision: place_order. Expected reply: \u304B\u3057\u3053\u307E\u308A\u307E\u3057\u305F\u3002\u30E9\u30FC\u30E1\u30F3\u3092\u3054\u7528\u610F\u3044\u305F\u3057\u307E\u3059\u3002 Expected actions: [{\"type\":\"place_order\",\"timing\":\"immediate\",\"item\":\"\u30E9\u30FC\u30E1\u30F3\",\"quantity\":1}].\n"
+            "- State: waiting_for_order. User: \u6709\u4EC0\u4E48\u63A8\u8350\uFF1F Expected decision: speak. Expected reply: \u304A\u3059\u3059\u3081\u306F\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\u3067\u3059\u3002\u3088\u308D\u3057\u3051\u308C\u3070\u3054\u6CE8\u6587\u3092\u627F\u308A\u307E\u3059\u3002 Expected actions: [{\"type\":\"recommend\",\"timing\":\"before_speech\",\"item\":\"\u30AB\u30EC\u30FC\u30E9\u30A4\u30B9\",\"quantity\":0}].\n"
             "\n"
 			"Explicit table cleanup rules:\n"
-			"- When State is awaiting_meal_completion_confirmation, Sumiha has already asked whether the customer has finished eating.\n"
+			"- When State is meal_confirmation, Sumiha has already asked whether the customer has finished eating.\n"
 			"- A clear affirmative answer such as はい, 食べ終わりました, 吃完了, 吃饱了, yes, or done must output exactly one clean_table action.\n"
 			"- A clear negative answer such as まだです, まだ食べています, 还没吃完, 只是站起来, no, or not yet must output exactly one continue_dining action and must not output clean_table.\n"
 			"- For continue_dining, use decision act_and_speak, a short polite Japanese acknowledgement, and action {\"type\":\"continue_dining\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}.\n"
 			"- If the answer is ambiguous or unrelated, ask one short clarifying question and output no cleanup action. Standing up alone is never confirmation that dining is finished.\n"
-			"- State: awaiting_meal_completion_confirmation. User: はい、食べ終わりました. Expected decision: act_and_speak. Expected reply: かしこまりました。すぐにお下げいたします。 Expected actions: [{\"type\":\"clean_table\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}].\n"
-			"- State: awaiting_meal_completion_confirmation. User: まだ食べています. Expected decision: act_and_speak. Expected reply: 失礼いたしました。どうぞごゆっくりお召し上がりください。 Expected actions: [{\"type\":\"continue_dining\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}].\n"
+			"- State: meal_confirmation. User: はい、食べ終わりました. Expected decision: act_and_speak. Expected reply: かしこまりました。すぐにお下げいたします。 Expected actions: [{\"type\":\"clean_table\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}].\n"
+			"- State: meal_confirmation. User: まだ食べています. Expected decision: act_and_speak. Expected reply: 失礼いたしました。どうぞごゆっくりお召し上がりください。 Expected actions: [{\"type\":\"continue_dining\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}].\n"
 			"- When State is served and the customer explicitly says they have finished eating or asks Sumiha to clear, tidy, or clean their table, output exactly one clean_table action.\n"
 			"- Do not merely promise to clean the table. The reply and the clean_table action must both be present.\n"
 			"- Use decision act_and_speak and action {\"type\":\"clean_table\",\"timing\":\"immediate\",\"item\":\"current_table\",\"quantity\":0}.\n"
@@ -1515,7 +1575,7 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
             "    \"reason\": \"Japanese reason explaining why this response style was chosen based on user state or behavior\"\n"
             "  },\n"
 			"  \"interaction_memory\": {\"should_remember\":false,\"event_type\":\"routine_interaction\",\"summary\":\"\",\"valence\":0.0,\"arousal\":0.0,\"importance\":0.0,\"cue_tags\":[]},\n"
-			"  \"embodied_response\": {\"enabled\":false,\"reaction_style\":\"neutral\",\"base_action_policy\":\"stop\",\"face\":\"neutral\",\"gaze\":\"none\",\"left_hand\":\"keep_current\",\"right_hand\":\"keep_current\",\"voice\":\"normal\",\"prop\":\"keep_current\",\"display_note\":\"\",\"resume_after_reply\":false,\"reason\":\"short Japanese reason\"},\n"
+			"  \"embodied_response\": {\"enabled\":false,\"reaction_style\":\"neutral\",\"base_action_policy\":\"stop\",\"face\":\"neutral\",\"gaze\":\"none\",\"left_hand\":\"keep_current\",\"right_hand\":\"keep_current\",\"voice\":\"normal\",\"prop\":\"keep_current\",\"display_note\":\"\",\"resume_after_reply\":false,\"player_released_npc\":false,\"reason\":\"short Japanese reason\"},\n"
             "  \"reply\": \"Japanese reply, or empty string when no speech is needed\",\n"
             "  \"actions\": [\n"
 			"    {\"type\":\"greet|explain|recommend|place_order|clean_table|continue_dining|sit_opposite_player|end_seated_conversation|accept_seat_invitation|decline_seat_invitation|guide_to_table|guide_player_to_table|guide_player_to_scene_tag|stop_guide_player|counter_then_return|table_route|action_sequence|move_near_player|follow_player|stop_follow_player|none\",\"timing\":\"immediate|before_speech|during_speech|after_speech\",\"item\":\"none, player, menu item, current_table, table hint, table ID, scene tag, comma-separated table route, or JSON string steps for action_sequence\",\"return_table_id\":\"Table_01 or current_table when type is counter_then_return\",\"quantity\":0}\n"
@@ -1559,6 +1619,14 @@ void ULLMClient::SendStrategyMessage(const FString& UserMessage)
     Request->ProcessRequest();
 
 	UE_LOG(LogTemp, Warning, TEXT("OpenAI strategy request sent: %s"), *UserMessage);
+	{
+		TSharedRef<FJsonObject> UtterancePayload = MakeShared<FJsonObject>();
+		UtterancePayload->SetStringField(TEXT("text"), UserMessage);
+		FString UtterancePayloadJson;
+		const TSharedRef<TJsonWriter<>> UtterancePayloadWriter = TJsonWriterFactory<>::Create(&UtterancePayloadJson);
+		FJsonSerializer::Serialize(UtterancePayload, UtterancePayloadWriter);
+		UNPCResearchLoggerComponent::RecordGlobalEvent(TEXT("player_utterance"), UtterancePayloadJson);
+	}
 }
 
 int32 ULLMClient::SendSocialOpportunityMessage(const FString& ContextJson)
@@ -1652,6 +1720,144 @@ int32 ULLMClient::SendSocialOpportunityMessage(const FString& ContextJson)
 
 	UE_LOG(LogTemp, Log, TEXT("[NPCSocial] LLM decision request sent. RequestId=%d Context=%s"), LocalRequestId, *ContextJson);
 	return LocalRequestId;
+}
+
+int32 ULLMClient::RequestAutonomyUtterance(const FString& IntentJson, const FString& FallbackLine)
+{
+	if (bInteractiveRequestPending)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[AutonomyUtterance] skipped because a player-facing request is pending."));
+		return 0;
+	}
+
+	const FString OpenAIApiKey = GetOpenAIApiKey();
+	if (OpenAIApiKey.IsEmpty())
+	{
+		if (!FallbackLine.IsEmpty())
+		{
+			SpeakDirectText(FallbackLine);
+		}
+		return 0;
+	}
+
+	TSharedPtr<FJsonObject> RootObject = MakeShared<FJsonObject>();
+	RootObject->SetStringField(TEXT("model"), OpenAIModelName);
+	RootObject->SetNumberField(TEXT("temperature"), 0.6);
+	RootObject->SetNumberField(TEXT("max_tokens"), 120);
+	RootObject->SetBoolField(TEXT("stream"), false);
+
+	TSharedPtr<FJsonObject> ResponseFormat = MakeShared<FJsonObject>();
+	ResponseFormat->SetStringField(TEXT("type"), TEXT("json_object"));
+	RootObject->SetObjectField(TEXT("response_format"), ResponseFormat);
+
+	TArray<TSharedPtr<FJsonValue>> Messages;
+	TSharedPtr<FJsonObject> SystemMessage = MakeShared<FJsonObject>();
+	SystemMessage->SetStringField(TEXT("role"), TEXT("system"));
+	SystemMessage->SetStringField(
+		TEXT("content"),
+		LLMNPCPersona::CorePromptEnglish() + TEXT(
+			"You are about to say one thing aloud on your own initiative while the customer sits at the table. "
+			"The context describes the situation and what you intend to convey. "
+			"Word it yourself in natural Japanese, in character: one or two short sentences, no stage directions, no system terms, "
+			"and do not copy the intent text. Do not invent facts beyond the context. "
+			"Return exactly one JSON object: {\"reply\":\"spoken Japanese\"}."));
+	Messages.Add(MakeShared<FJsonValueObject>(SystemMessage));
+
+	TSharedPtr<FJsonObject> UserMessage = MakeShared<FJsonObject>();
+	UserMessage->SetStringField(TEXT("role"), TEXT("user"));
+	UserMessage->SetStringField(TEXT("content"), IntentJson);
+	Messages.Add(MakeShared<FJsonValueObject>(UserMessage));
+	RootObject->SetArrayField(TEXT("messages"), Messages);
+
+	FString RequestBody;
+	TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&RequestBody);
+	FJsonSerializer::Serialize(RootObject.ToSharedRef(), Writer);
+
+	// Not an interactive request: it does not block the player. A newer interactive request makes it stale.
+	const int32 BaseInteractiveRequestId = ActiveLLMRequestId;
+	TSharedRef<IHttpRequest> Request = FHttpModule::Get().CreateRequest();
+	Request->SetURL(OpenAIChatCompletionsUrl);
+	Request->SetVerb(TEXT("POST"));
+	Request->SetHeader(TEXT("Content-Type"), TEXT("application/json"));
+	Request->SetHeader(TEXT("Authorization"), TEXT("Bearer ") + OpenAIApiKey);
+	Request->SetContentAsString(RequestBody);
+	Request->SetTimeout(30.0f);
+	Request->OnProcessRequestComplete().BindUObject(
+		this,
+		&ULLMClient::OnAutonomyUtteranceResponseReceived,
+		BaseInteractiveRequestId,
+		FallbackLine);
+
+	if (!Request->ProcessRequest())
+	{
+		UE_LOG(LogTemp, Error, TEXT("[AutonomyUtterance] failed to start request."));
+		if (!FallbackLine.IsEmpty())
+		{
+			SpeakDirectText(FallbackLine);
+		}
+		return 0;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[AutonomyUtterance] request sent. Intent=%s"), *IntentJson);
+	return BaseInteractiveRequestId;
+}
+
+void ULLMClient::OnAutonomyUtteranceResponseReceived(
+	FHttpRequestPtr Request,
+	FHttpResponsePtr Response,
+	bool bWasSuccessful,
+	int32 BaseInteractiveRequestId,
+	FString FallbackLine)
+{
+	auto RecordUtterance = [](const TCHAR* Source, const FString& Text)
+	{
+		TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetStringField(TEXT("source"), Source);
+		Payload->SetStringField(TEXT("text"), Text);
+		FString PayloadJson;
+		TSharedRef<TJsonWriter<>> PayloadWriter = TJsonWriterFactory<>::Create(&PayloadJson);
+		FJsonSerializer::Serialize(Payload, PayloadWriter);
+		UNPCResearchLoggerComponent::RecordGlobalEvent(TEXT("autonomy_utterance"), PayloadJson);
+	};
+
+	if (bInteractiveRequestPending || ActiveLLMRequestId != BaseInteractiveRequestId)
+	{
+		UE_LOG(LogTemp, Log, TEXT("[AutonomyUtterance] dropped: the player-facing conversation moved on."));
+		RecordUtterance(TEXT("dropped_stale"), FString());
+		return;
+	}
+
+	FString Reply;
+	if (bWasSuccessful && Response.IsValid() && Response->GetResponseCode() == 200)
+	{
+		FString Content;
+		FString ExtractError;
+		if (ExtractOpenAIMessageContent(Response->GetContentAsString(), Content, ExtractError))
+		{
+			TSharedPtr<FJsonObject> UtteranceRoot;
+			FString ParsedJsonContent;
+			FString LeadingText;
+			if (TryDeserializeJsonObjectContent(CleanJsonContent(Content), UtteranceRoot, ParsedJsonContent, LeadingText))
+			{
+				Reply = GetStringFieldOrDefault(UtteranceRoot, TEXT("reply"), TEXT("")).TrimStartAndEnd();
+			}
+		}
+	}
+
+	if (Reply.IsEmpty())
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[AutonomyUtterance] no usable reply; using the fallback line."));
+		if (!FallbackLine.IsEmpty())
+		{
+			SpeakDirectText(FallbackLine);
+		}
+		RecordUtterance(TEXT("fallback"), FallbackLine);
+		return;
+	}
+
+	UE_LOG(LogTemp, Log, TEXT("[AutonomyUtterance] generated: %s"), *Reply);
+	SpeakDirectText(Reply);
+	RecordUtterance(TEXT("llm"), Reply);
 }
 
 bool ULLMClient::IsInteractiveRequestPending() const
@@ -2010,11 +2216,37 @@ void ULLMClient::OnStrategyResponseReceived(
 		Reply = LeadingReplyText;
 	}
     FNPCEmbodiedResponseSignal EmbodiedResponse = ParseEmbodiedResponseSignal(StrategyRoot, !Reply.IsEmpty());
+    {
+        // The model decides whether the player let her go. By default nothing is overridden; when a clear
+        // release phrase was missed we only record the miss (measurement of model reliability), and the
+        // optional local inference is off unless explicitly enabled for an experiment condition.
+        const UNPCAutonomyComponent* ReleaseAutonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent();
+        const bool bWaitingForRelease = ReleaseAutonomy
+            && ReleaseAutonomy->bEnablePlayerReleaseResume
+            && ReleaseAutonomy->IsSuspendedPlanWaitingForRelease();
+        if (bWaitingForRelease && !EmbodiedResponse.bPlayerReleasedNPC && IsDirectReleaseRequest(LastStrategyUserMessage))
+        {
+            const bool bInfer = ReleaseAutonomy->bInferReleaseLocally;
+            UNPCResearchLoggerComponent::RecordGlobalEvent(
+                TEXT("release_phrase_missed_by_model"),
+                FString::Printf(TEXT("{\"inferred_locally\":%s}"), bInfer ? TEXT("true") : TEXT("false")));
+            UE_LOG(
+                LogTemp,
+                Warning,
+                TEXT("[LLMClient] Release phrase missed by the model. Player=%s InferredLocally=%d"),
+                *LastStrategyUserMessage,
+                bInfer ? 1 : 0);
+            if (bInfer)
+            {
+                EmbodiedResponse.bPlayerReleasedNPC = true;
+            }
+        }
+    }
     OnNPCEmbodiedResponseRequested.Broadcast(EmbodiedResponse);
     UE_LOG(
         LogTemp,
         Log,
-        TEXT("[EmbodiedResponse] parsed. Enabled=%s Style=%s Policy=%s Face=%s Gaze=%s Left=%s Right=%s Voice=%s Prop=%s Resume=%s"),
+        TEXT("[EmbodiedResponse] parsed. Enabled=%s Style=%s Policy=%s Face=%s Gaze=%s Left=%s Right=%s Voice=%s Prop=%s Resume=%s Released=%s"),
         EmbodiedResponse.bEnabled ? TEXT("true") : TEXT("false"),
         *EmbodiedResponse.ReactionStyle,
         *EmbodiedResponse.BaseActionPolicy,
@@ -2024,7 +2256,8 @@ void ULLMClient::OnStrategyResponseReceived(
         *EmbodiedResponse.RightHandIntent,
         *EmbodiedResponse.VoiceIntent,
         *EmbodiedResponse.PropIntent,
-        EmbodiedResponse.bResumeAfterReply ? TEXT("true") : TEXT("false"));
+        EmbodiedResponse.bResumeAfterReply ? TEXT("true") : TEXT("false"),
+        EmbodiedResponse.bPlayerReleasedNPC ? TEXT("true") : TEXT("false"));
 
     FString StrategyTone = TEXT("unknown");
     FString StrategyLength = TEXT("unknown");
@@ -2281,8 +2514,7 @@ void ULLMClient::OnStrategyResponseReceived(
 	const FCafeServiceSnapshot ServiceSnapshot = ServiceManager
 		? ServiceManager->GetServiceSnapshot()
 		: FCafeServiceSnapshot();
-	const bool bPlayerCanHostOppositeSeat = ServiceSnapshot.bSeatedForService
-		|| ServiceSnapshot.bPlayerInTableArea;
+	const bool bPlayerCanHostOppositeSeat = ServiceSnapshot.bPlayerSeated;
 	const FString RequestedDecision = GetStringFieldOrDefault(
 		StrategyRoot,
 		TEXT("decision"),
@@ -2290,8 +2522,19 @@ void ULLMClient::OnStrategyResponseReceived(
 	if (UNPCAutonomyComponent* Autonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent();
 		Autonomy
 		&& Autonomy->IsSeatedConversationActive()
-		&& IsDirectEndSeatedConversationRequest(LastStrategyUserMessage))
+		&& (IsDirectEndSeatedConversationRequest(LastStrategyUserMessage)
+			|| EmbodiedResponse.bPlayerReleasedNPC))
 	{
+		// The model's own judgment counts too: when it says the player let her go back to her own work while she
+		// is sitting with them, leaving the seat is what that means (the fixed phrase list misses wordings such
+		// as "你先去忙吧" with a typo or an extra word, and the model sometimes sets only the release flag).
+		if (!IsDirectEndSeatedConversationRequest(LastStrategyUserMessage))
+		{
+			UE_LOG(LogTemp, Log, TEXT("[NPCSeat] player_released_npc during a seated conversation; ending it."));
+			UNPCResearchLoggerComponent::RecordGlobalEvent(
+				TEXT("seated_conversation_end_from_release"),
+				FString(TEXT("{}")));
+		}
 		FParsedStrategyAction EndSeatAction = MakeParsedStrategyAction(TEXT("end_seated_conversation"), TEXT("current_table"));
 		EndSeatAction.Timing = TEXT("after_speech");
 		ParsedActions.Reset();
@@ -2394,6 +2637,32 @@ void ULLMClient::OnStrategyResponseReceived(
         {
             Decision = TEXT("none");
         }
+    }
+
+    const UNPCAutonomyComponent* ExperimentAutonomy = UNPCAutonomyComponent::GetPrimaryAutonomyComponent();
+    const bool bStaleGuideReply = ActionName.Equals(TEXT("guide_player_to_table"), ESearchCase::IgnoreCase)
+        && (ServiceSnapshot.bSeatingGuidanceCompleted
+            || (!ServiceSnapshot.PhaseName.Equals(TEXT("reception"), ESearchCase::IgnoreCase)
+                && !ServiceSnapshot.PhaseName.Equals(TEXT("guiding"), ESearchCase::IgnoreCase)));
+    const bool bReplaceStaleReply = bStaleGuideReply && (!ExperimentAutonomy || ExperimentAutonomy->bReplaceStaleGuideReply);
+    {
+        TSharedRef<FJsonObject> ReplyPayload = MakeShared<FJsonObject>();
+        ReplyPayload->SetStringField(TEXT("decision"), Decision);
+        ReplyPayload->SetStringField(TEXT("action"), ActionName);
+        ReplyPayload->SetStringField(TEXT("item"), ActionItem);
+        ReplyPayload->SetStringField(TEXT("reply"), Reply);
+        ReplyPayload->SetBoolField(TEXT("stale_guide_reply"), bStaleGuideReply);
+        ReplyPayload->SetBoolField(TEXT("stale_reply_replaced"), bReplaceStaleReply);
+        FString ReplyPayloadJson;
+        const TSharedRef<TJsonWriter<>> ReplyPayloadWriter = TJsonWriterFactory<>::Create(&ReplyPayloadJson);
+        FJsonSerializer::Serialize(ReplyPayload, ReplyPayloadWriter);
+        UNPCResearchLoggerComponent::RecordGlobalEvent(TEXT("interactive_reply_received"), ReplyPayloadJson);
+    }
+    if (bReplaceStaleReply)
+    {
+		// The workflow advanced while this reply was being generated: "I will show you to your seat" is stale.
+		UE_LOG(LogTemp, Warning, TEXT("[LLMClient] Stale guide reply replaced because seating guidance is already complete. Original=%s"), *Reply);
+        Reply = TEXT("ご注文が決まりましたら、いつでもお声がけください。");
     }
 
     UE_LOG(LogTemp, Warning, TEXT("Strategy decision: %s"), *Decision);
@@ -2968,9 +3237,9 @@ bool ULLMClient::ShouldDeferGuideActionUntilReplyFinished(const FString& ActionT
         return false;
     }
 
-    if (ServiceSnapshot.bSeatedForService
-        || ServiceSnapshot.bPlayerInTableArea
-        || ServiceSnapshot.bSeatingGuidanceCompleted)
+    if (ServiceSnapshot.bPlayerSeated
+        || ServiceSnapshot.bSeatingGuidanceCompleted
+        || !ServiceSnapshot.PhaseName.Equals(TEXT("reception"), ESearchCase::IgnoreCase))
     {
         return false;
     }
@@ -3123,7 +3392,16 @@ void ULLMClient::PlaySpeechAndDisplayInternal(
             }
 
             bCurrentAudioIsQueuedServiceSpeech = bQueuedServiceSpeech;
+            for (auto It = GVoicevoxSpeechOwners.CreateIterator(); It; ++It)
+            {
+                if (!It.Key().IsValid() || !It.Value().IsValid())
+                {
+                    It.RemoveCurrent();
+                }
+            }
+            GVoicevoxSpeechOwners.Add(ResolvedVoicevoxTTSClient, this);
             ResolvedVoicevoxTTSClient->GenerateVoice(CleanSpeechText);
+            RequestPlayerFacingForSpeech(ResolveSpeechWorld(), ResolvedVoicevoxTTSClient, CleanSpeechText);
 
             if (bQueuedServiceSpeech)
             {
@@ -3150,6 +3428,7 @@ void ULLMClient::PlaySpeechAndDisplayInternal(
         UE_LOG(LogTemp, Warning, TEXT("[VOICEVOX] VoicevoxTTSClient not found. Falling back to existing TTS path."));
     }
 
+    RequestPlayerFacingForSpeech(ResolveSpeechWorld(), nullptr, CleanSpeechText);
     OnLLMResponseReceived.Broadcast(CleanSpeechText);
 
     if (bQueuedServiceSpeech)
@@ -3172,6 +3451,12 @@ void ULLMClient::PlaySpeechAndDisplayInternal(
 
 void ULLMClient::HandleVoicevoxSpeechFinished()
 {
+    const TWeakObjectPtr<ULLMClient>* SpeechOwner = GVoicevoxSpeechOwners.Find(VoicevoxTTSClient);
+    if (!SpeechOwner || SpeechOwner->Get() != this
+        || !IsValid(VoicevoxTTSClient) || VoicevoxTTSClient->HasPendingVoicevoxSpeech())
+    {
+        return;
+    }
     if (!bCurrentAudioIsQueuedServiceSpeech)
     {
         DispatchDeferredStrategyActionIfReady();

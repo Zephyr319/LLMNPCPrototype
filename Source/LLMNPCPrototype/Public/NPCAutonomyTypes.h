@@ -41,6 +41,18 @@ enum class ENPCAutonomyDecisionMode : uint8
 	FixedIntervalSingleAction UMETA(DisplayName = "Fixed Interval Single Action (Baseline)")
 };
 
+// Experiment condition: one switch for the coordination mechanisms compared in the thesis.
+UENUM(BlueprintType)
+enum class ENPCExperimentCondition : uint8
+{
+	// Leave the individual switches exactly as set in the editor.
+	Custom,
+	// Mechanisms off: reproduces the pre-2026-11-12 behaviour for the baseline runs.
+	Baseline,
+	// All mechanisms on.
+	Full
+};
+
 UENUM(BlueprintType)
 enum class ENPCAutonomyPlanStatus : uint8
 {
@@ -251,6 +263,11 @@ struct FNPCEmbodiedResponseSignal
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Embodied Response")
 	bool bResumeAfterReply = false;
+
+	// True when the player's utterance clearly lets the NPC leave them for now and return to her own work
+	// (e.g. "go ahead, I'll call you"). It only permits a suspended plan to resume; it is not a service action.
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Embodied Response")
+	bool bPlayerReleasedNPC = false;
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "NPC Embodied Response")
 	bool bHasSpokenReply = false;

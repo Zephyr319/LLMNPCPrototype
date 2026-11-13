@@ -328,6 +328,11 @@ ULLMDialogueWidgetBase* UNPCDialogueUIControllerComponent::GetDialogueWidgetBase
 	return Cast<ULLMDialogueWidgetBase>(DialogueWidget);
 }
 
+void UNPCDialogueUIControllerComponent::SubmitPlayerMessage(const FString& Message)
+{
+	HandleWidgetSendMessageRequested(Message);
+}
+
 void UNPCDialogueUIControllerComponent::HandleWidgetSendMessageRequested(const FString& Message)
 {
 	const FString TrimmedMessage = Message.TrimStartAndEnd();

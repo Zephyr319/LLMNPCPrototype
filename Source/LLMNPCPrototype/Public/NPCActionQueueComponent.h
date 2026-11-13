@@ -62,6 +62,10 @@ struct FNPCQueuedAction
 
 	int32 AnimationLoopCount = 1;
 
+	// > 0: the action completes this many seconds before the montage ends, so the next animation can
+	// cross-fade from it instead of the body popping back to the standing base pose in between.
+	float AnimationEarlyFinishSeconds = 0.0f;
+
 	UStaticMesh* HeldPropMesh = nullptr;
 
 	FName HeldPropSocketName = FName(TEXT("RightHand"));
@@ -80,6 +84,9 @@ UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class UNPCActionQueueComponent : public UActorComponent
 {
 	GENERATED_BODY()
+
+	// Read-only access for the on-demand world snapshot; it must never write component state.
+	friend class UCafeWorldSnapshotSubsystem;
 
 public:
 	UNPCActionQueueComponent();
@@ -216,6 +223,8 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue|Animation")
 	bool HasActiveQueuedAnimation() const;
 
+	bool IsPlayingQueuedAnimation(const UAnimSequenceBase* Animation) const;
+
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue")
 	void EnqueueMoveToTableID(const FString& TableID);
 
@@ -242,6 +251,16 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Animation")
 	void EnqueueLoopedAnimation(UAnimSequenceBase* Animation, int32 LoopCount, FName SlotName = NAME_None, float PlayRate = 1.0f, float FallbackSeconds = 3.0f);
+
+	// Same as EnqueueLoopedAnimation, but hands over to the following animation before the montage blends out.
+	// Use only when another animation in the same slot is started right after this one (e.g. seated poses).
+	void EnqueueSeamlessAnimation(
+		UAnimSequenceBase* Animation,
+		int32 LoopCount,
+		FName SlotName,
+		float PlayRate,
+		float FallbackSeconds,
+		float EarlyFinishSeconds = 0.35f);
 
 	UFUNCTION(BlueprintCallable, Category = "NPC Action Queue|Seat")
 	void EnqueueEnterSeat();
@@ -365,6 +384,15 @@ public:
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue")
 	bool IsBusyForAutonomy() const;
+
+	// True while a queued animation (or its wait fallback) is actually running and not paused.
+	// The autonomy component uses it to add watering moisture only while the watering motion plays.
+	bool IsQueuedAnimationOrWaitActive() const
+	{
+		return bIsRunningQueue
+			&& !bQueuedAnimationPaused
+			&& (bQueuedAnimationInProgress || CurrentAction.ActionType == ENPCQueuedActionType::Wait);
+	}
 
 	UFUNCTION(BlueprintCallable, BlueprintPure, Category = "NPC Action Queue|Seat")
 	bool IsNPCSeated() const;

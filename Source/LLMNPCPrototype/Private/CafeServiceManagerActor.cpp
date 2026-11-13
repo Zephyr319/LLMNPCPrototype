@@ -2,6 +2,7 @@
 
 #include "CafeServiceManagerActor.h"
 
+#include "CafeWorldSnapshotSubsystem.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
@@ -19,6 +20,39 @@
 #include "Serialization/JsonSerializer.h"
 #include "Serialization/JsonWriter.h"
 #include "TableMarkerActor.h"
+
+namespace
+{
+	FString ResolveCanonicalServicePhase(const FCafeServiceSnapshot& Snapshot)
+	{
+		if (Snapshot.bMealCompletionConfirmationPending)
+		{
+			return TEXT("meal_confirmation");
+		}
+		if (Snapshot.bDiningServiceCompleted)
+		{
+			return TEXT("post_meal");
+		}
+
+		switch (Snapshot.State)
+		{
+		case ECafeServiceState::SelectingSeat:
+		case ECafeServiceState::GuidingToSeat:
+		case ECafeServiceState::WaitingForPlayerSeated:
+			return TEXT("guiding");
+		case ECafeServiceState::WaitingForOrder:
+			return TEXT("waiting_for_order");
+		case ECafeServiceState::OrderReceived:
+		case ECafeServiceState::GoingToCounter:
+		case ECafeServiceState::DeliveringOrder:
+			return TEXT("order_in_progress");
+		case ECafeServiceState::Served:
+			return TEXT("served");
+		default:
+			return Snapshot.bGuideInProgress ? TEXT("guiding") : TEXT("reception");
+		}
+	}
+}
 
 ACafeServiceManagerActor::ACafeServiceManagerActor()
 {
@@ -141,43 +175,13 @@ FCafeServiceSnapshot ACafeServiceManagerActor::GetServiceSnapshot() const
 	Snapshot.MealCompletionTableID = PendingDepartureTableID.TrimStartAndEnd();
 	Snapshot.bDiningServiceCompleted = bDepartureConfirmedForCurrentVisit;
 	Snapshot.CompletedServiceTableID = LastCompletedServiceTableID.TrimStartAndEnd();
+	Snapshot.PhaseName = ResolveCanonicalServicePhase(Snapshot);
 	return Snapshot;
 }
 
 FString ACafeServiceManagerActor::GetUnifiedServiceStateName() const
 {
-	const FCafeServiceSnapshot Snapshot = GetServiceSnapshot();
-	if (Snapshot.bMealCompletionConfirmationPending)
-	{
-		return TEXT("awaiting_meal_completion_confirmation");
-	}
-	if (Snapshot.bDiningServiceCompleted)
-	{
-		return TEXT("post_meal");
-	}
-	if (Snapshot.bGuideInProgress || CurrentState == ECafeServiceState::GuidingToSeat)
-	{
-		return TEXT("guiding");
-	}
-	if (Snapshot.bPlayerInTableArea)
-	{
-		return TEXT("in_table_area");
-	}
-	if (Snapshot.bSeatedForService || CurrentState == ECafeServiceState::WaitingForOrder)
-	{
-		return TEXT("seated");
-	}
-	if (CurrentState == ECafeServiceState::OrderReceived
-		|| CurrentState == ECafeServiceState::GoingToCounter
-		|| CurrentState == ECafeServiceState::DeliveringOrder)
-	{
-		return TEXT("order_in_progress");
-	}
-	if (CurrentState == ECafeServiceState::Served)
-	{
-		return TEXT("served");
-	}
-	return TEXT("reception");
+	return GetServiceSnapshot().PhaseName;
 }
 
 void ACafeServiceManagerActor::SynchronizeActionQueueState(
@@ -654,6 +658,9 @@ void ACafeServiceManagerActor::HandlePlayerSeated(FString SeatID, FString TableI
 		{
 			TargetTableID = ResolvedTableID;
 		}
+		// The player sat down without being guided: she was still at the reception spot, so she walks over.
+		const bool bMaidShouldFollowToTable = CurrentState == ECafeServiceState::WaitingForReceptionResponse
+			|| CurrentState == ECafeServiceState::SelectingSeat;
 		bPlayerInTableArea = true;
 		bSeatingGuidanceCompleted = true;
 		bGuideInProgress = false;
@@ -688,6 +695,16 @@ void ACafeServiceManagerActor::HandlePlayerSeated(FString SeatID, FString TableI
 			TargetTableID.IsEmpty() ? TEXT("none") : *TargetTableID,
 			*GetStateName(CurrentState));
 		RequestMaidSpeech(FText::FromString(TEXT("ご注文が決まりましたら、いつでもお声がけください。")));
+		if (bMaidShouldFollowToTable && MaidMoveComponent && !TargetTableID.TrimStartAndEnd().IsEmpty())
+		{
+			const bool bFollowStarted = MaidMoveComponent->MoveToTableByID(TargetTableID.TrimStartAndEnd());
+			UE_LOG(
+				LogTemp,
+				Log,
+				TEXT("[CafeServiceSync] player seated unguided; maid walks to table. Table=%s Started=%d"),
+				*TargetTableID,
+				bFollowStarted ? 1 : 0);
+		}
 	}
 	else
 	{
@@ -728,6 +745,9 @@ void ACafeServiceManagerActor::HandlePlayerLeftSeat(FString SeatID, FString Tabl
 
 void ACafeServiceManagerActor::HandleOrderStarted(FString TableID, FString Item)
 {
+	UNPCResearchLoggerComponent::RecordGlobalEvent(
+		TEXT("order_started"),
+		FString::Printf(TEXT("{\"table\":\"%s\",\"item\":\"%s\"}"), *TableID.ReplaceCharWithEscapedChar(), *Item.ReplaceCharWithEscapedChar()));
 	ClearPendingDeparture();
 	const FString ResolvedTableID = TableID.TrimStartAndEnd();
 	if (!ResolvedTableID.IsEmpty())
@@ -753,6 +773,9 @@ void ACafeServiceManagerActor::HandleOrderStarted(FString TableID, FString Item)
 
 void ACafeServiceManagerActor::HandleOrderServed(FString TableID, FString Item)
 {
+	UNPCResearchLoggerComponent::RecordGlobalEvent(
+		TEXT("order_served"),
+		FString::Printf(TEXT("{\"table\":\"%s\",\"item\":\"%s\"}"), *TableID.ReplaceCharWithEscapedChar(), *Item.ReplaceCharWithEscapedChar()));
 	const FString ResolvedTableID = TableID.TrimStartAndEnd();
 	if (!ResolvedTableID.IsEmpty())
 	{
@@ -981,6 +1004,14 @@ FString ACafeServiceManagerActor::BuildSocialOpportunityContext(
 	float LookDot,
 	bool bSeatedConversation)
 {
+	FCafeWorldSnapshot WorldSnapshot;
+	bool bHasWorldSnapshot = false;
+	if (UCafeWorldSnapshotSubsystem* SnapshotSubsystem = UCafeWorldSnapshotSubsystem::Get(this))
+	{
+		WorldSnapshot = SnapshotSubsystem->CaptureSnapshot(this);
+		bHasWorldSnapshot = true;
+	}
+
 	TSharedPtr<FJsonObject> Root = MakeShared<FJsonObject>();
 	Root->SetStringField(
 		TEXT("event"),
@@ -993,10 +1024,32 @@ FString ACafeServiceManagerActor::BuildSocialOpportunityContext(
 	Root->SetStringField(
 		TEXT("conversation_mode"),
 		bSeatedConversation ? TEXT("seated_with_player") : TEXT("brief_post_service_contact"));
-	Root->SetStringField(TEXT("service_state"), TEXT("served"));
+	Root->SetStringField(
+		TEXT("service_state"),
+		bHasWorldSnapshot ? WorldSnapshot.Service.PhaseName : GetUnifiedServiceStateName());
+	Root->SetStringField(
+		TEXT("service_raw_state"),
+		bHasWorldSnapshot ? WorldSnapshot.Service.StateName : GetStateName(CurrentState));
 	Root->SetStringField(TEXT("last_served_item"), LastServedItem.IsEmpty() ? TEXT("unknown") : LastServedItem);
 	Root->SetBoolField(TEXT("first_opportunity_this_approach"), true);
-	Root->SetBoolField(TEXT("player_is_seated"), PlayerSeatComponent && PlayerSeatComponent->bIsSeated);
+	Root->SetBoolField(
+		TEXT("player_present"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.bInServiceScene : CurrentPlayerActor != nullptr);
+	Root->SetBoolField(
+		TEXT("player_is_seated"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.bSeated : PlayerSeatComponent && PlayerSeatComponent->bIsSeated);
+	Root->SetBoolField(
+		TEXT("player_in_table_area"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.bInTableArea : bPlayerInTableArea);
+	Root->SetStringField(
+		TEXT("player_pose"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.Pose : TEXT("unknown"));
+	Root->SetStringField(
+		TEXT("player_activity"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.Activity : TEXT("unknown"));
+	Root->SetStringField(
+		TEXT("player_zone"),
+		bHasWorldSnapshot ? WorldSnapshot.Player.Zone : TEXT("unknown"));
 	Root->SetBoolField(TEXT("departure_confirmed"), bDepartureConfirmedForCurrentVisit);
 	Root->SetBoolField(TEXT("customer_explicitly_invited_conversation"), bSeatedConversation);
 	Root->SetNumberField(TEXT("distance_to_maid_cm"), DistanceToMaid);
@@ -1019,7 +1072,20 @@ FString ACafeServiceManagerActor::BuildSocialOpportunityContext(
 		Root->SetObjectField(TEXT("preferred_conversation_topic"), MemoryTopic);
 	}
 
-	if (AutonomyComponent)
+	if (bHasWorldSnapshot && WorldSnapshot.NPC.bAutonomyAvailable)
+	{
+		Root->SetStringField(
+			TEXT("maid_current_activity"),
+			WorldSnapshot.NPC.ActivityId.IsEmpty() ? TEXT("idle") : WorldSnapshot.NPC.ActivityId);
+		Root->SetNumberField(TEXT("maid_boredom"), WorldSnapshot.NPC.Motives.Boredom);
+		Root->SetNumberField(TEXT("maid_duty"), WorldSnapshot.NPC.Motives.Duty);
+		Root->SetNumberField(TEXT("maid_social_attention"), WorldSnapshot.NPC.Motives.SocialAttention);
+		Root->SetNumberField(TEXT("maid_energy"), WorldSnapshot.NPC.Resources.Energy);
+		Root->SetStringField(
+			TEXT("maid_plan_goal"),
+			WorldSnapshot.NPC.Plan.Goal.IsEmpty() ? TEXT("none") : WorldSnapshot.NPC.Plan.Goal);
+	}
+	else if (AutonomyComponent)
 	{
 		Root->SetStringField(
 			TEXT("maid_current_activity"),
@@ -1033,7 +1099,14 @@ FString ACafeServiceManagerActor::BuildSocialOpportunityContext(
 			AutonomyComponent->ActivePlan.Goal.IsEmpty() ? TEXT("none") : AutonomyComponent->ActivePlan.Goal);
 	}
 
-	if (EmotionComponent)
+	if (bHasWorldSnapshot && WorldSnapshot.bEmotionAvailable)
+	{
+		Root->SetStringField(TEXT("maid_emotion"), WorldSnapshot.Emotion.EmotionLabel);
+		Root->SetNumberField(TEXT("maid_short_term_valence"), WorldSnapshot.Emotion.ShortTermValence);
+		Root->SetNumberField(TEXT("maid_mood_valence"), WorldSnapshot.Emotion.MoodValence);
+		Root->SetNumberField(TEXT("maid_arousal"), WorldSnapshot.Emotion.Arousal);
+	}
+	else if (EmotionComponent)
 	{
 		Root->SetStringField(TEXT("maid_emotion"), EmotionComponent->CurrentState.EmotionLabel);
 		Root->SetNumberField(TEXT("maid_short_term_valence"), EmotionComponent->CurrentState.ShortTermValence);
@@ -1387,6 +1460,9 @@ void ACafeServiceManagerActor::SetState(ECafeServiceState NewState)
 {
 	const ECafeServiceState PreviousState = CurrentState;
 	CurrentState = NewState;
+	UNPCResearchLoggerComponent::RecordGlobalEvent(
+		TEXT("service_state_changed"),
+		FString::Printf(TEXT("{\"from\":\"%s\",\"to\":\"%s\"}"), *GetStateName(PreviousState), *GetStateName(NewState)));
 	OnCafeServiceStateChanged.Broadcast(CurrentState);
 	PrintDebugMessage(FString::Printf(TEXT("Cafe state: %s"), *GetStateName(CurrentState)), FColor::Cyan);
 	const FCafeServiceSnapshot Snapshot = GetServiceSnapshot();

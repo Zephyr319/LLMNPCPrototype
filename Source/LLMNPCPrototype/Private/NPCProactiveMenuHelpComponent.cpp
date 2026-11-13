@@ -6,12 +6,14 @@
 #include "NPCPersonaProfile.h"
 
 #include "LLMClient.h"
+#include "UObject/UnrealType.h"
 
 UNPCProactiveMenuHelpComponent::UNPCProactiveMenuHelpComponent()
 {
 	PrimaryComponentTick.bCanEverTick = false;
 
 	bUseStrategyMode = true;
+	bStartInStrategyMode = true;
 	bProactiveHelpOffered = false;
 	HesitationThreshold = 0.5f;
 	NPCName = LLMNPCPersona::NameJapanese();
@@ -22,6 +24,30 @@ UNPCProactiveMenuHelpComponent::UNPCProactiveMenuHelpComponent()
 	HesitationScore = 0.0f;
 	FixedProactiveHelpLine = TEXT("メニューで迷っていらっしゃいますか？ よろしければ、私のおすすめもご案内しますよ。");
 	LLMClientRef = nullptr;
+}
+
+void UNPCProactiveMenuHelpComponent::BeginPlay()
+{
+	Super::BeginPlay();
+	if (!bStartInStrategyMode)
+	{
+		return;
+	}
+
+	bUseStrategyMode = true;
+	AActor* OwnerActor = GetOwner();
+	FBoolProperty* BlueprintFlag = OwnerActor
+		? FindFProperty<FBoolProperty>(OwnerActor->GetClass(), TEXT("bUseStrategyMode"))
+		: nullptr;
+	if (BlueprintFlag)
+	{
+		BlueprintFlag->SetPropertyValue_InContainer(OwnerActor, true);
+		UE_LOG(LogTemp, Log, TEXT("[StrategyMode] Started in Strategy Mode. Owner=%s (press M to switch)"), *OwnerActor->GetName());
+	}
+	else
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[StrategyMode] Owner has no bUseStrategyMode variable; blueprint default is unchanged."));
+	}
 }
 
 void UNPCProactiveMenuHelpComponent::TriggerProactiveMenuHelp()

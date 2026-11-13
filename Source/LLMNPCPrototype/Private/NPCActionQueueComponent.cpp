@@ -339,6 +339,11 @@ bool UNPCActionQueueComponent::HasActiveQueuedAnimation() const
 		&& ActiveQueuedAnimationInstance;
 }
 
+bool UNPCActionQueueComponent::IsPlayingQueuedAnimation(const UAnimSequenceBase* Animation) const
+{
+	return Animation && HasActiveQueuedAnimation() && CurrentAction.Animation == Animation;
+}
+
 void UNPCActionQueueComponent::EnqueueMoveToTableID(const FString& TableID)
 {
 	FNPCQueuedAction Action;
@@ -421,6 +426,25 @@ void UNPCActionQueueComponent::EnqueueLoopedAnimation(
 	Action.AnimationPlayRate = FMath::Max(FMath::Abs(PlayRate), KINDA_SMALL_NUMBER);
 	Action.AnimationLoopCount = FMath::Max(LoopCount, 1);
 	Action.WaitSeconds = FMath::Max(FallbackSeconds, 0.1f);
+	EnqueueAction(Action);
+}
+
+void UNPCActionQueueComponent::EnqueueSeamlessAnimation(
+	UAnimSequenceBase* Animation,
+	int32 LoopCount,
+	FName SlotName,
+	float PlayRate,
+	float FallbackSeconds,
+	float EarlyFinishSeconds)
+{
+	FNPCQueuedAction Action;
+	Action.ActionType = ENPCQueuedActionType::Animation;
+	Action.Animation = Animation;
+	Action.AnimationSlotName = SlotName.IsNone() ? FName(TEXT("DefaultSlot")) : SlotName;
+	Action.AnimationPlayRate = FMath::Max(FMath::Abs(PlayRate), KINDA_SMALL_NUMBER);
+	Action.AnimationLoopCount = FMath::Max(LoopCount, 1);
+	Action.WaitSeconds = FMath::Max(FallbackSeconds, 0.1f);
+	Action.AnimationEarlyFinishSeconds = FMath::Max(EarlyFinishSeconds, 0.0f);
 	EnqueueAction(Action);
 }
 
@@ -1351,12 +1375,16 @@ void UNPCActionQueueComponent::RunOrderFulfillmentToCurrentTableInternal(const F
 	CancelFollowingForExplicitCommand();
 	ClearActionQueue();
 
+	// Broadcast first: listeners switch the service state, which interrupts a running autonomy activity and
+	// calls StopActionQueue() -> ClearPendingOrderState(). Setting the order state before the broadcast lost
+	// the return table (she walked to the counter and never brought the food).
+	OnOrderStarted.Broadcast(ResolvedTableID, TrimmedOrderItem);
+
 	CurrentServiceTableID = ResolvedTableID;
 	PendingOrderReturnTableID = ResolvedTableID;
 	PendingOrderItem = TrimmedOrderItem;
 	PendingOrderPrice = ResolvedOrderPrice;
 	bPendingOrderFulfillment = true;
-	OnOrderStarted.Broadcast(PendingOrderReturnTableID, PendingOrderItem);
 
 	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Place order: %s"), *TrimmedOrderItem);
 	UE_LOG(LogTemp, Warning, TEXT("[ActionQueue] Order return table: %s"), *PendingOrderReturnTableID);
@@ -2143,9 +2171,14 @@ void UNPCActionQueueComponent::ExecuteAnimationAction()
 	const float MontageRemainingSeconds = LoopCount > 1
 		? SingleLoopSeconds * LoopCount
 		: FMath::Max((ActiveQueuedAnimationMontage->GetPlayLength() - MontagePosition) / MontageRate, 0.0f);
-	const float WaitSeconds = MontageRemainingSeconds > KINDA_SMALL_NUMBER
+	float WaitSeconds = MontageRemainingSeconds > KINDA_SMALL_NUMBER
 		? MontageRemainingSeconds + 0.1f
 		: CurrentAction.WaitSeconds;
+	if (CurrentAction.AnimationEarlyFinishSeconds > 0.0f && MontageRemainingSeconds > KINDA_SMALL_NUMBER)
+	{
+		// Finish while the montage is still at full weight; the next animation cross-fades from it.
+		WaitSeconds = FMath::Max(MontageRemainingSeconds - CurrentAction.AnimationEarlyFinishSeconds, 0.1f);
+	}
 
 	UWorld* World = GetWorld();
 	if (!World)

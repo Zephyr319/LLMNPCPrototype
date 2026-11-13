@@ -7,6 +7,8 @@
 #include "NPCFaceTargetComponent.generated.h"
 
 class AActor;
+class UNPCAutonomyComponent;
+class UVoicevoxTTSClient;
 
 UCLASS(ClassGroup = (Custom), meta = (BlueprintSpawnableComponent))
 class UNPCFaceTargetComponent : public UActorComponent
@@ -45,6 +47,9 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Face Target")
 	void StopFacingActor();
 
+	// Speech owns a separate request: stopping an action must not cancel an ongoing reply.
+	void StartSpeechFacing(AActor* TargetActor, UVoicevoxTTSClient* VoiceSource, float SubtitleSeconds);
+
 	UFUNCTION(BlueprintCallable, Category = "Face Target")
 	void FaceActorOnce(AActor* TargetActor);
 
@@ -52,6 +57,16 @@ public:
 	bool IsFacingActor() const;
 
 private:
+	TWeakObjectPtr<AActor> SpeechFacingTarget;
+	TWeakObjectPtr<UVoicevoxTTSClient> SpeechVoiceSource;
+	TWeakObjectPtr<UNPCAutonomyComponent> SpeechAutonomyComponent;
+	double SpeechFacingFallbackUntil = 0.0;
+	bool bSpeechFacingActive = false;
+	FString LastSpeechFacingState;
+
+	FString GetSpeechFacingBlockReason() const;
+	void StopSpeechFacing(const TCHAR* Reason);
+
 	bool ShouldSkipFacingForMovement() const;
 
 	void FaceActor(AActor* TargetActor, float DeltaTime, bool bInterpolate, bool bForceYawOnly) const;

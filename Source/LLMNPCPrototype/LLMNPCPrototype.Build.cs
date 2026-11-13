@@ -19,6 +19,7 @@ public class LLMNPCPrototype : ModuleRules
 			"GameplayStateTreeModule",
 			"UMG",
 			"Slate",
+			"SlateCore",
 			"HTTP",
             "Json",
             "JsonUtilities",

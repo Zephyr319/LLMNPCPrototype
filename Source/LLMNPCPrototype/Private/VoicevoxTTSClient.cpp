@@ -157,13 +157,16 @@ bool UVoicevoxTTSClient::IsVoicevoxSpeechActive() const
 {
     const bool bTargetAudioPlaying = TargetAudioComponent && TargetAudioComponent->IsPlaying();
     const bool bOwnedAudioPlaying = OwnedAudioComponent && OwnedAudioComponent->IsPlaying();
+    return HasPendingVoicevoxSpeech() || bTargetAudioPlaying || bOwnedAudioPlaying;
+}
+
+bool UVoicevoxTTSClient::HasPendingVoicevoxSpeech() const
+{
     return bIsSynthesizingSentence
         || bIsAudioPlaying
         || bSpeechFinishNotificationPending
         || PendingSentenceQueue.Num() > 0
-        || PendingAudioQueue.Num() > 0
-        || bTargetAudioPlaying
-        || bOwnedAudioPlaying;
+        || PendingAudioQueue.Num() > 0;
 }
 
 void UVoicevoxTTSClient::StartDelayedVoicevoxWarmup()

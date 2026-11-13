@@ -54,6 +54,9 @@ public:
     UFUNCTION(BlueprintCallable, BlueprintPure, Category = "VOICEVOX")
     bool IsVoicevoxSpeechActive() const;
 
+    // Logical speech work excludes procedural audio that may continue streaming silence.
+    bool HasPendingVoicevoxSpeech() const;
+
 private:
     UPROPERTY()
     USoundWave* LastGeneratedSound;

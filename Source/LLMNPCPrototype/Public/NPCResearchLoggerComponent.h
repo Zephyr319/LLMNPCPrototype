@@ -31,6 +31,25 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "NPC Research Log")
 	void RecordStructuredEvent(const FString& EventType, const FString& PayloadJson = TEXT("{}"));
 
+	// --- Experiment harness: every event carries seq / world_time / trial_id / condition / interaction_id ---
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "NPC Research Log|Trial")
+	FString TrialID;
+
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "NPC Research Log|Trial")
+	FString TrialCondition;
+
+	// Incremented each time the player speaks; 0 until the first utterance of the session.
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "NPC Research Log|Trial")
+	int32 InteractionID = 0;
+
+	void BeginTrial(const FString& InTrialID, const FString& InCondition);
+	void EndTrial(const FString& Note);
+	int32 BeginInteraction();
+
+	// The logger of the running session, for code that has no direct reference to it (LLM client, service manager).
+	static UNPCResearchLoggerComponent* GetActiveLogger();
+	static void RecordGlobalEvent(const FString& EventType, const FString& PayloadJson);
+
 protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
@@ -56,4 +75,6 @@ private:
 
 	UFUNCTION()
 	void HandleActivityFinished(const FString& ActivityID, bool bInterrupted);
+
+	int64 EventSequence = 0;
 };
